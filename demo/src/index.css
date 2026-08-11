@@ -1,0 +1,20 @@
+@import "tailwindcss";
+@plugin "daisyui" {
+  themes: dark --default;
+}
+
+/* ── 自定义滚动条 ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: hsl(var(--bc) / 0.2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(var(--bc) / 0.3); }
+
+/* ── 本地视频镜像 ── */
+.video-mirror video {
+    transform: scaleX(-1);
+}
+
+/* ── 日志等宽字体 ── */
+.log-mono {
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+}
