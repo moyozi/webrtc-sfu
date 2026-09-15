@@ -8,7 +8,7 @@
 
 use crate::net::udp::SendBatch;
 use ahash::AHashMap;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// 使用 str0m 的 Mid 和 MediaKind 类型
 pub use str0m::media::Mid;
@@ -97,7 +97,11 @@ impl Router {
 
     /// 添加订阅关系
     ///
-    /// 当参与者 A 想订阅参与者 B 的轨道时调用
+    /// 当参与者 A 想订阅参与者 B 的轨道时调用。
+    ///
+    /// 注意: 订阅可能先于发布者的 `MediaAdded` 事件到达 (客户端收到
+    /// participant_joined 后会立即发起 subscribe)。因此这里**不要求**发布轨道
+    /// 已存在，先登记订阅关系；之后 `add_publisher()` 会复用同一条目。
     pub fn add_subscription(
         &mut self,
         subscriber_id: &str,
@@ -112,11 +116,14 @@ impl Router {
             mid,
         };
 
-        // 检查轨道是否存在
-        if !self.publishers.contains_key(&track_id) {
-            warn!(
-                "订阅失败: 发布轨道不存在 {}:{}",
-                publisher_id, publisher_mid
+        // 如果发布轨道已经注册，则无需二次确认；未注册也允许先订阅。
+        let subs = self.subscriptions.entry(track_id.clone()).or_default();
+
+        // 去重: 同一订阅者不要重复订阅同一轨道
+        if subs.iter().any(|s| s.subscriber_id == subscriber_id) {
+            debug!(
+                "订阅已存在: {} → {}:{}",
+                subscriber_id, publisher_id, publisher_mid
             );
             return;
         }
@@ -124,16 +131,11 @@ impl Router {
         // 添加到订阅列表
         // 注意: subscriber_mid 在实际实现中需要通过 SDP 协商确定
         // 这里简化处理，使用与发布者相同的 mid
-        let subscription = Subscription {
+        subs.push(Subscription {
             subscriber_id: subscriber_id.to_string(),
             subscriber_mid: mid,
             selected_layer: None,
-        };
-
-        self.subscriptions
-            .entry(track_id.clone())
-            .or_default()
-            .push(subscription);
+        });
 
         // 更新反向索引
         self.subscriber_index
@@ -283,3 +285,26 @@ pub struct RouterStats {
 
 // 导入日志宏
 use tracing::info;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 订阅可能先于发布者的 MediaAdded 事件到达, 必须保留订阅关系。
+    #[test]
+    fn subscription_before_publisher_is_preserved() {
+        let mut router = Router::new();
+
+        // 发布者尚未注册 (MediaAdded 未到达) 时先订阅
+        router.add_subscription("sub-1", "pub-1", "0");
+        assert_eq!(router.get_subscribers("pub-1", Mid::from("0")).len(), 1);
+
+        // 发布者随后注册, 订阅关系应保留
+        router.add_publisher("pub-1".to_string(), Mid::from("0"), MediaKind::Audio);
+        assert_eq!(router.get_subscribers("pub-1", Mid::from("0")).len(), 1);
+
+        // 重复订阅应去重
+        router.add_subscription("sub-1", "pub-1", "0");
+        assert_eq!(router.get_subscribers("pub-1", Mid::from("0")).len(), 1);
+    }
+}

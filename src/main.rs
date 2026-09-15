@@ -12,8 +12,9 @@ mod sfu;
 mod signaling;
 
 use config::SfuConfig;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, error};
+use tracing::{info, warn, error};
 
 fn main() {
     // 初始化日志
@@ -32,6 +33,16 @@ fn main() {
     let listen_addr = config.listen_addr;
     let ws_addr = config.ws_listen_addr;
 
+    // 每个 worker 占用一个媒体端口 (base + cpu_id), 防止超出 u16 端口上限。
+    let max_workers = (u16::MAX as usize) - (listen_addr.port() as usize) + 1;
+    let num_workers = num_workers.min(max_workers);
+    if num_workers < config.num_workers {
+        warn!(
+            "worker 数由 {} 限制为 {} (媒体端口范围不足)",
+            config.num_workers, num_workers
+        );
+    }
+
     // ── 1. 创建 Worker 线程 ──
     let mut worker_handles = Vec::with_capacity(num_workers);
     let mut worker_cmd_txs = Vec::with_capacity(num_workers);
@@ -40,9 +51,20 @@ fn main() {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<core::WorkerCommand>();
         worker_cmd_txs.push(cmd_tx);
 
+        // 每个 worker 使用独立的媒体端口: base_port + cpu_id。
+        //
+        // 既然同一个房间的所有参与者都被 select_worker() 固定到同一个 worker,
+        // 每个 worker 只需要自己的端口就行。客户端从 SDP 里拿到该 worker 的
+        // ICE 候选 (端口即 base_port + cpu_id), 包会直接到达正确的 worker,
+        // 不再依赖内核 SO_REUSEPORT 的流哈希 (它无法保证落到持有 Rtc 的 worker)。
+        let worker_listen_addr = SocketAddr::new(
+            listen_addr.ip(),
+            listen_addr.port() + cpu_id as u16,
+        );
+
         let worker_config = core::WorkerConfig {
             cpu_id,
-            listen_addr,
+            listen_addr: worker_listen_addr,
             batch_size: config.batch_size,
             send_batch_size: config.send_batch_size,
             busy_poll_us: config.busy_poll_us,
@@ -59,7 +81,12 @@ fn main() {
         worker_handles.push(handle);
     }
 
-    info!("已启动 {} 个 worker 线程", num_workers);
+    info!(
+        "已启动 {} 个 worker 线程, 媒体端口范围: {}..{}",
+        num_workers,
+        listen_addr.port(),
+        listen_addr.port() + (num_workers as u16).saturating_sub(1)
+    );
 
     // ── 2. 启动信令服务器 (Tokio Runtime) ──
     let signaling_state = Arc::new(signaling::SignalingState::new(worker_cmd_txs));

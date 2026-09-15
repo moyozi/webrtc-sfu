@@ -4,10 +4,18 @@ interface JoinScreenProps {
   onJoin: (serverUrl: string, roomId: string, name: string) => void;
 }
 
+/** 随机生成一个昵称, 例如 user-7f3k2a */
+function randomName(): string {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let s = "";
+  for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return `user-${s}`;
+}
+
 export default function JoinScreen(props: JoinScreenProps) {
-  const [serverUrl, setServerUrl] = createSignal("ws://localhost:8080");
+  const [serverUrl, setServerUrl] = createSignal("ws://192.168.31.112:5174");
   const [roomId, setRoomId] = createSignal("room-1");
-  const [name, setName] = createSignal("");
+  const [name, setName] = createSignal(randomName());
   const [error, setError] = createSignal("");
   const [joining, setJoining] = createSignal(false);
 
@@ -101,7 +109,7 @@ export default function JoinScreen(props: JoinScreenProps) {
           {/* Server info */}
           <div class="mt-6 pt-4 border-t border-base-300 text-center">
             <p class="text-xs text-base-content/50">
-              SFU 媒体端口 <code class="kbd kbd-xs">UDP 5004</code>　信令端口 <code class="kbd kbd-xs">WS 8080</code>
+              SFU 媒体端口 <code class="kbd kbd-xs">UDP 5175+</code>　信令端口 <code class="kbd kbd-xs">WS 5174</code>
             </p>
           </div>
         </div>

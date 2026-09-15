@@ -42,15 +42,24 @@
   │  sendmmsg │  │  sendmmsg │  │  sendmmsg │  │  sendmmsg │    │  sendmmsg
   └──────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘
          ↑                                                       ↑
-         └─────────────── SO_REUSEPORT (内核负载均衡) ─────────────┘
-                              所有 socket 绑定同一端口
+         └──────────── 房间分片: 每个房间固定到一个 Worker ──────────┘
+                      每个 Worker 使用独立媒体端口 (base+i)
 ```
+
+> **为什么不用 SO_REUSEPORT 共享同一端口？**
+> 内核的 SO_REUSEPORT 按四元组哈希选择 socket，**无法保证**包落到持有该
+> participant 的 worker，于是包会被其它 worker 丢弃。因此改为「房间级分片」：
+> 信令层用 `select_worker(room_id)` 把同一房间的所有参与者（发布者 + 订阅连接）
+> 固定到同一个 worker；每个 worker 监听自己的媒体端口 `base_port + cpu_id`，
+> 并在 ICE 候选里公布该端口。这样客户端直接连到正确的 worker，且同一房间的
+> 发布/订阅转发始终在 worker 内部完成，无需跨 worker 通信。
+> 代价：需要放行一个媒体端口段 (端口数 = worker 数)。
 
 ### 核心设计原则
 
 | 原则 | 实现方式 |
 |------|----------|
-| **Share-Nothing** | 每个 Worker 线程独占一个 CPU 核心，拥有独立的 UDP socket、Rtc 实例、路由表，无共享可变状态 |
+| **Share-Nothing** | 每个 Worker 线程独占一个 CPU 核心，拥有独立的 UDP socket (独立端口)、Rtc 实例、路由表，无共享可变状态；房间级分片保证同房间不跨 Worker |
 | **Batch I/O** | 使用 `recvmmsg` 批量收包 (64 packets/syscall)、`sendmmsg` 批量发包，减少 80%+ 系统调用 |
 | **Sans I/O 驱动** | str0m 不做任何网络 I/O，由 Worker 事件循环主动喂数据和驱动时间 |
 | **零拷贝路由** | RTP 包在参与者间转发使用 `Bytes` 引用计数，避免内存拷贝 |
@@ -72,7 +81,7 @@
 └──────────────────────────────────────────────────────────┘
           │
           ├──► Worker Thread 0  (CPU affinity: core 0)
-          │    · 独立 UDP socket (SO_REUSEPORT, 同一端口)
+          │    · 独立 UDP socket (独立媒体端口: base_port + core_id)
           │    · 独立 epoll 实例
           │    · 独立 Rtc 实例池
           │    · 独立路由表
@@ -173,7 +182,7 @@ enum WorkerReply {
 
 | 优化点 | 说明 |
 |--------|------|
-| **SO_REUSEPORT** | 多个 socket 绑定同一端口，内核通过 hash 将连接分配到固定 socket，保证同一个 ICE 连接的包始终到同一个 Worker |
+| **房间级分片** | `select_worker(room_id)` 将同一房间固定到同一 Worker；每个 Worker 监听独立媒体端口 `base_port + cpu_id`，ICE 候选公布该端口，避免内核 SO_REUSEPORT 把包分到错误 Worker |
 | **SO_BUSY_POLL** | 内核级忙轮询，减少软中断延迟 (需 Linux 3.11+, 适合低延迟场景) |
 | **Edge-Triggered epoll** | 配合 recvmmsg 循环读到 EAGAIN，避免 Level-Triggered 的重复唤醒 |
 | **预分配缓冲区** | RecvBatch/SendBatch 在 Worker 启动时分配，热路径零分配 |
@@ -421,7 +430,8 @@ struct SendBatch {
 ```rust
 fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
     // 1. 初始化
-    let socket = UdpSocket::new(config.listen_addr, true);  // SO_REUSEPORT
+    // 每个 worker 使用独立媒体端口 (base_port + cpu_id)
+    let socket = UdpSocket::new(config.listen_addr, false);
     let poll = Epoll::new();
     poll.add(socket.fd(), EPOLLIN | EPOLLET);
 
@@ -487,24 +497,50 @@ fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
 
 ### 8.1 WebSocket 协议
 
+一条 WebSocket 连接可同时承载多个 RTCPeerConnection，用 `pc_id` 区分：
+
+- `pc_id = "pub"`：发布连接（sendonly），加入房间
+- `pc_id = "sub-<publisherId>"`：订阅连接（recvonly），不加入房间
+
+同一个用户无论订阅多少路远端，都只维持 **一条** WebSocket；服务端为每个 `pc_id`
+创建一个独立的 str0m `Rtc` 实例，但共用同一条信令通道。如发布者媒体变更，
+订阅端仍复用同一连接。
+
 ```json
-// 客户端 → 服务器: SDP Offer
+// 客户端 → 服务器: SDP Offer (发布连接)
 {
   "type": "join",
+  "pc_id": "pub",
   "room_id": "room-123",
   "participant_id": "alice-uuid",
-  "sdp": "v=0\r\no=- 123456 2 IN IP4 127.0.0.1\r\n..."
+  "sdp": "v=0\r\no=- 123456 2 IN IP4 127.0.0.1\r\n...",
+  "role": "publisher"
 }
 
-// 服务器 → 客户端: SDP Answer
+// 客户端 → 服务器: SDP Offer (订阅连接, 复用同一条 WebSocket)
+{
+  "type": "join",
+  "pc_id": "sub-bob-uuid",
+  "room_id": "room-123",
+  "participant_id": "alice-uuid-recv-bob-uuid",
+  "sdp": "v=0\r\no=- 123456 2 IN IP4 127.0.0.1\r\n...",
+  "role": "subscriber"
+}
+// role: "publisher" (默认, 发布并加入房间) 或 "subscriber" (recvonly 订阅连接)
+// subscriber 连接不会加入房间, 也不会触发 participant_joined 广播
+
+// 服务器 → 客户端: SDP Answer (带 pc_id, 客户端据此路由到对应 PC)
 {
   "type": "sdp_answer",
-  "sdp": "v=0\r\no=- 789012 2 IN IP4 127.0.0.1\r\n..."
+  "pc_id": "sub-bob-uuid",
+  "sdp": "v=0\r\no=- 789012 2 IN IP4 127.0.0.1\r\n...",
+  "ice_candidates": ["candidate:1 1 udp 2122252543 1.2.3.4 5175 typ host"]
 }
 
 // 客户端 → 服务器: Trickle ICE Candidate
 {
   "type": "ice_candidate",
+  "pc_id": "sub-bob-uuid",
   "candidate": "candidate:842163049 1 udp 1677729535 ...",
   "sdp_mid": "0",
   "sdp_mline_index": 0
@@ -513,9 +549,13 @@ fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
 // 客户端 → 服务器: 订阅轨道
 {
   "type": "subscribe",
+  "pc_id": "sub-bob-uuid",
   "publisher_id": "bob-uuid",
   "track_mid": "1"
 }
+
+// 客户端 → 服务器: 关闭某个 PC 会话
+{ "type": "leave", "pc_id": "sub-bob-uuid" }
 ```
 
 ### 8.2 信令流程

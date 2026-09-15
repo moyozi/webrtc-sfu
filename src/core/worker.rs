@@ -16,7 +16,7 @@ use ahash::AHashMap;
 use crossbeam_channel::{Receiver, Sender};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error, debug, trace};
 
 /// Timer 驱动间隔 — 每 10ms 驱动一次所有 Rtc 实例的定时器
 const TIMER_INTERVAL: Duration = Duration::from_millis(10);
@@ -29,8 +29,8 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
     // ── 1. 设置 CPU 亲和性 ──
     set_cpu_affinity(cpu_id);
 
-    // ── 2. 创建 UDP socket (SO_REUSEPORT) ──
-    let socket = match UdpSocket::new(config.listen_addr, true) {
+    // ── 2. 创建 UDP socket (每个 worker 独立端口, 不再依赖 SO_REUSEPORT) ──
+    let socket = match UdpSocket::new(config.listen_addr, false) {
         Ok(s) => s,
         Err(e) => {
             error!(cpu_id, "创建 UDP socket 失败: {}", e);
@@ -121,7 +121,7 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
         // str0m 是 Sans I/O，需要外部驱动时间前进。
 
         if now >= next_timer {
-            drive_timers(&mut participants, &mut send_batch, now);
+            drive_timers(&mut participants, &mut router, &mut send_batch, now);
             next_timer = now + TIMER_INTERVAL;
         }
 
@@ -178,6 +178,18 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                         &publisher_id,
                         &publisher_mid,
                     );
+
+                    // 向发布者请求关键帧, 让新订阅者尽快拿到可解码的帧 (尤其是视频)。
+                    if let Some(publisher) = participants.get_mut(&publisher_id) {
+                        let mid = str0m::media::Mid::from(publisher_mid.as_str());
+                        if let Some(mut writer) = publisher.rtc.writer(mid) {
+                            let kind = str0m::media::KeyframeRequestKind::Pli;
+                            if writer.is_request_keyframe_possible(kind) {
+                                let _ = writer.request_keyframe(None, kind);
+                            }
+                        }
+                    }
+
                     debug!("订阅: {} -> {}:{}", subscriber_id, publisher_id, publisher_mid);
                 }
 
@@ -256,13 +268,17 @@ fn process_packet(
 
     // ── 阶段 1: 查找匹配的参与者 ──
     //
-    // 尝试通过 ICE ufrag 快速查找 (STUN 包)
-    // STUN Binding Request 的 USERNAME 属性格式: "remote_ufrag:local_ufrag"
-    let target_id = extract_ufrag(data)
-        .and_then(|ufrag| {
+    // STUN Binding Request 的 USERNAME 为 "ufragA:ufragB"。
+    // 不同实现里两个 ufrag 的顺序可能不同 (浏览器发来的可能是 remote:local),
+    // 因此只要任一片段等于某参与者的本地 ufrag 即可匹配, 否则 STUN 永远匹配不上,
+    // ICE 无法建立。
+    let ufrags = extract_ufrags(data);
+    let target_id = ufrags
+        .as_ref()
+        .and_then(|(a, b)| {
             participants.iter()
                 .find_map(|(id, p)| {
-                    if p.matches_ufrag(&ufrag) {
+                    if p.matches_ufrag(a) || p.matches_ufrag(b) {
                         Some(id.clone())
                     } else {
                         None
@@ -280,6 +296,11 @@ fn process_packet(
                     }
                 })
         });
+
+    trace!(
+        "rx udp: {} bytes from {}, ufrags={:?}, target={:?}",
+        data.len(), source, ufrags, target_id
+    );
 
     let participant_id = match target_id {
         Some(id) => id,
@@ -318,7 +339,13 @@ fn process_packet(
     // 1. 先收集当前参与者的所有输出 (Transmit + MediaData 事件)
     // 2. 再处理 MediaData 事件 (转发给其他订阅者)
 
-    let mut pending_media: Vec<(str0m::media::Mid, str0m::media::Pt, str0m::media::MediaTime, bytes::Bytes)> = Vec::new();
+    let mut pending_media: Vec<(
+        str0m::media::Mid,
+        str0m::media::MediaTime,
+        str0m::format::PayloadParams,
+        Instant,
+        bytes::Bytes,
+    )> = Vec::new();
 
     loop {
         match participant.rtc.poll_output() {
@@ -349,11 +376,13 @@ fn process_packet(
                         );
                     }
                     str0m::Event::MediaData(md) => {
-                        // 收集媒体数据，稍后转发
+                        // 收集媒体数据, 稍后转发。
+                        // 同时保留入站 PayloadParams 与到达时间, 供订阅者做 PT 重映射。
                         pending_media.push((
                             md.mid,
-                            md.pt,
                             md.time,
+                            md.params,
+                            md.network_time,
                             bytes::Bytes::copy_from_slice(&md.data),
                         ));
                     }
@@ -375,12 +404,13 @@ fn process_packet(
     //
     // 现在我们已经释放了对当前参与者的借用，
     // 可以安全地访问所有参与者进行转发。
-    for (mid, pt, time, media_data) in pending_media {
+    for (mid, time, params, network_time, media_data) in pending_media {
         forward_media_to_subscribers(
             &participant_id,
             mid,
-            pt,
             time,
+            params,
+            network_time,
             &media_data,
             participants,
             router,
@@ -389,11 +419,11 @@ fn process_packet(
     }
 }
 
-/// 从 STUN 包中提取 ICE ufrag
+/// 从 STUN 包中提取 ICE ufrag 的两个片段
 ///
-/// STUN Binding Request 的 USERNAME 属性格式: "remote_ufrag:local_ufrag"
-/// 我们提取 local_ufrag 部分 (SFU 的 ufrag) 来查找对应的 Rtc 实例。
-fn extract_ufrag(data: &[u8]) -> Option<String> {
+/// STUN Binding Request 的 USERNAME 属性为 `<ufragA>:<ufragB>`，
+/// 不同实现中两段的顺序可能不同，因此返回两段供调用方匹配。
+fn extract_ufrags(data: &[u8]) -> Option<(String, String)> {
     // STUN 包最少 20 字节头部
     if data.len() < 20 {
         return None;
@@ -418,11 +448,10 @@ fn extract_ufrag(data: &[u8]) -> Option<String> {
         if attr_type == 0x0006 {
             // USERNAME 属性
             let username = &data[offset..offset + attr_len];
-            // 格式: "remote_ufrag:local_ufrag"
             let username_str = std::str::from_utf8(username).ok()?;
-            let parts: Vec<&str> = username_str.split(':').collect();
-            if parts.len() == 2 {
-                return Some(parts[1].to_string()); // local_ufrag
+            let mut parts = username_str.split(':');
+            if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
+                return Some((a.to_string(), b.to_string()));
             }
         }
 
@@ -450,8 +479,9 @@ fn extract_ufrag(data: &[u8]) -> Option<String> {
 fn forward_media_to_subscribers(
     publisher_id: &str,
     publisher_mid: str0m::media::Mid,
-    pt: str0m::media::Pt,
     time: str0m::media::MediaTime,
+    params: str0m::format::PayloadParams,
+    network_time: Instant,
     data: &bytes::Bytes,
     participants: &mut AHashMap<String, Participant>,
     router: &Router,
@@ -480,24 +510,42 @@ fn forward_media_to_subscribers(
             None => continue,
         };
 
-        // 使用 str0m Writer 写入媒体数据
-        // str0m 内部处理: SRTP 加密 + RTP 打包 + 时间戳调整
-        // Writer::write 参数顺序: (pt, wallclock, rtp_time, data)
+        // 使用 str0m Writer 转发媒体。
+        //
+        // 关键: 发布者与订阅者各自协商的 PT 可能不同, 不能直接把发布者的
+        // pt 写进去 (Writer::write 会返回 RtcError::UnknownPt)。必须用
+        // Writer::match_params 把入站 PayloadParams 映射为订阅者本地的 PT。
         if let Some(writer) = subscriber.rtc.writer(subscriber_mid) {
-            if writer.write(pt, Instant::now(), time, data.as_ref()).is_ok() {
-                // Drain 订阅者的输出，收集 Transmit 包
-                loop {
-                    match subscriber.rtc.poll_output() {
-                        Ok(str0m::Output::Transmit(transmit)) => {
-                            send_batch.push(
-                                transmit.destination,
-                                bytes::Bytes::copy_from_slice(&transmit.contents),
-                            );
+            match writer.match_params(params) {
+                Some(local_pt) => {
+                    // wallclock 使用入站首个包的到达时间 (str0m 推荐做法)
+                    if writer.write(local_pt, network_time, time, data.as_ref()).is_ok() {
+                        // Drain 订阅者的输出，收集 Transmit 包
+                        loop {
+                            match subscriber.rtc.poll_output() {
+                                Ok(str0m::Output::Transmit(transmit)) => {
+                                    send_batch.push(
+                                        transmit.destination,
+                                        bytes::Bytes::copy_from_slice(&transmit.contents),
+                                    );
+                                }
+                                Ok(str0m::Output::Timeout(_)) => break,
+                                Ok(_) => {}
+                                Err(_) => break,
+                            }
                         }
-                        Ok(str0m::Output::Timeout(_)) => break,
-                        Ok(_) => {}
-                        Err(_) => break,
+                    } else {
+                        warn!(
+                            "订阅者 {} 写入媒体失败 (mid={:?}, pt={:?})",
+                            subscriber_id, subscriber_mid, local_pt
+                        );
                     }
+                }
+                None => {
+                    warn!(
+                        "订阅者 {} 未协商到与发布者 {} 匹配的编码 (mid={:?}, pt={:?})",
+                        subscriber_id, publisher_id, subscriber_mid, params.pt()
+                    );
                 }
             }
         }
@@ -511,10 +559,11 @@ fn forward_media_to_subscribers(
 /// 驱动所有参与者的 Rtc 定时器并收集输出
 fn drive_timers(
     participants: &mut AHashMap<String, Participant>,
+    router: &mut Router,
     send_batch: &mut SendBatch,
     now: Instant,
 ) {
-    for participant in participants.values_mut() {
+    for (participant_id, participant) in participants.iter_mut() {
         // 驱动时间前进
         if participant.rtc.handle_input(
             str0m::Input::Timeout(now)
@@ -522,7 +571,9 @@ fn drive_timers(
             continue;
         }
 
-        // Drain 输出 (只处理 Transmit，不处理 MediaData)
+        // Drain 输出 (Transmit + 事件)。
+        // 必须处理 MediaAdded 事件, 否则发布者轨道不会注册到 Router,
+        // 后续 subscribe 会找不到发布轨道而失败。
         loop {
             match participant.rtc.poll_output() {
                 Ok(str0m::Output::Transmit(transmit)) => {
@@ -531,8 +582,20 @@ fn drive_timers(
                         bytes::Bytes::copy_from_slice(&transmit.contents),
                     );
                 }
+                Ok(str0m::Output::Event(event)) => {
+                    if let str0m::Event::MediaAdded(media) = event {
+                        info!(
+                            "参与者 {} 发布媒体 mid={:?} kind={:?}",
+                            participant_id, media.mid, media.kind
+                        );
+                        router.add_publisher(
+                            participant_id.clone(),
+                            media.mid,
+                            media.kind,
+                        );
+                    }
+                }
                 Ok(str0m::Output::Timeout(_)) => break,
-                Ok(_) => {}
                 Err(_) => break,
             }
         }

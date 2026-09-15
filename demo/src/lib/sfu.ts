@@ -2,19 +2,28 @@ import { SignalingClient } from "./signaling";
 import type { ServerMessage, LogEntry, RemoteParticipant } from "./types";
 
 /**
- * SFU 客户端 — 管理发布与订阅
+ * SFU 客户端 — 单 WebSocket + 多 RTCPeerConnection (信令复用)
  *
  * 架构:
- *   ┌─────────────┐     主 WebSocket + PC (sendonly)     ┌───────────┐
- *   │  浏览器 A    │ ──────────────────────────────────→  │  SFU 服务  │
- *   │  (发布者)    │                                       │  (str0m)  │
- *   │             │     订阅 WebSocket + PC (recvonly)    │           │
- *   │             │ ←──────────────────────────────────  │           │
- *   └─────────────┘                                       └───────────┘
+ *   ┌─────────────┐        一条 WebSocket (所有 PC 复用, 按 pc_id 区分)      ┌───────────┐
+ *   │  浏览器 A    │ ────────────────────────────────────────────────────→  │  SFU 服务  │
+ *   │             │   pc_id="pub"        → 发布 PC (sendonly)                │  (str0m)  │
+ *   │             │   pc_id="sub-bob"    → 订阅 bob 的 PC (recvonly)        │           │
+ *   │             │   pc_id="sub-carol"  → 订阅 carol 的 PC (recvonly)      │           │
+ *   └─────────────┘                                                        └───────────┘
  *
- * 发布流: getUserMedia → sendonly PC → join → 服务器接收
- * 订阅流: 为每个远端参与者创建独立 WS + PC → join(recvonly) → subscribe → 服务器推送
+ * 一个用户无论订阅多少人, 都只维持 1 条 WebSocket 连接, 节省大量 TCP/TLS 资源。
+ * 服务端为每个 pc_id 创建一个独立的 str0m Rtc 实例 (参与者), 但共用同一条信令通道。
  */
+
+const PUB_PC_ID = "pub";
+
+interface PcEntry {
+  pc: RTCPeerConnection;
+  role: "publisher" | "subscriber";
+  /** subscriber: 正在订阅的远端参与者 id */
+  publisherId?: string;
+}
 
 // 回调类型
 export interface SfuCallbacks {
@@ -30,17 +39,15 @@ export class SfuClient {
   private participantId = "";
   private roomId = "";
 
-  // 发布 (主连接)
-  private mainSig: SignalingClient | null = null;
-  private publishPC: RTCPeerConnection | null = null;
-  private localStream: MediaStream | null = null;
+  // 单条信令连接 (所有 PC 复用)
+  private sig: SignalingClient | null = null;
 
-  // 订阅 (每个远端参与者一个独立连接)
-  // key = publisherId
-  private subs = new Map<string, {
-    signaling: SignalingClient;
-    pc: RTCPeerConnection;
-  }>();
+  // pc_id → PC 元数据
+  private pcs = new Map<string, PcEntry>();
+  // 远端 publisherId → 订阅它的 pc_id
+  private subPcByPublisher = new Map<string, string>();
+
+  private localStream: MediaStream | null = null;
 
   private cb: SfuCallbacks;
 
@@ -62,49 +69,43 @@ export class SfuClient {
     });
     this.cb.onLog("本地媒体流已就绪", "success");
 
-    // 2. 连接信令服务器
-    this.mainSig = new SignalingClient(serverUrl);
-    await this.mainSig.connect();
-    this.mainSig.onMessage = (msg) => this.onMainMessage(msg);
-    this.mainSig.onClose = () => {
+    // 2. 连接信令服务器 (整个会话只此一条 WebSocket)
+    this.sig = new SignalingClient(serverUrl);
+    await this.sig.connect();
+    this.sig.onMessage = (msg) => this.onMessage(msg);
+    this.sig.onClose = () => {
       this.cb.onLog("信令连接断开", "warn");
       this.cb.onConnectionStateChange("disconnected");
     };
 
     // 3. 创建发布 PC (sendonly)
-    this.publishPC = new RTCPeerConnection({ iceServers: [] });
+    const pc = new RTCPeerConnection({ iceServers: [] });
     for (const track of this.localStream.getTracks()) {
-      this.publishPC.addTransceiver(track, { direction: "sendonly", streams: [this.localStream] });
+      pc.addTransceiver(track, { direction: "sendonly", streams: [this.localStream] });
     }
+    this.registerPc(PUB_PC_ID, pc, "publisher");
 
-    this.publishPC.onicecandidate = (e) => {
-      if (e.candidate) {
-        this.mainSig!.send({
-          type: "ice_candidate",
-          candidate: e.candidate.candidate,
-          sdp_mid: e.candidate.sdpMid,
-          sdp_mline_index: e.candidate.sdpMLineIndex,
-        });
-      }
+    pc.onicecandidate = (e) => {
+      if (e.candidate) this.sendIce(PUB_PC_ID, e.candidate);
     };
-
-    this.publishPC.onconnectionstatechange = () => {
-      const state = this.publishPC!.connectionState;
-      this.cb.onLog(`发布连接状态: ${state}`);
-      this.cb.onConnectionStateChange(state);
+    pc.onconnectionstatechange = () => {
+      this.cb.onLog(`发布连接状态: ${pc.connectionState}`);
+      this.cb.onConnectionStateChange(pc.connectionState);
     };
 
     // 4. 创建 offer, 等待 ICE 收集完成
-    const offer = await this.publishPC.createOffer();
-    await this.publishPC.setLocalDescription(offer);
-    await this.waitIceComplete(this.publishPC);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await this.waitIceComplete(pc);
 
-    // 5. 发送 join
-    this.mainSig.send({
+    // 5. 发送 join (发布连接, role=publisher)
+    this.sig.send({
       type: "join",
+      pc_id: PUB_PC_ID,
       room_id: roomId,
       participant_id: participantId,
-      sdp: this.publishPC.localDescription!.sdp,
+      sdp: pc.localDescription!.sdp,
+      role: "publisher",
     });
     this.cb.onLog(`正在加入房间 ${roomId}...`);
   }
@@ -114,28 +115,28 @@ export class SfuClient {
     return this.localStream;
   }
 
-  // ── 订阅: 接收远端参与者媒体 ──────────────────────────────
+  // ── 订阅: 接收远端参与者媒体 (复用同一条 WebSocket) ──────────
 
   async subscribe(publisherId: string): Promise<void> {
-    if (this.subs.has(publisherId)) {
+    if (this.subPcByPublisher.has(publisherId)) {
       this.cb.onLog(`已订阅 ${publisherId}`, "warn");
       return;
     }
-    if (!this.mainSig) return;
+    if (!this.sig) return;
+
+    // 不订阅自己, 也不订阅"订阅连接" (xxx-recv-yyy 只是 recvonly 连接, 不是发布者)。
+    if (publisherId === this.participantId || publisherId.includes("-recv-")) {
+      this.cb.onLog(`忽略非法订阅目标: ${publisherId}`, "warn");
+      return;
+    }
 
     this.cb.onLog(`正在订阅 ${publisherId}...`);
     this.cb.onSubscriptionUpdate(publisherId, { status: "connecting" });
 
-    const subId = `${this.participantId}-recv-${publisherId}`;
-    const serverUrl = this.mainSig.url;
+    const pcId = `sub-${publisherId}`;
 
-    // 1. 创建独立信令连接
-    const signaling = new SignalingClient(serverUrl);
-    await signaling.connect();
-
-    // 2. 创建订阅 PC (recvonly)
+    // 1. 创建订阅 PC (recvonly)
     const pc = new RTCPeerConnection({ iceServers: [] });
-
     // recvonly 音频 (mid=0) + recvonly 视频 (mid=1)
     pc.addTransceiver("audio", { direction: "recvonly" });
     pc.addTransceiver("video", { direction: "recvonly" });
@@ -149,50 +150,44 @@ export class SfuClient {
     };
 
     pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        signaling.send({
-          type: "ice_candidate",
-          candidate: e.candidate.candidate,
-          sdp_mid: e.candidate.sdpMid,
-          sdp_mline_index: e.candidate.sdpMLineIndex,
-        });
-      }
+      if (e.candidate) this.sendIce(pcId, e.candidate);
     };
-
     pc.onconnectionstatechange = () => {
       this.cb.onLog(`订阅 ${publisherId} 连接状态: ${pc.connectionState}`);
     };
 
-    this.subs.set(publisherId, { signaling, pc });
+    this.registerPc(pcId, pc, "subscriber", publisherId);
+    this.subPcByPublisher.set(publisherId, pcId);
 
-    // 3. 处理信令消息
-    signaling.onMessage = (msg) => this.onSubMessage(msg, publisherId, pc);
-
-    // 4. 创建 offer, 发送 join
+    // 2. 创建 offer, 通过同一条 WebSocket 发送 join (role=subscriber)
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     await this.waitIceComplete(pc);
 
-    signaling.send({
+    this.sig.send({
       type: "join",
+      pc_id: pcId,
       room_id: this.roomId,
-      participant_id: subId,
+      participant_id: `${this.participantId}-recv-${publisherId}`,
       sdp: pc.localDescription!.sdp,
+      role: "subscriber",
     });
   }
 
   /** 取消订阅 */
   unsubscribe(publisherId: string): void {
-    const sub = this.subs.get(publisherId);
-    if (!sub) return;
+    const pcId = this.subPcByPublisher.get(publisherId);
+    if (!pcId) return;
+    const entry = this.pcs.get(pcId);
 
-    // 通知服务器取消订阅
-    sub.signaling.send({ type: "subscribe", publisher_id: publisherId, track_mid: "0" });
-    sub.signaling.send({ type: "leave" });
+    // 通知服务器取消订阅 (音频 mid=0 + 视频 mid=1)
+    this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: "0" });
+    this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: "1" });
+    this.sig?.send({ type: "leave", pc_id: pcId });
 
-    sub.pc.close();
-    sub.signaling.close();
-    this.subs.delete(publisherId);
+    entry?.pc.close();
+    this.pcs.delete(pcId);
+    this.subPcByPublisher.delete(publisherId);
     this.cb.onLog(`已取消订阅 ${publisherId}`);
     this.cb.onSubscriptionUpdate(publisherId, { status: "idle", stream: null });
   }
@@ -200,21 +195,19 @@ export class SfuClient {
   // ── 离开 ──────────────────────────────────────────────────
 
   leave(): void {
-    // 取消所有订阅
-    for (const [pid] of this.subs) {
-      this.unsubscribe(pid);
+    // 通知服务器关闭所有 PC 会话
+    if (this.sig?.isConnected) {
+      for (const [pcId] of this.pcs) {
+        this.sig.send({ type: "leave", pc_id: pcId });
+      }
     }
 
-    // 发送 leave
-    if (this.mainSig?.isConnected) {
-      this.mainSig.send({ type: "leave" });
+    // 关闭所有 PC
+    for (const [, entry] of this.pcs) {
+      entry.pc.close();
     }
-
-    // 关闭发布 PC
-    if (this.publishPC) {
-      this.publishPC.close();
-      this.publishPC = null;
-    }
+    this.pcs.clear();
+    this.subPcByPublisher.clear();
 
     // 停止本地轨道
     if (this.localStream) {
@@ -223,8 +216,8 @@ export class SfuClient {
     }
 
     // 关闭信令
-    this.mainSig?.close();
-    this.mainSig = null;
+    this.sig?.close();
+    this.sig = null;
   }
 
   // ── 媒体控制 ──────────────────────────────────────────────
@@ -237,36 +230,69 @@ export class SfuClient {
     this.localStream?.getVideoTracks().forEach((t) => (t.enabled = enabled));
   }
 
-  // ── 信令消息处理 ──────────────────────────────────────────
+  // ── 信令消息处理 (统一入口, 按 pc_id 分发) ─────────────────
 
-  /** 主连接消息 (发布) */
-  private onMainMessage(msg: ServerMessage): void {
+  private onMessage(msg: ServerMessage): void {
     switch (msg.type) {
-      case "sdp_answer":
-        this.publishPC?.setRemoteDescription({ type: "answer", sdp: msg.sdp })
+      case "sdp_answer": {
+        const entry = this.pcs.get(msg.pc_id);
+        if (!entry) {
+          this.cb.onLog(`收到未知 pc_id 的 sdp_answer: ${msg.pc_id}`, "warn");
+          return;
+        }
+        const { pc, role, publisherId } = entry;
+
+        pc.setRemoteDescription({ type: "answer", sdp: msg.sdp })
           .then(() => {
-            // 添加服务器 ICE 候选
+            // 服务器的是 BUNDLE 单端口候选: 发布连接加到 mid 0,
+            // 订阅连接两个 mid 都尝试加入 (对端 mid 数量不同时忽略失败)。
+            const targets = role === "subscriber"
+              ? [{ mid: "0", idx: 0 }, { mid: "1", idx: 1 }]
+              : [{ mid: "0", idx: 0 }];
             for (const c of msg.ice_candidates) {
-              this.publishPC?.addIceCandidate({
-                candidate: c,
-                sdpMid: "0",
-                sdpMLineIndex: 0,
-              });
+              for (const t of targets) {
+                pc.addIceCandidate({ candidate: c, sdpMid: t.mid, sdpMLineIndex: t.idx })
+                  .catch(() => {});
+              }
             }
-            this.cb.onLog("SDP 协商完成, 已添加服务器候选", "success");
+
+            if (role === "subscriber" && publisherId) {
+              // SDP 完成后发送 subscribe (音频 mid=0 + 视频 mid=1), 复用同一 WebSocket
+              this.sig?.send({ type: "subscribe", pc_id: msg.pc_id, publisher_id: publisherId, track_mid: "0" });
+              this.sig?.send({ type: "subscribe", pc_id: msg.pc_id, publisher_id: publisherId, track_mid: "1" });
+              this.cb.onLog(`订阅 ${publisherId} SDP 完成, 已发送 subscribe`, "success");
+            } else {
+              this.cb.onLog("SDP 协商完成, 已添加服务器候选", "success");
+            }
           })
           .catch((e) => this.cb.onLog(`SDP 设置失败: ${e}`, "error"));
         break;
+      }
 
-      case "ice_candidate":
-        this.publishPC?.addIceCandidate({
-          candidate: msg.candidate,
-          sdpMid: msg.sdp_mid ?? "0",
-          sdpMLineIndex: 0,
-        });
+      case "ice_candidate": {
+        const entry = this.pcs.get(msg.pc_id);
+        entry?.pc
+          .addIceCandidate({ candidate: msg.candidate, sdpMid: msg.sdp_mid ?? "0", sdpMLineIndex: 0 })
+          .catch(() => {});
         break;
+      }
+
+      case "subscribed": {
+        const entry = this.pcs.get(msg.pc_id);
+        const pid = entry?.publisherId ?? msg.publisher_id;
+        this.cb.onSubscriptionUpdate(pid, { status: "subscribed" });
+        this.cb.onLog(`订阅确认: ${pid}`, "success");
+        break;
+      }
 
       case "participant_joined":
+        // 防御性过滤: 忽略自己, 以及自己的订阅连接 (participantId-recv-*).
+        if (
+          msg.participant_id === this.participantId ||
+          msg.participant_id.startsWith(`${this.participantId}-recv-`)
+        ) {
+          return;
+        }
         this.cb.onLog(`参与者加入: ${msg.participant_id}`, "info");
         this.cb.onParticipantJoined(msg.participant_id);
         break;
@@ -278,51 +304,34 @@ export class SfuClient {
         break;
 
       case "error":
-        this.cb.onLog(`服务器错误: ${msg.error}`, "error");
-        break;
-    }
-  }
-
-  /** 订阅连接消息 */
-  private onSubMessage(msg: ServerMessage, publisherId: string, pc: RTCPeerConnection): void {
-    switch (msg.type) {
-      case "sdp_answer":
-        pc.setRemoteDescription({ type: "answer", sdp: msg.sdp })
-          .then(() => {
-            for (const c of msg.ice_candidates) {
-              pc.addIceCandidate({ candidate: c, sdpMid: "0", sdpMLineIndex: 0 });
-              pc.addIceCandidate({ candidate: c, sdpMid: "1", sdpMLineIndex: 1 });
-            }
-            // SDP 完成后发送 subscribe (音频 mid=0 + 视频 mid=1)
-            const sig = this.subs.get(publisherId)?.signaling;
-            sig?.send({ type: "subscribe", publisher_id: publisherId, track_mid: "0" });
-            sig?.send({ type: "subscribe", publisher_id: publisherId, track_mid: "1" });
-            this.cb.onLog(`订阅 ${publisherId} SDP 完成, 已发送 subscribe`, "success");
-          })
-          .catch((e) => this.cb.onLog(`订阅 SDP 失败: ${e}`, "error"));
-        break;
-
-      case "ice_candidate":
-        pc.addIceCandidate({
-          candidate: msg.candidate,
-          sdpMid: msg.sdp_mid ?? "0",
-          sdpMLineIndex: 0,
-        });
-        break;
-
-      case "subscribed":
-        this.cb.onSubscriptionUpdate(publisherId, { status: "subscribed" });
-        this.cb.onLog(`订阅确认: ${publisherId}`, "success");
-        break;
-
-      case "error":
-        this.cb.onLog(`订阅 ${publisherId} 错误: ${msg.error}`, "error");
-        this.cb.onSubscriptionUpdate(publisherId, { status: "error" });
+        this.cb.onLog(
+          msg.pc_id ? `服务器错误 [${msg.pc_id}]: ${msg.error}` : `服务器错误: ${msg.error}`,
+          "error"
+        );
         break;
     }
   }
 
   // ── 工具 ──────────────────────────────────────────────────
+
+  private registerPc(
+    pcId: string,
+    pc: RTCPeerConnection,
+    role: "publisher" | "subscriber",
+    publisherId?: string
+  ): void {
+    this.pcs.set(pcId, { pc, role, publisherId });
+  }
+
+  private sendIce(pcId: string, cand: RTCIceCandidate): void {
+    this.sig?.send({
+      type: "ice_candidate",
+      pc_id: pcId,
+      candidate: cand.candidate,
+      sdp_mid: cand.sdpMid,
+      sdp_mline_index: cand.sdpMLineIndex,
+    });
+  }
 
   /** 等待 ICE 收集完成 */
   private waitIceComplete(pc: RTCPeerConnection): Promise<void> {

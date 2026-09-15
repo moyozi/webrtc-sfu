@@ -142,11 +142,15 @@ impl Participant {
 
     /// 获取本地 ICE 候选列表 (用于发送给客户端)
     pub fn local_candidates(&self) -> Vec<String> {
-        // 在实际实现中，需要从 Rtc 实例获取已添加的本地候选
-        // 这里返回基本的 host 候选
+        // 注意: ICE candidate 的 connection-address 与 port 必须用空格分隔的
+        // 两个字段 (如 `... 192.168.31.112 5175 typ host`),
+        // 不能用 SocketAddr 的 `ip:port` 形式, 否则浏览器 addIceCandidate
+        // 会报 "Error processing ICE candidate" 而拒绝, 导致 ICE 无法建立。
+        let addr = self.local_addr();
         vec![format!(
-            "candidate:1 1 udp 2122252543 {} typ host",
-            self.local_addr()
+            "candidate:1 1 udp 2122252543 {} {} typ host",
+            addr.ip(),
+            addr.port()
         )]
     }
 

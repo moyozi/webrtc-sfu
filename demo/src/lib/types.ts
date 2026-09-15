@@ -1,21 +1,24 @@
 /** 信令消息类型定义 — 与 Rust 服务端 `SignalingMessage` / `SignalingResponse` 对应 */
 
 // 客户端 → 服务器
+// 每条消息带 pc_id, 用于在同一条 WebSocket 上区分不同的 RTCPeerConnection:
+//   - "pub"            发布连接 (sendonly)
+//   - "sub-<remoteId>" 订阅某个远端参与者的连接 (recvonly)
 export type ClientMessage =
-  | { type: "join"; room_id: string; participant_id: string; sdp: string }
-  | { type: "ice_candidate"; candidate: string; sdp_mid: string | null; sdp_mline_index: number | null }
-  | { type: "subscribe"; publisher_id: string; track_mid: string }
-  | { type: "unsubscribe"; publisher_id: string; track_mid: string }
-  | { type: "leave" };
+  | { type: "join"; pc_id: string; room_id: string; participant_id: string; sdp: string; role: "publisher" | "subscriber" }
+  | { type: "ice_candidate"; pc_id: string; candidate: string; sdp_mid: string | null; sdp_mline_index: number | null }
+  | { type: "subscribe"; pc_id: string; publisher_id: string; track_mid: string }
+  | { type: "unsubscribe"; pc_id: string; publisher_id: string; track_mid: string }
+  | { type: "leave"; pc_id: string };
 
 // 服务器 → 客户端
 export type ServerMessage =
-  | { type: "sdp_answer"; sdp: string; ice_candidates: string[] }
-  | { type: "ice_candidate"; candidate: string; sdp_mid: string | null }
+  | { type: "sdp_answer"; pc_id: string; sdp: string; ice_candidates: string[] }
+  | { type: "ice_candidate"; pc_id: string; candidate: string; sdp_mid: string | null }
   | { type: "participant_joined"; participant_id: string }
   | { type: "participant_left"; participant_id: string }
-  | { type: "subscribed"; publisher_id: string }
-  | { type: "error"; error: string };
+  | { type: "subscribed"; pc_id: string; publisher_id: string }
+  | { type: "error"; pc_id?: string; error: string };
 
 /** 订阅状态 */
 export type SubStatus = "idle" | "connecting" | "subscribed" | "error";

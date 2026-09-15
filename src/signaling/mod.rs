@@ -19,10 +19,9 @@ use tokio::sync::mpsc;
 /// 信令服务器全局状态
 pub struct SignalingState {
     /// Worker 命令发送器 (每个 worker 一个)
-    /// 使用 round-robin 将新参与者分配到不同 worker
+    /// 同一房间的所有参与者 (发布者 + 订阅连接) 必须落在同一个 worker,
+    /// 因为每个 worker 拥有独立的 participants/router, 跨 worker 无法转发媒体。
     pub worker_txs: Vec<Sender<WorkerCommand>>,
-    /// 下一个 worker 索引 (round-robin)
-    pub next_worker: Mutex<usize>,
     /// 房间表: room_id → 房间信息
     pub rooms: Mutex<AHashMap<String, RoomInfo>>,
     /// WebSocket 消息发送器: participant_id → channel sender
@@ -41,18 +40,28 @@ impl SignalingState {
     pub fn new(worker_txs: Vec<Sender<WorkerCommand>>) -> Self {
         Self {
             worker_txs,
-            next_worker: Mutex::new(0),
             rooms: Mutex::new(AHashMap::new()),
             ws_senders: Mutex::new(AHashMap::new()),
         }
     }
 
-    /// Round-robin 选择下一个 worker
-    pub fn select_worker(&self) -> usize {
-        let mut next = self.next_worker.lock();
-        let idx = *next % self.worker_txs.len();
-        *next += 1;
-        idx
+    /// 按房间选择 worker (稳定哈希)
+    ///
+    /// 同一房间的发布者和订阅连接必须落在同一个 worker 上,
+    /// 否则订阅关系与媒体转发会落到不同的 participants/router 中而失败。
+    /// 不同房间则尽量均匀分布到不同 worker。
+    pub fn select_worker(&self, room_id: &str) -> usize {
+        let n = self.worker_txs.len();
+        if n <= 1 {
+            return 0;
+        }
+        // FNV-1a 64 位稳定哈希
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in room_id.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (hash as usize) % n
     }
 
     /// 加入房间
@@ -64,7 +73,10 @@ impl SignalingState {
                 id: room_id.to_string(),
                 participants: Vec::new(),
             });
-        room.participants.push(participant_id.to_string());
+        let pid = participant_id.to_string();
+        if !room.participants.contains(&pid) {
+            room.participants.push(pid);
+        }
     }
 
     /// 离开房间
