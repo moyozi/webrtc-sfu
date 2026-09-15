@@ -1,14 +1,23 @@
-//! 信令层 — WebSocket 信令服务器
+//! 信令层 — 同时支持 WebSocket 与 QUIC 两种传输
 //!
-//! 负责:
-//! - WebSocket 连接管理
-//! - SDP offer/answer 交换
-//! - Trickle ICE 候选交换
-//! - Room 创建/加入/离开
-//! - 订阅/取消订阅控制
-//! - 与 Worker 线程通过无锁 channel 通信
+//! ```text
+//!                    ┌──────────────────────────────┐
+//!   客户端 ──ws────► │  server.rs  (WebSocket 传输)  │ ─┐
+//!                    └──────────────────────────────┘  │
+//!                                                       ├─► session.rs ──► Worker
+//!                    ┌──────────────────────────────┐  │   (协议/房间/订阅)
+//!   客户端 ──quic──► │  quic.rs    (QUIC 传输)       │ ─┘
+//!                    └──────────────────────────────┘
+//! ```
+//!
+//! 两条传输承载相同的 JSON 协议 (`protocol.rs`), 复用同一套会话状态机
+//! (`session.rs`)。QUIC 天然支持连接迁移: 移动端从 WiFi 切到蜂窝时 IP 变化,
+//! 连接仍由 Connection ID 标识而不断开, 信令无需重连即可恢复。
 
+pub mod protocol;
+pub mod quic;
 pub mod server;
+pub mod session;
 
 use crate::core::WorkerCommand;
 use ahash::AHashMap;
@@ -24,9 +33,10 @@ pub struct SignalingState {
     pub worker_txs: Vec<Sender<WorkerCommand>>,
     /// 房间表: room_id → 房间信息
     pub rooms: Mutex<AHashMap<String, RoomInfo>>,
-    /// WebSocket 消息发送器: participant_id → channel sender
-    /// 用于向特定参与者推送通知 (participant_joined / participant_left)
-    pub ws_senders: Mutex<AHashMap<String, mpsc::UnboundedSender<String>>>,
+    /// 信令消息发送器: participant_id → channel sender
+    /// 用于向特定参与者推送通知 (participant_joined / participant_left)。
+    /// 与传输无关: WebSocket 与 QUIC 连接注册的 sender 语义完全一致。
+    pub senders: Mutex<AHashMap<String, mpsc::UnboundedSender<String>>>,
 }
 
 /// 房间信息 (信令层)
@@ -41,7 +51,7 @@ impl SignalingState {
         Self {
             worker_txs,
             rooms: Mutex::new(AHashMap::new()),
-            ws_senders: Mutex::new(AHashMap::new()),
+            senders: Mutex::new(AHashMap::new()),
         }
     }
 
@@ -105,19 +115,19 @@ impl SignalingState {
             .unwrap_or_default()
     }
 
-    /// 注册 WebSocket 消息发送器
-    pub fn register_ws_sender(&self, participant_id: &str, tx: mpsc::UnboundedSender<String>) {
-        self.ws_senders.lock().insert(participant_id.to_string(), tx);
+    /// 注册信令消息发送器 (WebSocket / QUIC 通用)
+    pub fn register_sender(&self, participant_id: &str, tx: mpsc::UnboundedSender<String>) {
+        self.senders.lock().insert(participant_id.to_string(), tx);
     }
 
-    /// 注销 WebSocket 消息发送器
-    pub fn unregister_ws_sender(&self, participant_id: &str) {
-        self.ws_senders.lock().remove(participant_id);
+    /// 注销信令消息发送器
+    pub fn unregister_sender(&self, participant_id: &str) {
+        self.senders.lock().remove(participant_id);
     }
 
     /// 向特定参与者发送消息
     pub fn send_to(&self, participant_id: &str, msg: &str) {
-        if let Some(tx) = self.ws_senders.lock().get(participant_id) {
+        if let Some(tx) = self.senders.lock().get(participant_id) {
             let _ = tx.send(msg.to_string());
         }
     }
@@ -128,10 +138,16 @@ impl SignalingState {
             let rooms = self.rooms.lock();
             rooms
                 .get(room_id)
-                .map(|r| r.participants.iter().filter(|p| p.as_str() != exclude).cloned().collect())
+                .map(|r| {
+                    r.participants
+                        .iter()
+                        .filter(|p| p.as_str() != exclude)
+                        .cloned()
+                        .collect()
+                })
                 .unwrap_or_default()
         };
-        let senders = self.ws_senders.lock();
+        let senders = self.senders.lock();
         for pid in &participants {
             if let Some(tx) = senders.get(pid) {
                 let _ = tx.send(msg.to_string());

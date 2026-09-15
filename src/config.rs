@@ -9,6 +9,8 @@ pub struct SfuConfig {
     pub listen_addr: SocketAddr,
     /// WebSocket 信令端口
     pub ws_listen_addr: SocketAddr,
+    /// QUIC 信令端口 (None = 禁用 QUIC)。默认启用, 移动端优先使用。
+    pub quic_listen_addr: Option<SocketAddr>,
     /// Worker 线程数 (每个 worker 占用一个媒体端口, 需放行端口段)
     pub num_workers: usize,
     /// recvmmsg 批量大小
@@ -31,9 +33,19 @@ impl SfuConfig {
             .filter(|n| *n > 0)
             .unwrap_or(1);
 
+        // QUIC 信令默认开启, IP 与 WebSocket 相同; 端口可用 SFU_QUIC_ADDR 覆盖,
+        // 置空 (SFU_QUIC_ADDR="") 或设为 "0" 可禁用。
+        let ws_listen_addr: SocketAddr = "192.168.31.112:5174".parse().unwrap();
+        let quic_listen_addr = match std::env::var("SFU_QUIC_ADDR") {
+            Ok(v) if v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off") => None,
+            Ok(v) => v.parse().ok(),
+            Err(_) => Some(SocketAddr::new(ws_listen_addr.ip(), 5173)),
+        };
+
         Self {
             listen_addr: "192.168.31.112:5175".parse().unwrap(),
-            ws_listen_addr: "192.168.31.112:5174".parse().unwrap(),
+            ws_listen_addr,
+            quic_listen_addr,
             num_workers,
             batch_size: 64,
             send_batch_size: 128,

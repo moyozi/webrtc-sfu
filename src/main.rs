@@ -90,7 +90,24 @@ fn main() {
 
     // ── 2. 启动信令服务器 (Tokio Runtime) ──
     let signaling_state = Arc::new(signaling::SignalingState::new(worker_cmd_txs));
-    let ws_addr_clone = ws_addr;
+
+    // QUIC 信令: 生成本地自签名证书 (生产环境应替换为受信证书)
+    let quic_tls = match config.quic_listen_addr {
+        Some(_) => match signaling::quic::QuicTls::self_signed("localhost") {
+            Ok(tls) => {
+                info!(
+                    "QUIC 自签名证书 SHA-256 指纹: {}",
+                    tls.fingerprint_sha256()
+                );
+                Some(tls)
+            }
+            Err(e) => {
+                warn!("生成 QUIC 自签名证书失败, QUIC 信令已禁用: {}", e);
+                None
+            }
+        },
+        None => None,
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -100,8 +117,34 @@ fn main() {
         .expect("failed to create tokio runtime");
 
     rt.block_on(async move {
-        if let Err(e) = signaling::server::run_server(ws_addr_clone, signaling_state).await {
-            error!("信令服务器错误: {}", e);
+        let ws_state = signaling_state.clone();
+        let ws_task = tokio::spawn(async move {
+            if let Err(e) = signaling::server::run_server(ws_addr, ws_state).await {
+                error!("WebSocket 信令服务器错误: {}", e);
+            }
+        });
+
+        // QUIC 优先作为移动终端的信令通道; WebSocket 作为兼容回退, 两者并存。
+        let quic_task = match (config.quic_listen_addr, quic_tls) {
+            (Some(addr), Some(tls)) => {
+                let quic_state = signaling_state.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(e) =
+                        signaling::quic::run_server(addr, quic_state, tls).await
+                    {
+                        error!("QUIC 信令服务器错误: {}", e);
+                    }
+                }))
+            }
+            _ => {
+                warn!("QUIC 信令未启用, 仅提供 WebSocket 信令");
+                None
+            }
+        };
+
+        let _ = ws_task.await;
+        if let Some(t) = quic_task {
+            let _ = t.await;
         }
     });
 

@@ -9,7 +9,7 @@
 ```
                         ┌─────────────────────────────────────────────────┐
                         │              Signaling Layer (Tokio)             │
-                        │   WebSocket Server · SDP 交换 · Room 管理        │
+                        │  QUIC (优先) + WebSocket · SDP 交换 · Room 管理  │
                         └────────┬──────────────────────────┬─────────────┘
                                  │ join/leave               │ SDP answer
                                  ▼                          ▼
@@ -95,7 +95,7 @@
 
 ┌──────────────────────────────────────────────────────────┐
 │              Tokio Runtime (信令线程池)                   │
-│  · WebSocket 连接管理                                    │
+│  · WebSocket / QUIC 连接管理                             │
 │  · SDP offer/answer 交换                                 │
 │  · Room 创建/销毁                                        │
 │  · 通过 crossbeam channel 向 Worker 发送命令              │
@@ -495,9 +495,29 @@ fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
 
 ## 8. 信令服务器
 
-### 8.1 WebSocket 协议
+信令服务器同时提供两种传输，承载**完全相同**的 JSON 协议：
 
-一条 WebSocket 连接可同时承载多个 RTCPeerConnection，用 `pc_id` 区分：
+| 传输 | 默认端口 | 适用场景 | 网络切换 |
+|------|----------|----------|----------|
+| **QUIC** (quinn) | `5173/udp` | 移动端 / 原生客户端（优先） | 连接迁移，IP 变化不断连 |
+| **WebSocket** | `5174/tcp` | 浏览器 / 兼容回退 | TCP 断开需重连 |
+
+二者共用 `signaling/session.rs` 中的同一套会话状态机，因此房间、订阅、
+Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉。
+
+```
+        ┌────────────┐   ws://host:5174   ┌─────────────────┐
+        │  浏览器     │ ─────────────────► │ server.rs (WS)  │ ─┐
+        └────────────┘                    └─────────────────┘  │
+                                                               ├─► session.rs ─► Worker
+        ┌────────────┐  quic://host:5173  ┌─────────────────┐  │   (protocol.rs)
+        │ 移动端 App  │ ─────────────────► │  quic.rs (quinn)│ ─┘
+        └────────────┘                    └─────────────────┘
+```
+
+### 8.1 消息协议（传输无关）
+
+一条信令连接可同时承载多个 RTCPeerConnection，用 `pc_id` 区分：
 
 - `pc_id = "pub"`：发布连接（sendonly），加入房间
 - `pc_id = "sub-<publisherId>"`：订阅连接（recvonly），不加入房间
@@ -558,12 +578,50 @@ fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
 { "type": "leave", "pc_id": "sub-bob-uuid" }
 ```
 
-### 8.2 信令流程
+### 8.2 QUIC 传输与连接迁移
+
+WebSocket 基于 TCP，四元组 (src ip:port, dst ip:port) 标识连接。移动终端从
+WiFi 切到蜂窝时本机 IP 改变，TCP 连接必然断开，需要重新握手、重新 join、
+重新协商 SDP。
+
+QUIC 连接由 **Connection ID** 标识，与 IP/端口解耦。切换网络后客户端把底层
+UDP socket 重新绑定到新接口，已有连接通过一次路径验证
+（`PATH_CHALLENGE` / `PATH_RESPONSE`）迁移到新路径即可继续使用，**信令会话、
+房间成员关系与 SDP 协商结果全部保留**。服务端无需任何特殊处理（quinn 自动
+按 Connection ID 路由），只需避免把业务状态绑定到 `remote_address()`。
+
+**帧格式**（单条双向流上承载多条 JSON 消息，长度前缀分帧）：
+
+```
+┌──────────────┬───────────────────────┐
+│ u32 BE len   │ JSON 负载 (len 字节)   │
+└──────────────┴───────────────────────┘
+```
+
+**TLS 证书**：服务端启动时用 `rcgen` 生成自签名证书并打印 SHA-256 指纹：
+
+```
+INFO QUIC 自签名证书 SHA-256 指纹: 3595d0c1...ce95
+INFO QUIC 信令服务器启动: quic://192.168.31.112:5173
+```
+
+客户端可固定校验该指纹（`examples/quic_signaling_client.rs` 已实现）。生产环境
+应换用受信证书；浏览器接入 QUIC 需经 **WebTransport**（HTTP/3），当前 demo
+页面仍走 WebSocket。
+
+**参考客户端**（含 `/migrate` 迁移演示）：
+
+```bash
+cargo run --example quic_signaling_client -- 192.168.31.112:5173 <指纹hex>
+# 交互: 输入 JSON 发送; /migrate 192.168.31.112 重绑 socket 触发迁移
+```
+
+### 8.3 信令流程
 
 ```
   Browser                  Signaling Server              Worker Thread
      │                            │                            │
-     │── WebSocket Connect ──────►│                            │
+     │── QUIC / WebSocket Connect ─►│                            │
      │                            │                            │
      │── join (SDP Offer) ───────►│                            │
      │                            │── WorkerCommand::Create ──►│
@@ -627,8 +685,13 @@ webrtc-sfu/
     │   ├── router.rs            ← RTP 路由引擎
     │   └── track.rs             ← 轨道表示
     └── signaling/
-        ├── mod.rs
-        └── server.rs            ← WebSocket 信令服务器
+        ├── mod.rs               ← SignalingState (房间表 / sender 表 / worker 选择)
+        ├── protocol.rs          ← 信令 JSON 协议 (与传输无关)
+        ├── session.rs           ← 传输无关会话状态机 (WS/QUIC 共用)
+        ├── server.rs            ← WebSocket 传输层
+        └── quic.rs              ← QUIC 传输层 (quinn) + 自签名证书
+└── examples/
+    └── quic_signaling_client.rs ← QUIC 信令客户端参考实现 (含连接迁移)
 ```
 
 ---
@@ -643,9 +706,12 @@ webrtc-sfu/
 cargo build --release
 
 # 运行
-RUST_LOG=info ./target/release/sfu-server --port 5004 --ws-port 8080 --workers 4
+RUST_LOG=info ./target/release/sfu-server
+# 默认端口: QUIC 信令 udp/5173, WebSocket 信令 tcp/5174, 媒体 udp/5175..
 
 # 环境变量调优
+SFU_WORKERS=4            # worker 线程数 (同时决定媒体端口数量)
+SFU_QUIC_ADDR=0.0.0.0:5173  # QUIC 信令监听地址; 设为 0/off/空 则禁用 QUIC
 SO_BUSY_POLL=50          # 内核忙轮询微秒数 (0=禁用)
 BATCH_SIZE=64            # recvmmsg 批量大小
 ```
@@ -717,6 +783,6 @@ for recv_msg in results {
 
 - **io_uring**: 用 `io_uring` 替代 `epoll + recvmmsg`，进一步减少系统调用 (Linux 5.1+)
 - **Kernel BPF**: 用 eBPF 做更精细的包路由和负载均衡
-- **QUIC 传输**: 支持基于 QUIC 的 WebRTC (WebTransport)
+- **WebTransport**: 在现有 quinn 端点上叠加 HTTP/3，让浏览器也能直接使用 QUIC 信令
 - **分布式 SFU**: 跨机器 Room 联邦，支持更大规模会议
 - **GPU 加速**: 视频转码/合流 (SFU + MCU 混合模式)

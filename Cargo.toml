@@ -28,6 +28,13 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.23"
 futures-util = "0.3"
 
+# QUIC 信令 (连接迁移: 移动端 WiFi/蜂窝切换时信令连接不中断)
+quinn = "0.11"
+# 自签名证书生成 (开发/内网部署)
+rcgen = "0.14"
+# 证书指纹 (WebTransport serverCertificateHashes / 客户端固定校验)
+sha2 = "0.10"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
