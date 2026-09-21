@@ -10,20 +10,29 @@
 //! 热路径设计要点:
 //! - 收包路由为 O(1) (ParticipantTable 的 ufrag/源地址索引)
 //! - 出包直接 move `Transmit.contents`，无 memcpy
-//! - 媒体帧以 `Arc<[u8]>` 在订阅者间共享，无拷贝
+//! - RTP mode 包级转发: 不重组帧、不重新分包，`RtpPacket.payload` (`Arc<[u8]>`)
+//!   在订阅者间共享，仅引用计数自增
 //! - 转发时的订阅者列表以切片借用，无 Vec/ String 分配
 //! - 媒体暂存缓冲区跨包复用
 
 use crate::core::timer::TimerWheel;
-use crate::core::{WorkerConfig, WorkerCommand, WorkerReply};
+use crate::core::{RelayHub, RelayedRtp, WorkerCommand, WorkerConfig, WorkerReply};
 use crate::net::udp::{UdpSocket, RecvBatch, SendBatch, MTU};
 use crate::net::poll::Poll;
-use crate::sfu::participant::ParticipantTable;
+use crate::sfu::layer::{is_keyframe, select_layer, vp8_temporal_id, RateWindow};
+use crate::sfu::participant::{Participant, ParticipantTable};
 use crate::sfu::router::Router;
+use ahash::AHashMap;
+use arrayvec::ArrayVec;
 use crossbeam_channel::{Receiver, Sender};
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use str0m::format::PayloadParams;
+use str0m::media::{Mid, Rid};
+use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
 use tracing::{info, warn, error, debug, trace};
 
 /// epoll 最长等待时间。
@@ -32,31 +41,51 @@ use tracing::{info, warn, error, debug, trace};
 /// (命令走 crossbeam channel, 无法唤醒 epoll)。该值即信令命令的最坏延迟。
 const MAX_WAIT: Duration = Duration::from_millis(10);
 
-/// 待转发的媒体帧: (mid, 媒体时间, 编码参数, 到达时间, 帧数据)
-type PendingMedia = (
-    str0m::media::Mid,
-    str0m::media::MediaTime,
-    str0m::format::PayloadParams,
-    Instant,
-    Arc<[u8]>,
-);
+/// 待转发的入站 RTP 包: (所属 mid, RtpPacket)。
+///
+/// RTP mode 下不再重组完整帧，每个入站 RTP 包独立转发。
+/// `RtpPacket.payload` 是 `Arc<[u8]>`，发给多个订阅者时仅增加引用计数，零拷贝。
+type PendingRtp = (str0m::media::Mid, str0m::rtp::RtpPacket);
 
 /// Worker 线程主函数
 pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
     let cpu_id = config.cpu_id;
-    info!(cpu_id, "Worker 线程启动");
+    let bwe_initial_bps = config.bwe_initial_bps;
+    // 跨 worker 中继: 本 worker 编号、中继总线、接收端与唤醒管道。
+    let self_idx = config.self_idx;
+    let relay = config.relay.clone();
+    // 全局 worker 编号 (跨主机唯一)
+    let self_global = relay.worker_offset + self_idx as u32;
+    let relay_rx: Receiver<RelayedRtp> = config.relay_rx.clone();
+    let wake_rx: UnixStream = config.wake_rx.try_clone().expect("clone wake_rx");
+    // 记录远端发布者所在 worker: publisher_id -> worker_idx (仅远端)。
+    // 以及每个本地订阅者订阅的远端发布者, 用于离开时注销中继。
+    let mut remote_publishers: AHashMap<String, usize> = AHashMap::new();
+    // subscriber_id -> [(publisher_id, publisher_mid, publisher_worker)]
+    let mut sub_remote: AHashMap<String, Vec<(String, String, usize)>> = AHashMap::new();
+    // 远端发布者的层/时间层速率 (从中继包实测)。
+    let mut remote_stats: AHashMap<String, RemotePublisherStats> = AHashMap::new();
+    info!(cpu_id, self_idx, "Worker 线程启动");
 
     // ── 1. 设置 CPU 亲和性 ──
     set_cpu_affinity(cpu_id);
 
     // ── 2. 创建 UDP socket (每个 worker 独立端口, 不再依赖 SO_REUSEPORT) ──
-    let socket = match UdpSocket::new(config.listen_addr, false) {
+    let socket = match UdpSocket::new(config.listen_addr, false, config.sock_buf_bytes) {
         Ok(s) => s,
         Err(e) => {
             error!(cpu_id, "创建 UDP socket 失败: {}", e);
             return;
         }
     };
+    let (rcvbuf, sndbuf) = socket.buffer_sizes();
+    info!(
+        cpu_id,
+        requested = config.sock_buf_bytes,
+        rcvbuf,
+        sndbuf,
+        "UDP socket 缓冲区生效值 (受内核 rmem_max/wmem_max 限制)"
+    );
 
     // 设置 SO_BUSY_POLL (如果配置了)
     if config.busy_poll_us > 0 {
@@ -78,6 +107,11 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
         error!(cpu_id, "注册 socket 到 epoll 失败: {}", e);
         return;
     }
+    // 注册中继唤醒管道读端
+    if let Err(e) = poll.add(wake_rx.as_raw_fd()) {
+        error!(cpu_id, "注册 wake 管道到 epoll 失败: {}", e);
+        return;
+    }
 
     // ── 4. 预分配缓冲区 ──
     let batch_size = config.batch_size;
@@ -85,7 +119,7 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
     let mut recv_batch = RecvBatch::new(batch_size, MTU);
     let mut send_batch = SendBatch::new(send_batch_size);
     // 媒体暂存缓冲区跨包复用，避免每包新建 Vec
-    let mut pending_media: Vec<PendingMedia> = Vec::with_capacity(64);
+    let mut pending_media: Vec<PendingRtp> = Vec::with_capacity(64);
 
     // ── 5. 初始化参与者表、路由器与定时器 ──
     let mut table = ParticipantTable::new();
@@ -109,6 +143,23 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
     loop {
         let now = Instant::now();
 
+        // ═══ Phase 0: 处理跨 worker 中继包 + 清空唤醒管道 ═══
+        drain_wake(&wake_rx);
+        while let Ok(relayed) = relay_rx.try_recv() {
+            forward_relayed_rtp(
+                relayed,
+                now,
+                self_global,
+                &mut table,
+                &mut router,
+                &mut send_batch,
+                &mut wheel,
+                &relay,
+                &mut remote_stats,
+                &remote_publishers,
+            );
+        }
+
         // ═══ Phase 1: 批量收包 (recvmmsg) ═══
         //
         // 使用 recvmmsg 批量接收 UDP 包，单次系统调用最多收 batch_size 个包。
@@ -127,11 +178,14 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                             data,
                             now,
                             local_addr,
+                            self_global,
+                            &relay,
                             &mut table,
                             &mut router,
                             &mut send_batch,
                             &mut pending_media,
                             &mut wheel,
+                            &remote_publishers,
                         );
                     }
                     // 如果没收满，说明数据已读完
@@ -176,6 +230,7 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                         room_id,
                         sdp_offer,
                         local_addr,
+                        bwe_initial_bps,
                         reply_tx,
                     );
                 }
@@ -203,8 +258,23 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                     if let Some(mut p) = table.remove(&participant_id) {
                         router.remove_participant(&participant_id);
                         p.rtc.disconnect();
-                        info!("参与者 {} 已移除", participant_id);
                     }
+                    // 注销该订阅者在远端发布者 worker 上的中继登记
+                    if let Some(subs) = sub_remote.remove(&participant_id) {
+                        for (publisher_id, publisher_mid, worker) in subs {
+                            if worker as u32 != self_global {
+                                relay.send_control(
+                                    worker as u32,
+                                    crate::core::RelayControl::Unregister {
+                                        publisher_id,
+                                        publisher_mid: Mid::from(publisher_mid.as_str()),
+                                        subscriber_id: participant_id.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    info!("参与者 {} 已移除", participant_id);
                 }
 
                 WorkerCommand::Subscribe {
@@ -213,46 +283,122 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                     publisher_id,
                     publisher_mid,
                     subscriber_mid,
+                    publisher_worker,
                 } => {
+                    // 本地 Router 登记 (用于本地送达), worker_idx 永远标记为本 worker。
                     router.add_subscription(
                         &subscriber_id,
                         &publisher_id,
                         &publisher_mid,
                         subscriber_mid.as_deref(),
+                        self_global as usize,
                     );
 
-                    // 向发布者请求关键帧, 让新订阅者尽快拿到可解码的帧 (尤其是视频)。
-                    if let Some(publisher) = table.get_mut(&publisher_id) {
-                        let mid = str0m::media::Mid::from(publisher_mid.as_str());
-                        if let Some(mut writer) = publisher.rtc.writer(mid) {
-                            let kind = str0m::media::KeyframeRequestKind::Pli;
-                            if writer.is_request_keyframe_possible(kind) {
-                                let _ = writer.request_keyframe(None, kind);
-                            }
-                        }
+                    if publisher_worker as u32 == self_global {
+                        // 本地发布者
+                        request_publisher_keyframe(
+                            &publisher_id, &publisher_mid, None, &mut table,
+                        );
+                        drain_and_schedule(
+                            &publisher_id, &mut table, &mut router,
+                            &mut send_batch, &mut wheel,
+                        );
+                    } else {
+                        // 远端 (可能跨主机) 发布者: 在发布者 worker 登记中继订阅
+                        remote_publishers.insert(publisher_id.clone(), publisher_worker);
+                        sub_remote
+                            .entry(subscriber_id.clone())
+                            .or_default()
+                            .push((
+                                publisher_id.clone(),
+                                publisher_mid.clone(),
+                                publisher_worker,
+                            ));
+                        relay.send_control(
+                            publisher_worker as u32,
+                            crate::core::RelayControl::Register {
+                                publisher_id: publisher_id.clone(),
+                                publisher_mid: Mid::from(publisher_mid.as_str()),
+                                subscriber_worker: self_global as usize,
+                                subscriber_id: subscriber_id.clone(),
+                                subscriber_mid: subscriber_mid
+                                    .as_deref()
+                                    .map(Mid::from),
+                            },
+                        );
                     }
 
-                    // 关键帧请求会产生 RTCP 输出, 立即 drain 并重排定时器
-                    drain_and_schedule(
-                        &publisher_id,
-                        &mut table,
-                        &mut router,
-                        &mut send_batch,
-                        &mut wheel,
+                    debug!(
+                        "订阅: {} -> {}:{} (publisher_worker={})",
+                        subscriber_id, publisher_id, publisher_mid, publisher_worker
                     );
-
-                    debug!("订阅: {} -> {}:{}", subscriber_id, publisher_id, publisher_mid);
                 }
 
                 WorkerCommand::Unsubscribe {
                     subscriber_id,
                     publisher_id,
                     publisher_mid,
+                    publisher_worker,
                 } => {
                     router.remove_subscription(
                         &subscriber_id,
                         &publisher_id,
                         &publisher_mid,
+                    );
+                    if publisher_worker as u32 != self_global {
+                        relay.send_control(
+                            publisher_worker as u32,
+                            crate::core::RelayControl::Unregister {
+                                publisher_id: publisher_id.clone(),
+                                publisher_mid: Mid::from(publisher_mid.as_str()),
+                                subscriber_id: subscriber_id.clone(),
+                            },
+                        );
+                    }
+                    if let Some(v) = sub_remote.get_mut(&subscriber_id) {
+                        v.retain(|(p, m, _)| !(p == &publisher_id && m == &publisher_mid));
+                    }
+                }
+
+                WorkerCommand::RegisterRelaySubscriber {
+                    publisher_id,
+                    publisher_mid,
+                    subscriber_worker,
+                    subscriber_id,
+                    subscriber_mid,
+                } => {
+                    // 发布者 worker: 登记一个远端订阅者 (worker_idx = 订阅者 worker)。
+                    router.add_subscription(
+                        &subscriber_id,
+                        &publisher_id,
+                        &publisher_mid,
+                        subscriber_mid.as_deref(),
+                        subscriber_worker,
+                    );
+                    request_publisher_keyframe(&publisher_id, &publisher_mid, None, &mut table);
+                    drain_and_schedule(
+                        &publisher_id, &mut table, &mut router,
+                        &mut send_batch, &mut wheel,
+                    );
+                }
+
+                WorkerCommand::UnregisterRelaySubscriber {
+                    publisher_id,
+                    publisher_mid,
+                    subscriber_id,
+                } => {
+                    router.remove_subscription(&subscriber_id, &publisher_id, &publisher_mid);
+                }
+
+                WorkerCommand::RequestKeyframe {
+                    publisher_id,
+                    publisher_mid,
+                    rid,
+                } => {
+                    request_publisher_keyframe(&publisher_id, &publisher_mid, rid, &mut table);
+                    drain_and_schedule(
+                        &publisher_id, &mut table, &mut router,
+                        &mut send_batch, &mut wheel,
                     );
                 }
 
@@ -268,10 +414,21 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
         // 将所有收集的 Transmit 包用 sendmmsg 一次发出。
 
         if !send_batch.is_empty() {
-            if let Err(e) = send_batch.flush(socket.raw_fd()) {
-                warn!(cpu_id, "sendmmsg 错误: {}", e);
+            match send_batch.flush(socket.raw_fd()) {
+                Ok(_) => {
+                    // 未发出的包已保留在 send_batch 中, 下一轮重试 (不 clear)。
+                    // 仅当积压超限时才会有丢弃, 此处给出诊断。
+                    let dropped = send_batch.dropped();
+                    if dropped > 0 {
+                        debug!(cpu_id, "send_batch 积压丢弃累计 {} 包", dropped);
+                    }
+                }
+                Err(e) => {
+                    warn!(cpu_id, "sendmmsg 错误: {}", e);
+                    // 出错时清空积压, 避免内存无限增长 (连接可能已失效)。
+                    send_batch.clear();
+                }
             }
-            send_batch.clear();
         }
 
         // ═══ Phase 5: epoll 等待 ═══
@@ -306,19 +463,22 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
 /// 1. 尝试从 STUN 包中提取 ICE ufrag (快速路径)
 /// 2. 通过 ParticipantTable 的 ufrag/源地址索引 O(1) 定位参与者
 /// 3. 喂入 str0m handle_input
-/// 4. Drain poll_output → 收集 Transmit 与 MediaData 事件
-/// 5. 将 MediaData 转发给订阅者 (先收集、后转发，规避借用冲突)
+/// 4. Drain poll_output → 收集 Transmit 与 RtpPacket 事件
+/// 5. 将 RtpPacket 转发给订阅者 (先收集、后转发，规避借用冲突)
 #[allow(clippy::too_many_arguments)]
 fn process_packet(
     source: SocketAddr,
     data: &[u8],
     now: Instant,
     local_addr: SocketAddr,
+    self_global: u32,
+    relay: &RelayHub,
     table: &mut ParticipantTable,
     router: &mut Router,
     send_batch: &mut SendBatch,
-    pending_media: &mut Vec<PendingMedia>,
+    pending_media: &mut Vec<PendingRtp>,
     wheel: &mut TimerWheel,
+    remote_publishers: &AHashMap<String, usize>,
 ) {
     if data.is_empty() {
         return;
@@ -343,7 +503,7 @@ fn process_packet(
     // ── 阶段 2: 喂入 str0m 处理并收集输出 ──
     //
     // 由于 Rust 所有权限制，我们不能在遍历一个参与者的同时修改其他参与者。
-    // 因此先把本参与者的 Transmit 与 MediaData 收集起来，稍后再转发。
+    // 因此先把本参与者的 Transmit 与 RtpPacket 收集起来，稍后再转发。
 
     pending_media.clear();
 
@@ -406,15 +566,19 @@ fn process_packet(
                                 media.kind,
                             );
                         }
-                        str0m::Event::MediaData(md) => {
-                            // 帧数据是 Arc<[u8]>，直接 move，供订阅者共享，零拷贝。
-                            pending_media.push((
-                                md.mid,
-                                md.time,
-                                md.params,
-                                md.network_time,
-                                md.data,
-                            ));
+                        str0m::Event::RtpPacket(pkt) => {
+                            // RTP mode: 直接收集 RTP 包。优先用 RTP header 扩展里的
+                            // mid 定位所属媒体; 缺失时回退用 SSRC 反查接收流。
+                            let mid = pkt.header.ext_vals.mid.or_else(|| {
+                                participant
+                                    .rtc
+                                    .direct_api()
+                                    .stream_rx(&pkt.header.ssrc)
+                                    .map(|s| s.mid())
+                            });
+                            if let Some(mid) = mid {
+                                pending_media.push((mid, pkt));
+                            }
                         }
                         _ => {
                             debug!("参与者 {} 事件: {:?}", target_id, event);
@@ -452,18 +616,19 @@ fn process_packet(
     //
     // 现在我们已经释放了对当前参与者的借用，
     // 可以安全地访问所有参与者进行转发。
-    for (mid, time, params, network_time, media_data) in pending_media.drain(..) {
-        forward_media_to_subscribers(
+    for (mid, pkt) in pending_media.drain(..) {
+        forward_rtp_to_subscribers(
             &target_id,
             mid,
-            time,
-            params,
-            network_time,
-            media_data,
+            pkt,
+            now,
+            self_global,
             table,
             router,
             send_batch,
             wheel,
+            relay,
+            remote_publishers,
         );
     }
 }
@@ -515,93 +680,534 @@ fn extract_ufrags(data: &[u8]) -> Option<(&str, &str)> {
 // 媒体转发 — SFU 核心操作
 // ──────────────────────────────────────────────────────────
 
-/// 将媒体数据转发给所有订阅者
-///
-/// 这是 SFU 的核心操作。流程:
-/// 1. 通过 Router 取订阅者切片 (零分配)
-/// 2. 对每个订阅者: 用 Rtc.writer(mid) 写入媒体 → drain poll_output 收集 Transmit
-///
-/// `data` 为 `Arc<[u8]>`，多个订阅者共享同一底层帧，仅做引用计数自增，
-/// 完全不拷贝帧内容。
-#[allow(clippy::too_many_arguments)]
-fn forward_media_to_subscribers(
+/// 解析 BWE 事件中的带宽估计 (bit/s)。
+fn bwe_kind_bps(kind: &str0m::bwe::BweKind) -> u64 {
+    match kind {
+        str0m::bwe::BweKind::Twcc(b) => b.as_u64(),
+        str0m::bwe::BweKind::Remb(_, b) => b.as_u64(),
+        _ => 0,
+    }
+}
+
+/// 转发源上下文: 统一「本地入站包」与「跨 worker 中继包」。
+struct SourceCtx<'a> {
+    publisher_id: &'a str,
+    mid: Mid,
+    params: PayloadParams,
+    layers: &'a [(Rid, u64)],
+    temporal: &'a [(u8, u64)],
+    incoming_rid: Option<Rid>,
+    incoming_tid: Option<u8>,
+    packet_keyframe: bool,
+    seq_no: SeqNo,
+    timestamp: u32,
+    marker: bool,
+    ext_vals: &'a ExtensionValues,
+    ssrc: Ssrc,
+    arrival: Instant,
+    payload: &'a Arc<[u8]>,
+}
+
+/// 远端发布者的层/时间层速率统计 (从中继包实测)。
+#[derive(Default)]
+struct RemotePublisherStats {
+    layers: AHashMap<Ssrc, RemoteLayer>,
+}
+
+struct RemoteLayer {
+    mid: Mid,
+    rid: Option<Rid>,
+    rate: RateWindow,
+    tid_rates: [RateWindow; 4],
+}
+
+impl RemotePublisherStats {
+    fn observe(
+        &mut self,
+        ssrc: Ssrc,
+        mid: Mid,
+        rid: Option<Rid>,
+        tid: Option<u8>,
+        bytes: usize,
+        now: Instant,
+    ) {
+        let e = self.layers.entry(ssrc).or_insert_with(|| RemoteLayer {
+            mid,
+            rid,
+            rate: RateWindow::new(now),
+            tid_rates: std::array::from_fn(|_| RateWindow::new(now)),
+        });
+        if e.rid.is_none() {
+            e.rid = rid;
+        }
+        e.rate.add(bytes, now);
+        if let Some(t) = tid {
+            e.tid_rates[(t & 3) as usize].add(bytes, now);
+        }
+    }
+
+    fn layer_rates(&self, mid: Mid) -> ArrayVec<(Rid, u64), 5> {
+        let mut v: ArrayVec<(Rid, u64), 5> = ArrayVec::new();
+        for l in self.layers.values() {
+            if l.mid == mid {
+                if let Some(rid) = l.rid {
+                    let _ = v.try_push((rid, l.rate.bps()));
+                }
+            }
+        }
+        v.sort_by_key(|(_, bps)| *bps);
+        v
+    }
+
+    fn temporal_rates(&self, mid: Mid) -> ArrayVec<(u8, u64), 4> {
+        let mut own = [0u64; 4];
+        for l in self.layers.values().filter(|l| l.mid == mid) {
+            for (t, o) in own.iter_mut().enumerate() {
+                *o += l.tid_rates[t].bps();
+            }
+        }
+        if own[1..].iter().all(|&b| b == 0) {
+            return ArrayVec::new();
+        }
+        let mut cum = [0u64; 4];
+        let mut acc = 0u64;
+        for t in 0..4usize {
+            acc += own[t];
+            cum[t] = acc;
+        }
+        let mut v: ArrayVec<(u8, u64), 4> = ArrayVec::new();
+        for t in 0..4usize {
+            if t == 0 || own[t] > 0 {
+                let _ = v.try_push((t as u8, cum[t]));
+            }
+        }
+        v
+    }
+}
+
+/// 直接向本地发布者的接收流请求关键帧。
+fn request_publisher_keyframe(
     publisher_id: &str,
-    publisher_mid: str0m::media::Mid,
-    time: str0m::media::MediaTime,
-    params: str0m::format::PayloadParams,
-    network_time: Instant,
-    data: Arc<[u8]>,
+    publisher_mid: &str,
+    rid: Option<Rid>,
     table: &mut ParticipantTable,
-    router: &Router,
+) {
+    if let Some(p) = table.get_mut(publisher_id) {
+        let mid = Mid::from(publisher_mid);
+        if let Some(stream) = p.rtc.direct_api().stream_rx_by_mid(mid, rid) {
+            stream.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
+        }
+    }
+}
+
+/// 请求关键帧: 本地直接请求, 远端发送跨 worker 命令。返回是否为本地发布者。
+fn request_keyframe(
+    publisher_id: &str,
+    mid: Mid,
+    rid: Option<Rid>,
+    table: &mut ParticipantTable,
+    remote_publishers: &AHashMap<String, usize>,
+    relay: &RelayHub,
+) -> bool {
+    if let Some(p) = table.get_mut(publisher_id) {
+        if let Some(stream) = p.rtc.direct_api().stream_rx_by_mid(mid, rid) {
+            stream.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
+        }
+        true
+    } else if let Some(&w) = remote_publishers.get(publisher_id) {
+        relay.send_control(
+            w as u32,
+            crate::core::RelayControl::RequestKeyframe {
+                publisher_id: publisher_id.to_string(),
+                publisher_mid: mid,
+                rid,
+            },
+        );
+        false
+    } else {
+        false
+    }
+}
+
+/// 清空唤醒管道 (非阻塞读到 EAGAIN)。
+fn drain_wake(wake_rx: &UnixStream) {
+    use std::io::Read;
+    let mut buf = [0u8; 64];
+    let mut s = wake_rx;
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
+/// 把一个个入站包送达所有订阅者: 本地写 `write_rtp`, 远端经 `RelayHub` 中继。
+///
+/// 同时完成: simulcast 选层 + 关键帧门控切换、SVC 时间层降级、逐订阅者序号重写、
+/// BWE 更新、PLI 回传。
+#[allow(clippy::too_many_arguments)]
+fn deliver_to_subscribers(
+    self_global: u32,
+    src: &SourceCtx<'_>,
+    now: Instant,
+    table: &mut ParticipantTable,
+    router: &mut Router,
     send_batch: &mut SendBatch,
     wheel: &mut TimerWheel,
+    relay: &RelayHub,
+    remote_publishers: &AHashMap<String, usize>,
 ) {
-    // 直接借用路由表内的订阅者切片 (无 Vec 分配、无 ID 克隆)
-    let subscribers = router.subscribers(publisher_id, publisher_mid);
+    let subscribers = router.subscribers(src.publisher_id, src.mid);
     if subscribers.is_empty() {
         return;
     }
 
-    debug!(
-        "转发: {} mid={:?} -> {} 订阅者",
-        publisher_id, publisher_mid, subscribers.len()
-    );
+    let simulcast = src.incoming_rid.is_some();
+    let svc = !simulcast && src.temporal.len() > 1;
+    let total_layer_bps: u64 = src.layers.iter().map(|(_, b)| *b).sum();
+
+    let mut keyframe_requests: Vec<(String, str0m::media::KeyframeRequest)> = Vec::new();
+    let mut switch_requests: Vec<Option<Rid>> = Vec::new();
+    // 需要中继的远端 worker (去重)
+    let mut remote_workers: ArrayVec<usize, 16> = ArrayVec::new();
 
     for sub in subscribers {
+        // 远端订阅者 (跨线程或跨主机): 只记录目标 worker, 实际由中继通道送达。
+        if sub.worker_idx as u32 != self_global {
+            if !remote_workers.contains(&sub.worker_idx) {
+                let _ = remote_workers.try_push(sub.worker_idx);
+            }
+            continue;
+        }
+
         let subscriber = match table.get_mut(&sub.subscriber_id) {
             Some(p) => p,
             None => continue,
         };
         let subscriber_mid = sub.subscriber_mid;
 
-        // 使用 str0m Writer 转发媒体。
-        //
-        // 关键: 发布者与订阅者各自协商的 PT 可能不同, 不能直接把发布者的
-        // pt 写进去 (Writer::write 会返回 RtcError::UnknownPt)。必须用
-        // Writer::match_params 把入站 PayloadParams 映射为订阅者本地的 PT。
-        if let Some(writer) = subscriber.rtc.writer(subscriber_mid) {
-            match writer.match_params(params) {
-                Some(local_pt) => {
-                    // wallclock 使用入站首个包的到达时间 (str0m 推荐做法)。
-                    // `data.clone()` 只增加 Arc 引用计数，无数据拷贝。
-                    if writer.write(local_pt, network_time, time, data.clone()).is_ok() {
-                        // Drain 订阅者的输出，收集 Transmit 包
-                        loop {
-                            match subscriber.rtc.poll_output() {
-                                Ok(str0m::Output::Transmit(transmit)) => {
-                                    send_batch.push(
-                                        transmit.destination,
-                                        transmit.contents.into(),
-                                    );
-                                }
-                                Ok(str0m::Output::Timeout(t)) => {
-                                    // 重排该订阅者的定时器 (仅 deadline 变化时写表)
-                                    if subscriber.next_timeout != Some(t) {
-                                        subscriber.next_timeout = Some(t);
-                                        wheel.schedule(&sub.subscriber_id, t);
-                                    }
-                                    break;
-                                }
-                                Ok(_) => {}
-                                Err(_) => break,
-                            }
-                        }
+        // 入站 PT → 订阅者本地 PT。
+        let local_pt = match subscriber.rtc.codec_config().match_params(src.params) {
+            Some(local) => local.pt(),
+            None => {
+                warn!(
+                    "订阅者 {} 未协商到与发布者 {} 匹配的编码 (mid={:?}, pt={:?})",
+                    sub.subscriber_id, src.publisher_id, subscriber_mid, src.params.pt()
+                );
+                continue;
+            }
+        };
+
+        subscriber.ensure_tx_stream(subscriber_mid);
+
+        let desired = if total_layer_bps > 0 {
+            total_layer_bps
+        } else {
+            src.temporal.last().map(|(_, b)| *b).unwrap_or(0)
+        };
+        subscriber.maybe_set_desired_bitrate(desired, now);
+
+        // ── 层选择 / 过滤 ──
+        let mut forward = true;
+        {
+            let budget = subscriber.egress_bitrate().unwrap_or(0);
+            let state = subscriber.layer_state_mut(subscriber_mid, now);
+
+            if simulcast {
+                if Participant::should_eval_layer(state, now) {
+                    let target = if budget == 0 {
+                        src.layers.last().map(|(r, _)| *r)
                     } else {
-                        warn!(
-                            "订阅者 {} 写入媒体失败 (mid={:?}, pt={:?})",
-                            sub.subscriber_id, subscriber_mid, local_pt
-                        );
+                        select_layer(src.layers, budget, 0.9)
+                            .or_else(|| src.layers.first().map(|(r, _)| *r))
+                    };
+                    if target != state.current && target != state.pending {
+                        state.pending = target;
+                        if target.is_some() {
+                            switch_requests.push(target);
+                        }
                     }
                 }
-                None => {
-                    warn!(
-                        "订阅者 {} 未协商到与发布者 {} 匹配的编码 (mid={:?}, pt={:?})",
-                        sub.subscriber_id, publisher_id, subscriber_mid, params.pt()
-                    );
+                match state.current {
+                    Some(cur) if src.incoming_rid == Some(cur) => {}
+                    _ => {
+                        if state.pending.is_some()
+                            && state.pending == src.incoming_rid
+                            && src.packet_keyframe
+                        {
+                            state.current = state.pending.take();
+                        } else if state.current.is_none()
+                            && state.pending.is_none()
+                            && src.packet_keyframe
+                        {
+                            state.current = src.incoming_rid;
+                        } else {
+                            forward = false;
+                        }
+                    }
+                }
+            } else if svc {
+                if Participant::should_eval_layer(state, now) {
+                    let effective = (budget as f64 * 0.95) as u64;
+                    let target = if budget == 0 {
+                        src.temporal.last().map(|(t, _)| *t)
+                    } else {
+                        src.temporal
+                            .iter()
+                            .rev()
+                            .find(|(_, bps)| *bps <= effective)
+                            .map(|(t, _)| *t)
+                            .or_else(|| src.temporal.first().map(|(t, _)| *t))
+                    };
+                    if target != state.max_tid {
+                        state.max_tid = target;
+                    }
+                }
+                if let (Some(tid), Some(max)) = (src.incoming_tid, state.max_tid) {
+                    if tid > max {
+                        forward = false;
+                    }
                 }
             }
         }
+        if !forward {
+            continue;
+        }
+
+        // 逐订阅者重写序号。
+        let seq = subscriber.next_tx_seq(subscriber_mid);
+        {
+            let mut api = subscriber.rtc.direct_api();
+            let Some(stream) = api.stream_tx_by_mid(subscriber_mid, None) else {
+                continue;
+            };
+            let write = str0m::rtp::RtpWrite::new(
+                local_pt,
+                seq,
+                src.timestamp,
+                src.arrival,
+                src.payload.clone(),
+            )
+            .marker(src.marker)
+            .ext_vals(src.ext_vals.clone())
+            .nackable(true);
+            stream.write_rtp(write);
+        }
+
+        loop {
+            match subscriber.rtc.poll_output() {
+                Ok(str0m::Output::Transmit(transmit)) => {
+                    send_batch.push(transmit.destination, transmit.contents.into());
+                }
+                Ok(str0m::Output::Event(str0m::Event::KeyframeRequest(req))) => {
+                    keyframe_requests.push((sub.subscriber_id.clone(), req));
+                }
+                Ok(str0m::Output::Event(str0m::Event::EgressBitrateEstimate(est))) => {
+                    subscriber.set_egress_bitrate(bwe_kind_bps(&est));
+                }
+                Ok(str0m::Output::Timeout(t)) => {
+                    if subscriber.next_timeout != Some(t) {
+                        subscriber.next_timeout = Some(t);
+                        wheel.schedule(&sub.subscriber_id, t);
+                    }
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
     }
+
+    // ── 中继给远端订阅者所在 worker (每目标 worker 一份, payload Arc 共享) ──
+    if !remote_workers.is_empty() {
+        let relayed = RelayedRtp {
+            publisher_id: Arc::from(src.publisher_id),
+            publisher_mid: src.mid,
+            params: src.params,
+            seq_no: src.seq_no,
+            timestamp: src.timestamp,
+            marker: src.marker,
+            ext_vals: src.ext_vals.clone(),
+            rid: src.incoming_rid,
+            ssrc: src.ssrc,
+            arrival: src.arrival,
+            payload: src.payload.clone(),
+        };
+        for w in remote_workers {
+            relay.relay(w as u32, relayed.clone());
+        }
+    }
+
+    // ── PLI 回传 (层切换 + 订阅者主动) ──
+    let mut local_drain: Vec<String> = Vec::new();
+    for rid in switch_requests {
+        if request_keyframe(src.publisher_id, src.mid, rid, table, remote_publishers, relay) {
+            local_drain.push(src.publisher_id.to_string());
+        }
+    }
+    for (subscriber_id, req) in keyframe_requests {
+        let targets = router.publisher_for_subscriber_mid(&subscriber_id, req.mid);
+        for (pub_id, pub_mid) in targets {
+            if request_keyframe(&pub_id, pub_mid, req.rid, table, remote_publishers, relay) {
+                local_drain.push(pub_id);
+            }
+        }
+    }
+    for pub_id in local_drain {
+        drain_and_schedule(&pub_id, table, router, send_batch, wheel);
+    }
+}
+
+/// 本地入站 RTP 包 → 观测层速率 → 送达。
+#[allow(clippy::too_many_arguments)]
+fn forward_rtp_to_subscribers(
+    publisher_id: &str,
+    publisher_mid: Mid,
+    pkt: str0m::rtp::RtpPacket,
+    now: Instant,
+    self_global: u32,
+    table: &mut ParticipantTable,
+    router: &mut Router,
+    send_batch: &mut SendBatch,
+    wheel: &mut TimerWheel,
+    relay: &RelayHub,
+    remote_publishers: &AHashMap<String, usize>,
+) {
+    let (params, layers, temporal) = {
+        let publisher = match table.get_mut(publisher_id) {
+            Some(p) => p,
+            None => return,
+        };
+        let params = match publisher.payload_params_for(pkt.header.payload_type) {
+            Some(p) => p,
+            None => return,
+        };
+        let tid = if params.spec().codec == str0m::format::Codec::Vp8 {
+            vp8_temporal_id(&pkt.payload)
+        } else {
+            None
+        };
+        publisher.observe_rx_packet(
+            pkt.header.ssrc,
+            publisher_mid,
+            pkt.header.ext_vals.rid,
+            tid,
+            pkt.payload.len() + pkt.header.header_len,
+            now,
+        );
+        let layers = publisher.layer_rates(publisher_mid);
+        let temporal = publisher.temporal_rates(publisher_mid);
+        (params, layers, temporal)
+    };
+
+    let codec = params.spec().codec;
+    let incoming_rid = pkt.header.ext_vals.rid;
+    let svc = incoming_rid.is_none() && temporal.len() > 1;
+    let packet_keyframe = codec.is_video() && is_keyframe(codec, &pkt.payload);
+    let incoming_tid = if svc {
+        vp8_temporal_id(&pkt.payload)
+    } else {
+        None
+    };
+
+    let src = SourceCtx {
+        publisher_id,
+        mid: publisher_mid,
+        params,
+        layers: &layers,
+        temporal: &temporal,
+        incoming_rid,
+        incoming_tid,
+        packet_keyframe,
+        seq_no: pkt.seq_no,
+        timestamp: pkt.header.timestamp,
+        marker: pkt.header.marker,
+        ext_vals: &pkt.header.ext_vals,
+        ssrc: pkt.header.ssrc,
+        arrival: pkt.timestamp,
+        payload: &pkt.payload,
+    };
+
+    deliver_to_subscribers(
+        self_global, &src, now, table, router, send_batch, wheel, relay, remote_publishers,
+    );
+}
+
+/// 跨 worker 中继包 → 实测远端层速率 → 送达本地订阅者。
+#[allow(clippy::too_many_arguments)]
+fn forward_relayed_rtp(
+    relayed: RelayedRtp,
+    now: Instant,
+    self_global: u32,
+    table: &mut ParticipantTable,
+    router: &mut Router,
+    send_batch: &mut SendBatch,
+    wheel: &mut TimerWheel,
+    relay: &RelayHub,
+    remote_stats: &mut AHashMap<String, RemotePublisherStats>,
+    remote_publishers: &AHashMap<String, usize>,
+) {
+    {
+        if !remote_stats.contains_key(&*relayed.publisher_id) {
+            remote_stats.insert(
+                relayed.publisher_id.to_string(),
+                RemotePublisherStats::default(),
+            );
+        }
+        let stats = remote_stats.get_mut(&*relayed.publisher_id).unwrap();
+        let tid = if relayed.params.spec().codec == str0m::format::Codec::Vp8 {
+            vp8_temporal_id(&relayed.payload)
+        } else {
+            None
+        };
+        stats.observe(
+            relayed.ssrc,
+            relayed.publisher_mid,
+            relayed.rid,
+            tid,
+            relayed.payload.len(),
+            now,
+        );
+    }
+
+    let stats = remote_stats.get(&*relayed.publisher_id).unwrap();
+    let layers = stats.layer_rates(relayed.publisher_mid);
+    let temporal = stats.temporal_rates(relayed.publisher_mid);
+
+    let codec = relayed.params.spec().codec;
+    let incoming_rid = relayed.rid;
+    let svc = incoming_rid.is_none() && temporal.len() > 1;
+    let incoming_tid = if svc {
+        vp8_temporal_id(&relayed.payload)
+    } else {
+        None
+    };
+    let packet_keyframe = codec.is_video() && is_keyframe(codec, &relayed.payload);
+
+    let src = SourceCtx {
+        publisher_id: &relayed.publisher_id,
+        mid: relayed.publisher_mid,
+        params: relayed.params,
+        layers: &layers,
+        temporal: &temporal,
+        incoming_rid,
+        incoming_tid,
+        packet_keyframe,
+        seq_no: relayed.seq_no,
+        timestamp: relayed.timestamp,
+        marker: relayed.marker,
+        ext_vals: &relayed.ext_vals,
+        ssrc: relayed.ssrc,
+        arrival: relayed.arrival,
+        payload: &relayed.payload,
+    };
+
+    deliver_to_subscribers(
+        self_global, &src, now, table, router, send_batch, wheel, relay, remote_publishers,
+    );
 }
 
 // ──────────────────────────────────────────────────────────
@@ -653,47 +1259,75 @@ fn drain_and_schedule(
     send_batch: &mut SendBatch,
     wheel: &mut TimerWheel,
 ) {
-    let participant = match table.get_mut(id) {
-        Some(p) => p,
-        None => return,
-    };
+    let mut keyframe_requests: Vec<str0m::media::KeyframeRequest> = Vec::new();
 
-    // Drain 输出 (Transmit + 事件)。
-    // 必须处理 MediaAdded 事件, 否则发布者轨道不会注册到 Router,
-    // 后续 subscribe 会找不到发布轨道而失败。
-    loop {
-        match participant.rtc.poll_output() {
-            Ok(str0m::Output::Transmit(transmit)) => {
-                send_batch.push(transmit.destination, transmit.contents.into());
+    {
+        let participant = match table.get_mut(id) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Drain 输出 (Transmit + 事件)。
+        // 必须处理 MediaAdded 事件, 否则发布者轨道不会注册到 Router,
+        // 后续 subscribe 会找不到发布轨道而失败。
+        loop {
+            match participant.rtc.poll_output() {
+                Ok(str0m::Output::Transmit(transmit)) => {
+                    send_batch.push(transmit.destination, transmit.contents.into());
+                }
+                Ok(str0m::Output::Event(event)) => match event {
+                    str0m::Event::Connected => {
+                        info!("参与者 {} 已连接", id);
+                    }
+                    str0m::Event::IceConnectionStateChange(state) => {
+                        debug!("参与者 {} ICE: {:?}", id, state);
+                    }
+                    str0m::Event::MediaAdded(media) => {
+                        info!(
+                            "参与者 {} 发布媒体 mid={:?} kind={:?}",
+                            id, media.mid, media.kind
+                        );
+                        router.add_publisher(id.to_string(), media.mid, media.kind);
+                    }
+                    str0m::Event::KeyframeRequest(req) => {
+                        // 订阅者的 PLI/FIR: 收集后回传给对应发布者。
+                        keyframe_requests.push(req);
+                    }
+                    str0m::Event::EgressBitrateEstimate(est) => {
+                        // 订阅者链路的带宽估计, 用于层选择。
+                        participant.set_egress_bitrate(bwe_kind_bps(&est));
+                    }
+                    other => {
+                        debug!("参与者 {} 事件: {:?}", id, other);
+                    }
+                },
+                Ok(str0m::Output::Timeout(t)) => {
+                    if participant.next_timeout != Some(t) {
+                        participant.next_timeout = Some(t);
+                        wheel.schedule(id, t);
+                    }
+                    break;
+                }
+                Err(e) => {
+                    warn!("参与者 {} poll_output 错误: {:?}", id, e);
+                    break;
+                }
             }
-            Ok(str0m::Output::Event(event)) => match event {
-                str0m::Event::Connected => {
-                    info!("参与者 {} 已连接", id);
+        }
+    }
+
+    // participant 的可变借用已结束，可以安全地访问其他参与者。
+    //
+    // 注意: 这里只处理**本地**发布者 (远端发布者的 PLI 在中继热路径
+    // `deliver_to_subscribers` 中通过 RequestKeyframe 命令回传)。
+    for req in keyframe_requests {
+        let targets = router.publisher_for_subscriber_mid(id, req.mid);
+        for (pub_id, pub_mid) in targets {
+            if let Some(p) = table.get_mut(&pub_id) {
+                if let Some(stream) = p.rtc.direct_api().stream_rx_by_mid(pub_mid, req.rid) {
+                    stream.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
                 }
-                str0m::Event::IceConnectionStateChange(state) => {
-                    debug!("参与者 {} ICE: {:?}", id, state);
-                }
-                str0m::Event::MediaAdded(media) => {
-                    info!(
-                        "参与者 {} 发布媒体 mid={:?} kind={:?}",
-                        id, media.mid, media.kind
-                    );
-                    router.add_publisher(id.to_string(), media.mid, media.kind);
-                }
-                other => {
-                    debug!("参与者 {} 事件: {:?}", id, other);
-                }
-            },
-            Ok(str0m::Output::Timeout(t)) => {
-                if participant.next_timeout != Some(t) {
-                    participant.next_timeout = Some(t);
-                    wheel.schedule(id, t);
-                }
-                break;
-            }
-            Err(e) => {
-                warn!("参与者 {} poll_output 错误: {:?}", id, e);
-                break;
+                drain_and_schedule(&pub_id, table, router, send_batch, wheel);
             }
         }
     }
@@ -714,6 +1348,7 @@ fn handle_create_participant(
     room_id: String,
     sdp_offer: String,
     local_addr: SocketAddr,
+    bwe_initial_bps: u64,
     reply_tx: Sender<WorkerReply>,
 ) {
     // 创建新的 Rtc 实例 (local_addr 为对外通告地址, 决定 ICE host 候选)
@@ -721,6 +1356,7 @@ fn handle_create_participant(
         participant_id.clone(),
         room_id.clone(),
         local_addr,
+        bwe_initial_bps,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -776,5 +1412,170 @@ fn set_cpu_affinity(cpu_id: usize) {
         warn!(cpu_id, "设置 CPU 亲和性失败: {}", e);
     } else {
         debug!(cpu_id, "已绑定到 CPU {}", cpu_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+
+    /// RemotePublisherStats 应能按 RID 选出层、按 TID 计算累计时间层。
+    #[test]
+    fn remote_stats_layers_and_temporal() {
+        let now = Instant::now();
+        let mid = Mid::from("1");
+        let mut s = RemotePublisherStats::default();
+
+        // 跨过 500ms 窗口 (首包 +100ms, 到 +600ms 触发)
+        for i in 1..=6u64 {
+            let t = now + Duration::from_millis(100 * i);
+            s.observe(Ssrc::from(10), mid, Some(Rid::from("l")), None, 1000, t);
+            s.observe(Ssrc::from(20), mid, Some(Rid::from("h")), None, 2000, t);
+            // SVC 时间层 (单 SSRC)
+            s.observe(Ssrc::from(30), mid, None, Some(0), 1000, t);
+            s.observe(Ssrc::from(30), mid, None, Some(1), 1000, t);
+        }
+
+        let layers = s.layer_rates(mid);
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].0, Rid::from("l"));
+        assert_eq!(layers[1].0, Rid::from("h"));
+        assert!(layers[0].1 <= layers[1].1);
+
+        let tr = s.temporal_rates(mid);
+        assert_eq!(tr.len(), 2);
+        assert_eq!(tr[0].0, 0);
+        assert_eq!(tr[1].0, 1);
+        assert!(tr[1].1 > tr[0].1);
+
+        // 其它 mid 无数据
+        assert!(s.layer_rates(Mid::from("9")).is_empty());
+        assert!(s.temporal_rates(Mid::from("9")).is_empty());
+    }
+
+    /// RelayHub: 向目标 worker 投递中继包并唤醒。
+    #[test]
+    fn relay_hub_delivers_and_wakes() {
+        let (rt, rr) = unbounded::<RelayedRtp>();
+        let (wrx, wtx) = UnixStream::pair().unwrap();
+        wrx.set_nonblocking(true).unwrap();
+        wtx.set_nonblocking(true).unwrap();
+
+        let hub = RelayHub {
+            relay_txs: vec![rt],
+            wake_txs: vec![Arc::new(wtx)],
+            cmd_txs: vec![],
+            worker_offset: 0,
+            local_workers: 1,
+            peer_addrs: Default::default(),
+            endpoint: None,
+        };
+
+        let pkt = RelayedRtp {
+            publisher_id: Arc::from("pub"),
+            publisher_mid: Mid::from("0"),
+            params: str0m::format::CodecConfig::new_with_defaults().params()[0],
+            seq_no: SeqNo::default(),
+            timestamp: 0,
+            marker: false,
+            ext_vals: ExtensionValues::default(),
+            rid: None,
+            ssrc: Ssrc::from(1),
+            arrival: Instant::now(),
+            payload: Arc::from(&[1u8, 2, 3][..]),
+        };
+        hub.relay(0, pkt);
+
+        assert!(rr.try_recv().is_ok(), "中继包应送达目标 worker");
+        // 唤醒管道应可读到字节
+        use std::io::Read;
+        let mut buf = [0u8; 8];
+        let mut r = &wrx;
+        assert!(r.read(&mut buf).unwrap_or(0) > 0, "应写入唤醒字节");
+    }
+
+    fn sample_pkt() -> RelayedRtp {
+        RelayedRtp {
+            publisher_id: Arc::from("pub"),
+            publisher_mid: Mid::from("0"),
+            params: str0m::format::CodecConfig::new_with_defaults().params()[0],
+            seq_no: SeqNo::from(1),
+            timestamp: 0,
+            marker: false,
+            ext_vals: ExtensionValues::default(),
+            rid: None,
+            ssrc: Ssrc::from(1),
+            arrival: Instant::now(),
+            payload: Arc::from(&[1u8, 2, 3][..]),
+        }
+    }
+
+    /// 目标 worker 在远端进程时, `RelayHub::relay` 应经 UDP 发送, 对端可解码。
+    #[test]
+    fn relay_routes_remote_over_udp() {
+        use crate::net::relay::{decode, Decoded, RelayEndpoint};
+
+        let sender = Arc::new(
+            RelayEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap(),
+        );
+        let receiver = RelayEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(1u32, receiver_addr);
+        let hub = RelayHub {
+            relay_txs: vec![],
+            wake_txs: vec![],
+            cmd_txs: vec![],
+            worker_offset: 0,
+            local_workers: 1,
+            peer_addrs: peers,
+            endpoint: Some(sender),
+        };
+
+        // 目标全局编号 1 属于另一台主机
+        hub.relay(1, sample_pkt());
+
+        let mut buf = [0u8; 2048];
+        let (n, _src) = receiver.recv_from(&mut buf).unwrap();
+        match decode(&buf[..n]).unwrap() {
+            Decoded::Rtp(d) => {
+                assert_eq!(d.target_worker, 1);
+                assert_eq!(&*d.pkt.payload, &[1u8, 2, 3]);
+            }
+            _ => panic!("expected RTP"),
+        }
+    }
+
+    /// 解码后的跨主机控制消息应注入目标本地 worker 的命令通道。
+    #[test]
+    fn dispatch_control_injects_command() {
+        use crate::net::relay::DecodedControl;
+        let (ctx, crx) = unbounded::<WorkerCommand>();
+        let hub = RelayHub {
+            relay_txs: vec![],
+            wake_txs: vec![],
+            cmd_txs: vec![ctx],
+            worker_offset: 0,
+            local_workers: 1,
+            peer_addrs: Default::default(),
+            endpoint: None,
+        };
+        crate::core::dispatch_relay_control(
+            &hub,
+            DecodedControl::RequestKeyframe {
+                target_worker: 0,
+                publisher_id: "p".into(),
+                publisher_mid: Mid::from("0"),
+                rid: None,
+            },
+        );
+        match crx.try_recv().unwrap() {
+            WorkerCommand::RequestKeyframe { publisher_id, .. } => {
+                assert_eq!(publisher_id, "p")
+            }
+            _ => panic!("expected RequestKeyframe"),
+        }
     }
 }
