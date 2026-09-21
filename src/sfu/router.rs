@@ -5,8 +5,11 @@
 //! 2. 将收到的 RTP 媒体数据转发给所有订阅者
 //! 3. 管理 simulcast 层选择
 //! 4. 处理订阅/取消订阅
+//!
+//! 性能关键: 媒体转发热路径 (`subscribers`) 不得分配内存。
+//! 因此路由表按 `publisher_id → mid → 订阅者` 两层组织，用 `&str`/`Mid`
+//! 直接查找，避免为每次查找构造 `TrackId { String, Mid }`。
 
-use crate::net::udp::SendBatch;
 use ahash::AHashMap;
 use tracing::debug;
 
@@ -15,6 +18,8 @@ pub use str0m::media::Mid;
 pub use str0m::media::MediaKind;
 
 /// 轨道标识: (发布者 ID, 发布者轨道 Mid)
+///
+/// 仅用于非热路径 (订阅反向索引)，热路径请使用两层 HashMap 直接查找。
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct TrackId {
     pub publisher_id: String,
@@ -43,11 +48,11 @@ pub struct Subscription {
 
 /// 路由引擎
 pub struct Router {
-    /// 发布轨道表: TrackId → 轨道信息
-    publishers: AHashMap<TrackId, PublishedTrack>,
+    /// 发布轨道表: publisher_id → (mid → 轨道信息)
+    publishers: AHashMap<String, AHashMap<Mid, PublishedTrack>>,
 
-    /// 订阅表: 发布轨道 TrackId → 订阅者列表
-    subscriptions: AHashMap<TrackId, Vec<Subscription>>,
+    /// 订阅表: publisher_id → (mid → 订阅者列表)
+    subscriptions: AHashMap<String, AHashMap<Mid, Vec<Subscription>>>,
 
     /// 反向索引: 订阅者 ID → 其订阅的所有轨道
     subscriber_index: AHashMap<String, Vec<TrackId>>,
@@ -71,28 +76,30 @@ impl Router {
         mid: Mid,
         kind: MediaKind,
     ) {
-        let track_id = TrackId {
-            publisher_id: publisher_id.clone(),
-            mid,
-        };
-
         info!(
             "注册发布轨道: {} mid={:?} kind={:?}",
             publisher_id, mid, kind
         );
 
-        self.publishers.insert(
-            track_id.clone(),
-            PublishedTrack {
-                publisher_id,
+        self.publishers
+            .entry(publisher_id.clone())
+            .or_default()
+            .insert(
                 mid,
-                kind,
-                simulcast_rids: Vec::new(),
-            },
-        );
+                PublishedTrack {
+                    publisher_id: publisher_id.clone(),
+                    mid,
+                    kind,
+                    simulcast_rids: Vec::new(),
+                },
+            );
 
-        // 初始化订阅列表
-        self.subscriptions.entry(track_id).or_default();
+        // 初始化订阅列表 (保留先前可能已登记的订阅关系)
+        self.subscriptions
+            .entry(publisher_id)
+            .or_default()
+            .entry(mid)
+            .or_default();
     }
 
     /// 添加订阅关系
@@ -107,17 +114,18 @@ impl Router {
         subscriber_id: &str,
         publisher_id: &str,
         publisher_mid: &str,
+        subscriber_mid: Option<&str>,
     ) {
-        // 解析 Mid (str0m Mid 实现了 From<&str>)
-        let mid = Mid::from(publisher_mid);
+        let publisher_key = Mid::from(publisher_mid);
+        // 订阅者自身该轨道的 mid；缺省退化为发布者 mid，兼容浏览器 "0"/"1" 约定。
+        let subscriber_mid = subscriber_mid.map(Mid::from).unwrap_or(publisher_key);
 
-        let track_id = TrackId {
-            publisher_id: publisher_id.to_string(),
-            mid,
-        };
-
-        // 如果发布轨道已经注册，则无需二次确认；未注册也允许先订阅。
-        let subs = self.subscriptions.entry(track_id.clone()).or_default();
+        let subs = self
+            .subscriptions
+            .entry(publisher_id.to_string())
+            .or_default()
+            .entry(publisher_key)
+            .or_default();
 
         // 去重: 同一订阅者不要重复订阅同一轨道
         if subs.iter().any(|s| s.subscriber_id == subscriber_id) {
@@ -128,12 +136,9 @@ impl Router {
             return;
         }
 
-        // 添加到订阅列表
-        // 注意: subscriber_mid 在实际实现中需要通过 SDP 协商确定
-        // 这里简化处理，使用与发布者相同的 mid
         subs.push(Subscription {
             subscriber_id: subscriber_id.to_string(),
-            subscriber_mid: mid,
+            subscriber_mid,
             selected_layer: None,
         });
 
@@ -141,7 +146,10 @@ impl Router {
         self.subscriber_index
             .entry(subscriber_id.to_string())
             .or_default()
-            .push(track_id);
+            .push(TrackId {
+                publisher_id: publisher_id.to_string(),
+                mid: publisher_key,
+            });
 
         debug!(
             "添加订阅: {} → {}:{}",
@@ -158,15 +166,28 @@ impl Router {
     ) {
         let mid = Mid::from(publisher_mid);
 
+        if let Some(mids) = self.subscriptions.get_mut(publisher_id) {
+            if let Some(subs) = mids.get_mut(&mid) {
+                subs.retain(|s| s.subscriber_id != subscriber_id);
+                if subs.is_empty() {
+                    mids.remove(&mid);
+                }
+            }
+        }
+        // 清理空的发布者条目
+        let empty = self
+            .subscriptions
+            .get(publisher_id)
+            .map(|m| m.is_empty())
+            .unwrap_or(false);
+        if empty {
+            self.subscriptions.remove(publisher_id);
+        }
+
         let track_id = TrackId {
             publisher_id: publisher_id.to_string(),
             mid,
         };
-
-        if let Some(subs) = self.subscriptions.get_mut(&track_id) {
-            subs.retain(|s| s.subscriber_id != subscriber_id);
-        }
-
         if let Some(tracks) = self.subscriber_index.get_mut(subscriber_id) {
             tracks.retain(|t| t != &track_id);
         }
@@ -174,104 +195,44 @@ impl Router {
 
     /// 移除参与者的所有发布和订阅
     pub fn remove_participant(&mut self, participant_id: &str) {
-        // 移除其发布轨道
-        let pub_keys: Vec<_> = self.publishers
-            .keys()
-            .filter(|k| k.publisher_id == participant_id)
-            .cloned()
-            .collect();
+        // 该参与者发布的所有轨道 (以及挂在轨道上的订阅) 整体移除
+        self.publishers.remove(participant_id);
+        self.subscriptions.remove(participant_id);
 
-        for key in &pub_keys {
-            self.publishers.remove(key);
-            self.subscriptions.remove(key);
-        }
+        // 反向索引
+        self.subscriber_index.remove(participant_id);
 
-        // 移除其订阅
-        if let Some(tracks) = self.subscriber_index.remove(participant_id) {
-            for track_id in &tracks {
-                if let Some(subs) = self.subscriptions.get_mut(track_id) {
-                    subs.retain(|s| s.subscriber_id != participant_id);
-                }
-            }
-        }
-
-        // 从其他人的订阅列表中移除该参与者
-        for subs in self.subscriptions.values_mut() {
-            subs.retain(|s| s.subscriber_id != participant_id);
+        // 从其他人的订阅列表中移除该参与者 (作为订阅者)
+        for mids in self.subscriptions.values_mut() {
+            mids.retain(|_, subs| {
+                subs.retain(|s| s.subscriber_id != participant_id);
+                !subs.is_empty()
+            });
         }
     }
 
-    /// 转发媒体数据 — SFU 的核心操作
+    /// 获取指定发布轨道的订阅者列表 (热路径, 零分配)
     ///
-    /// 当发布者收到 RTP 媒体数据时，将其转发给所有订阅者。
-    ///
-    /// 流程:
-    /// 1. 查找轨道的订阅者列表
-    /// 2. 对每个订阅者:
-    ///    a. 获取订阅者 Rtc 的 media writer
-    ///    b. 写入媒体数据 (str0m 内部处理 SRTP 加密 + RTP 打包)
-    ///    c. Drain 订阅者的 poll_output，收集 Transmit 包
-    ///
-    /// 注意: 由于 Rust 所有权限制，实际的参与者访问需要通过 Worker 传入。
-    /// 这里只做订阅者查找，实际的写入操作在 Worker 中完成。
-    pub fn forward_media(
-        &mut self,
-        publisher_id: &str,
-        mid: Mid,
-        pt: u8,
-        _time: str0m::media::MediaTime,
-        data: &[u8],
-        _send_batch: &mut SendBatch,
-    ) {
-        let track_id = TrackId {
-            publisher_id: publisher_id.to_string(),
-            mid,
-        };
-
-        // 查找订阅者
-        let subs = match self.subscriptions.get(&track_id) {
-            Some(s) if !s.is_empty() => s.clone(),
-            _ => return, // 没有订阅者，不需要转发
-        };
-
-        debug!(
-            "转发媒体: publisher={} mid={:?} pt={} bytes={} subscribers={}",
-            publisher_id, mid, pt, data.len(), subs.len()
-        );
-
-        // 注意: 在实际实现中，这里需要访问订阅者的 Rtc 实例。
-        // 由于 participants HashMap 和 Router 都在 Worker 中，
-        // Worker 需要协调两者的访问。
-        //
-        // 正确的做法是在 Worker 中实现转发逻辑:
-        // 1. Router.forward_media() 返回订阅者列表
-        // 2. Worker 遍历订阅者，访问其 Participant.rtc.writer(mid)
-        // 3. Worker drain 订阅者的 poll_output
-
-        // 这里提供一个回调式接口的占位实现
-        // 实际转发逻辑在 Worker::handle_event 中完成
-    }
-
-    /// 获取指定发布轨道的订阅者列表
-    ///
-    /// Worker 使用此方法获取订阅者，然后直接访问参与者进行转发
-    pub fn get_subscribers(&self, publisher_id: &str, mid: Mid) -> Vec<&Subscription> {
-        let track_id = TrackId {
-            publisher_id: publisher_id.to_string(),
-            mid,
-        };
-
+    /// 返回的切片借用 `self`，调用方可在同一函数内同时可变借用
+    /// 参与者表 (两者为不同变量)，从而无需克隆订阅者 ID。
+    pub fn subscribers(&self, publisher_id: &str, mid: Mid) -> &[Subscription] {
         self.subscriptions
-            .get(&track_id)
-            .map(|s| s.iter().collect())
-            .unwrap_or_default()
+            .get(publisher_id)
+            .and_then(|mids| mids.get(&mid))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// 统计信息
     pub fn stats(&self) -> RouterStats {
         RouterStats {
-            published_tracks: self.publishers.len(),
-            total_subscriptions: self.subscriptions.values().map(|s| s.len()).sum(),
+            published_tracks: self.publishers.values().map(|m| m.len()).sum(),
+            total_subscriptions: self
+                .subscriptions
+                .values()
+                .flat_map(|m| m.values())
+                .map(|v| v.len())
+                .sum(),
         }
     }
 }
@@ -296,15 +257,52 @@ mod tests {
         let mut router = Router::new();
 
         // 发布者尚未注册 (MediaAdded 未到达) 时先订阅
-        router.add_subscription("sub-1", "pub-1", "0");
-        assert_eq!(router.get_subscribers("pub-1", Mid::from("0")).len(), 1);
+        router.add_subscription("sub-1", "pub-1", "0", None);
+        assert_eq!(router.subscribers("pub-1", Mid::from("0")).len(), 1);
 
         // 发布者随后注册, 订阅关系应保留
         router.add_publisher("pub-1".to_string(), Mid::from("0"), MediaKind::Audio);
-        assert_eq!(router.get_subscribers("pub-1", Mid::from("0")).len(), 1);
+        assert_eq!(router.subscribers("pub-1", Mid::from("0")).len(), 1);
 
         // 重复订阅应去重
-        router.add_subscription("sub-1", "pub-1", "0");
-        assert_eq!(router.get_subscribers("pub-1", Mid::from("0")).len(), 1);
+        router.add_subscription("sub-1", "pub-1", "0", None);
+        assert_eq!(router.subscribers("pub-1", Mid::from("0")).len(), 1);
+    }
+
+    /// 移除参与者后，其订阅不应再被转发。
+    #[test]
+    fn remove_participant_cleans_subscriptions() {
+        let mut router = Router::new();
+        router.add_publisher("pub-1".to_string(), Mid::from("0"), MediaKind::Video);
+        router.add_subscription("sub-1", "pub-1", "0", None);
+        router.add_subscription("sub-2", "pub-1", "0", None);
+
+        router.remove_participant("sub-1");
+        let subs = router.subscribers("pub-1", Mid::from("0"));
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].subscriber_id, "sub-2");
+
+        // 移除发布者后轨道消失
+        router.remove_participant("pub-1");
+        assert_eq!(router.subscribers("pub-1", Mid::from("0")).len(), 0);
+    }
+
+    /// 订阅者自身 mid 与发布者不同时应被原样保存 (不再假定两者相同)。
+    #[test]
+    fn subscriber_mid_is_stored_independently() {
+        let mut router = Router::new();
+        router.add_publisher("pub-1".to_string(), Mid::from("pubA"), MediaKind::Video);
+
+        // 未提供 subscriber_mid 时退化为发布者 mid
+        router.add_subscription("sub-legacy", "pub-1", "pubA", None);
+        // 显式提供不同的 subscriber_mid
+        router.add_subscription("sub-1", "pub-1", "pubA", Some("subA"));
+
+        let subs = router.subscribers("pub-1", Mid::from("pubA"));
+        assert_eq!(subs.len(), 2);
+        let legacy = subs.iter().find(|s| s.subscriber_id == "sub-legacy").unwrap();
+        assert_eq!(legacy.subscriber_mid, Mid::from("pubA"));
+        let explicit = subs.iter().find(|s| s.subscriber_id == "sub-1").unwrap();
+        assert_eq!(explicit.subscriber_mid, Mid::from("subA"));
     }
 }

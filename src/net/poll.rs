@@ -49,22 +49,21 @@ impl Poll {
     ///
     /// `timeout`: 最大等待时间。0 = 立即返回，None = 无限等待
     ///
-    /// 返回就绪的文件描述符列表 (对于 UDP socket，通常只有一个 fd)
-    pub fn wait(&mut self, timeout: Option<Duration>) -> std::io::Result<Vec<RawFd>> {
+    /// 返回就绪的事件数量。事件缓冲区在 `Poll::new` 时预分配，
+    /// 本方法不再分配任何内存 (热路径每轮事件循环都会调用)。
+    ///
+    /// 注意: `timeout` 超过 65535ms 会被截断 (epoll 超时单位限制)。
+    pub fn wait(&mut self, timeout: Option<Duration>) -> std::io::Result<usize> {
         // nix 0.29: Epoll::wait 泛型超时接受 Option<u16> (None = 无限等待)
-        let timeout_ms: Option<u16> = timeout.map(|d| d.as_millis() as u16);
+        let timeout_ms: Option<u16> =
+            timeout.map(|d| d.as_millis().min(u16::MAX as u128) as u16);
 
         let n = self.epoll.wait(
             &mut self.events,
             timeout_ms,
         ).map_err(nix_to_io)?;
 
-        let mut fds = Vec::with_capacity(n);
-        for i in 0..n {
-            fds.push(self.events[i].data() as RawFd);
-        }
-
-        Ok(fds)
+        Ok(n)
     }
 }
 

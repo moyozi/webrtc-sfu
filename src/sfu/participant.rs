@@ -7,7 +7,9 @@
 //! - SDP 协商
 //! - 媒体收发
 
+use ahash::AHashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn, debug};
 
@@ -33,6 +35,10 @@ pub struct Participant {
 
     /// 是否已连接 (ICE + DTLS 完成)
     pub connected: bool,
+
+    /// 上次 `poll_output()` 返回的 `Output::Timeout` 时刻。
+    /// 用于避免收包热路径反复对定时器表做哈希查找: 只有该值变化时才更新 TimerWheel。
+    pub next_timeout: Option<Instant>,
 
     /// 本地绑定地址
     local_addr: SocketAddr,
@@ -69,6 +75,7 @@ impl Participant {
             local_ufrag,
             remote_ufrag: None,
             connected: false,
+            next_timeout: None,
             local_addr,
         })
     }
@@ -173,4 +180,160 @@ impl Participant {
 /// 将 SocketAddr 转换为 Candidate 地址格式
 fn local_addr_to_candidate_addr(addr: SocketAddr) -> SocketAddr {
     addr
+}
+
+// ──────────────────────────────────────────────────────────
+// ParticipantTable — O(1) 包路由索引
+// ──────────────────────────────────────────────────────────
+
+/// 参与者表 + 包路由索引
+///
+/// 热路径 (`process_packet`) 对每个 UDP 包都需要定位参与者:
+///   - STUN 包: 用 ICE ufrag 匹配
+///   - RTP/RTCP/DTLS 包: 用远端源地址匹配
+///
+/// 早期实现对参与者做 O(N) 线性扫描，每包一次，参与者增多时是灾难性的。
+/// 这里用两张索引把路由降为 O(1):
+///   - `ufrag_index`: local_ufrag → participant_id
+///   - `source_index`: 远端源地址 → participant_id
+///
+/// 索引值为 `Arc<str>`: 查找命中后克隆一次 Arc 只是原子自增，不产生堆分配，
+/// 同时避免持有对索引的借用而无法再可变借用参与者表。
+pub struct ParticipantTable {
+    participants: AHashMap<String, Participant>,
+    /// local ICE ufrag → participant_id
+    ufrag_index: AHashMap<String, Arc<str>>,
+    /// 远端源地址 → participant_id
+    source_index: AHashMap<SocketAddr, Arc<str>>,
+}
+
+impl ParticipantTable {
+    pub fn new() -> Self {
+        Self {
+            participants: AHashMap::new(),
+            ufrag_index: AHashMap::new(),
+            source_index: AHashMap::new(),
+        }
+    }
+
+    /// 插入参与者并建立 ufrag 索引
+    pub fn insert(&mut self, p: Participant) {
+        let id: Arc<str> = Arc::from(p.id.as_str());
+        self.ufrag_index.insert(p.local_ufrag.clone(), id.clone());
+        if let Some(source) = p.known_source {
+            self.source_index.insert(source, id.clone());
+        }
+        self.participants.insert(p.id.clone(), p);
+    }
+
+    /// 移除参与者并清理索引
+    pub fn remove(&mut self, id: &str) -> Option<Participant> {
+        let p = self.participants.remove(id)?;
+        self.ufrag_index.remove(&p.local_ufrag);
+        // 源地址索引可能因 ICE 迁移存在多条历史映射，统一清理，
+        // 保证任何指向已移除参与者的包都会被丢弃而不是路由到错误的 Rtc。
+        // 断连不是热路径，O(N) 可接受。
+        self.source_index.retain(|_, v| &**v != id);
+        Some(p)
+    }
+
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut Participant> {
+        self.participants.get_mut(id)
+    }
+
+    /// 遍历所有参与者 (供 Timer 驱动使用)
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut Participant)> {
+        self.participants.iter_mut()
+    }
+
+    /// O(1) 解析包所属参与者
+    ///
+    /// 先尝试 STUN ufrag (两段顺序都试)，再退回源地址匹配。
+    /// STUN USERNAME 为 `ufragA:ufragB`，两段顺序因实现而异，
+    /// 只要任一段等于本地 ufrag 即可命中。
+    pub fn resolve(
+        &self,
+        ufrags: Option<(&str, &str)>,
+        source: SocketAddr,
+    ) -> Option<Arc<str>> {
+        if let Some((a, b)) = ufrags {
+            if let Some(id) = self.ufrag_index.get(a) {
+                return Some(id.clone());
+            }
+            if let Some(id) = self.ufrag_index.get(b) {
+                return Some(id.clone());
+            }
+        }
+        self.source_index.get(&source).cloned()
+    }
+
+    /// 参与者远端源地址变化时同步索引。
+    ///
+    /// 调用方在持有参与者可变借用时已更新 `known_source` 字段，这里只负责
+    /// 同步索引，避免热路径为了更新索引再做一次参与者查找。
+    pub fn update_source_index(
+        &mut self,
+        id: &str,
+        old: Option<SocketAddr>,
+        new: SocketAddr,
+    ) {
+        if let Some(old) = old {
+            if self.source_index.get(&old).map(|v| &**v) == Some(id) {
+                self.source_index.remove(&old);
+            }
+        }
+        self.source_index.insert(new, Arc::from(id));
+    }
+
+    pub fn len(&self) -> usize {
+        self.participants.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.participants.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_by_ufrag_and_source() {
+        let mut table = ParticipantTable::new();
+        let p = Participant::new(
+            "p1".into(),
+            "room".into(),
+            "127.0.0.1:5000".parse().unwrap(),
+        )
+        .unwrap();
+        let ufrag = p.local_ufrag.clone();
+        table.insert(p);
+
+        // 两段 ufrag 任意一段匹配
+        assert_eq!(
+            table
+                .resolve(Some((&ufrag, "remote")), "1.2.3.4:9".parse().unwrap())
+                .as_deref(),
+            Some("p1")
+        );
+        assert_eq!(
+            table
+                .resolve(Some(("remote", &ufrag)), "1.2.3.4:9".parse().unwrap())
+                .as_deref(),
+            Some("p1")
+        );
+
+        // 源地址尚未记录时无法命中
+        let src: SocketAddr = "1.2.3.4:9".parse().unwrap();
+        assert!(table.resolve(None, src).is_none());
+
+        // 记录后可通过源地址命中，移除后索引清理
+        table.update_source_index("p1", None, src);
+        assert_eq!(table.resolve(None, src).as_deref(), Some("p1"));
+
+        assert!(table.remove("p1").is_some());
+        assert!(table.resolve(Some((&ufrag, "remote")), src).is_none());
+        assert!(table.resolve(None, src).is_none());
+    }
 }

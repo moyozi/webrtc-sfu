@@ -1,25 +1,45 @@
 //! Worker 事件循环 — SFU 的核心
 //!
 //! 每个 Worker 线程运行一个独立的事件循环，包含:
-//! 1. recvmmsg 批量收包 → 路由到 str0m Rtc 实例 → poll_output 收集输出
+//! 1. recvmmsg 批量收包 → O(1) 路由到 str0m Rtc 实例 → poll_output 收集输出
 //! 2. 驱动 Timer (Rtc 超时)
 //! 3. 处理信令命令 (通过 channel)
 //! 4. sendmmsg 批量发包
 //! 5. epoll 等待下一次收包
+//!
+//! 热路径设计要点:
+//! - 收包路由为 O(1) (ParticipantTable 的 ufrag/源地址索引)
+//! - 出包直接 move `Transmit.contents`，无 memcpy
+//! - 媒体帧以 `Arc<[u8]>` 在订阅者间共享，无拷贝
+//! - 转发时的订阅者列表以切片借用，无 Vec/ String 分配
+//! - 媒体暂存缓冲区跨包复用
 
+use crate::core::timer::TimerWheel;
 use crate::core::{WorkerConfig, WorkerCommand, WorkerReply};
 use crate::net::udp::{UdpSocket, RecvBatch, SendBatch, MTU};
 use crate::net::poll::Poll;
-use crate::sfu::participant::Participant;
+use crate::sfu::participant::ParticipantTable;
 use crate::sfu::router::Router;
-use ahash::AHashMap;
 use crossbeam_channel::{Receiver, Sender};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn, error, debug, trace};
 
-/// Timer 驱动间隔 — 每 10ms 驱动一次所有 Rtc 实例的定时器
-const TIMER_INTERVAL: Duration = Duration::from_millis(10);
+/// epoll 最长等待时间。
+///
+/// 定时器已改为 deadline 驱动, 但仍需周期性醒来处理信令命令
+/// (命令走 crossbeam channel, 无法唤醒 epoll)。该值即信令命令的最坏延迟。
+const MAX_WAIT: Duration = Duration::from_millis(10);
+
+/// 待转发的媒体帧: (mid, 媒体时间, 编码参数, 到达时间, 帧数据)
+type PendingMedia = (
+    str0m::media::Mid,
+    str0m::media::MediaTime,
+    str0m::format::PayloadParams,
+    Instant,
+    Arc<[u8]>,
+);
 
 /// Worker 线程主函数
 pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
@@ -64,16 +84,26 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
     let send_batch_size = config.send_batch_size;
     let mut recv_batch = RecvBatch::new(batch_size, MTU);
     let mut send_batch = SendBatch::new(send_batch_size);
+    // 媒体暂存缓冲区跨包复用，避免每包新建 Vec
+    let mut pending_media: Vec<PendingMedia> = Vec::with_capacity(64);
 
-    // ── 5. 初始化参与者表和路由器 ──
-    let mut participants: AHashMap<String, Participant> = AHashMap::new();
+    // ── 5. 初始化参与者表、路由器与定时器 ──
+    let mut table = ParticipantTable::new();
     let mut router = Router::new();
-    let mut next_timer = Instant::now() + TIMER_INTERVAL;
+    let mut wheel = TimerWheel::new();
 
-    // 本地地址 (用于 Receive::new 的 destination)
-    let local_addr = config.listen_addr;
+    // 对外通告地址: 绑定在 0.0.0.0, 但 SDP/ICE 候选与 Receive destination
+    // 必须使用客户端实际可达的地址 (announce_ip)。
+    let announce_addr = config.announce_addr;
+    // Receive::new 的 destination 使用实际收到的本地地址。绑定 0.0.0.0 时
+    // 通告地址即客户端发往的目标地址, 因此用它而非 0.0.0.0。
+    let local_addr = announce_addr;
 
-    info!(cpu_id, "Worker 就绪, 监听 {}", config.listen_addr);
+    info!(
+        cpu_id,
+        "Worker 就绪, 监听 {} (对外通告 {})",
+        config.listen_addr, announce_addr
+    );
 
     // ── 6. 主事件循环 ──
     loop {
@@ -97,9 +127,11 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                             data,
                             now,
                             local_addr,
-                            &mut participants,
+                            &mut table,
                             &mut router,
                             &mut send_batch,
+                            &mut pending_media,
+                            &mut wheel,
                         );
                     }
                     // 如果没收满，说明数据已读完
@@ -115,15 +147,12 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
             }
         }
 
-        // ═══ Phase 2: 驱动 Timer ═══
+        // ═══ Phase 2: 驱动到期定时器 ═══
         //
-        // 每 TIMER_INTERVAL 驱动一次所有 Rtc 实例的定时器。
+        // 只驱动 deadline 已到的参与者, 不再每 10ms 全量扫描。
         // str0m 是 Sans I/O，需要外部驱动时间前进。
 
-        if now >= next_timer {
-            drive_timers(&mut participants, &mut router, &mut send_batch, now);
-            next_timer = now + TIMER_INTERVAL;
-        }
+        drive_due_timers(now, &mut table, &mut router, &mut send_batch, &mut wheel);
 
         // ═══ Phase 3: 处理信令命令 ═══
         //
@@ -139,8 +168,10 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                     reply_tx,
                 } => {
                     handle_create_participant(
-                        &mut participants,
+                        &mut table,
                         &mut router,
+                        &mut send_batch,
+                        &mut wheel,
                         participant_id,
                         room_id,
                         sdp_offer,
@@ -154,13 +185,22 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                     candidate,
                     sdp_mid,
                 } => {
-                    if let Some(p) = participants.get_mut(&participant_id) {
+                    if let Some(p) = table.get_mut(&participant_id) {
                         p.add_remote_candidate(&candidate, sdp_mid);
                     }
+                    // 添加远端候选可能立即触发 ICE 发包, 需及时 drain 并重排定时器
+                    drain_and_schedule(
+                        &participant_id,
+                        &mut table,
+                        &mut router,
+                        &mut send_batch,
+                        &mut wheel,
+                    );
                 }
 
                 WorkerCommand::RemoveParticipant { participant_id } => {
-                    if let Some(mut p) = participants.remove(&participant_id) {
+                    wheel.cancel(&participant_id);
+                    if let Some(mut p) = table.remove(&participant_id) {
                         router.remove_participant(&participant_id);
                         p.rtc.disconnect();
                         info!("参与者 {} 已移除", participant_id);
@@ -172,15 +212,17 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                     subscriber_id,
                     publisher_id,
                     publisher_mid,
+                    subscriber_mid,
                 } => {
                     router.add_subscription(
                         &subscriber_id,
                         &publisher_id,
                         &publisher_mid,
+                        subscriber_mid.as_deref(),
                     );
 
                     // 向发布者请求关键帧, 让新订阅者尽快拿到可解码的帧 (尤其是视频)。
-                    if let Some(publisher) = participants.get_mut(&publisher_id) {
+                    if let Some(publisher) = table.get_mut(&publisher_id) {
                         let mid = str0m::media::Mid::from(publisher_mid.as_str());
                         if let Some(mut writer) = publisher.rtc.writer(mid) {
                             let kind = str0m::media::KeyframeRequestKind::Pli;
@@ -189,6 +231,15 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                             }
                         }
                     }
+
+                    // 关键帧请求会产生 RTCP 输出, 立即 drain 并重排定时器
+                    drain_and_schedule(
+                        &publisher_id,
+                        &mut table,
+                        &mut router,
+                        &mut send_batch,
+                        &mut wheel,
+                    );
 
                     debug!("订阅: {} -> {}:{}", subscriber_id, publisher_id, publisher_mid);
                 }
@@ -225,11 +276,16 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
 
         // ═══ Phase 5: epoll 等待 ═══
         //
-        // 等待下一次有数据可读，或超时后继续循环驱动 Timer。
+        // 睡到「最近的定时器 deadline」或 MAX_WAIT 中较早者。
         // 边缘触发模式下，只有新数据到达才会唤醒。
 
-        let timeout = next_timer.checked_duration_since(now);
-        match poll.wait(timeout) {
+        let wait = wheel
+            .next_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(MAX_WAIT)
+            .min(MAX_WAIT);
+
+        match poll.wait(Some(wait)) {
             Ok(_) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -248,189 +304,182 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
 ///
 /// 流程:
 /// 1. 尝试从 STUN 包中提取 ICE ufrag (快速路径)
-/// 2. 通过 ufrag 查表找到对应的 Rtc 实例
-/// 3. 如果不是 STUN 包，用源地址匹配
-/// 4. 喂入 str0m handle_input
-/// 5. Drain poll_output → 收集 Transmit 和 MediaData 事件
-/// 6. 将 MediaData 转发给订阅者 (需要访问其他参与者，分两阶段处理)
+/// 2. 通过 ParticipantTable 的 ufrag/源地址索引 O(1) 定位参与者
+/// 3. 喂入 str0m handle_input
+/// 4. Drain poll_output → 收集 Transmit 与 MediaData 事件
+/// 5. 将 MediaData 转发给订阅者 (先收集、后转发，规避借用冲突)
+#[allow(clippy::too_many_arguments)]
 fn process_packet(
     source: SocketAddr,
     data: &[u8],
     now: Instant,
     local_addr: SocketAddr,
-    participants: &mut AHashMap<String, Participant>,
+    table: &mut ParticipantTable,
     router: &mut Router,
     send_batch: &mut SendBatch,
+    pending_media: &mut Vec<PendingMedia>,
+    wheel: &mut TimerWheel,
 ) {
     if data.is_empty() {
         return;
     }
 
-    // ── 阶段 1: 查找匹配的参与者 ──
+    // ── 阶段 1: O(1) 查找匹配的参与者 ──
     //
     // STUN Binding Request 的 USERNAME 为 "ufragA:ufragB"。
-    // 不同实现里两个 ufrag 的顺序可能不同 (浏览器发来的可能是 remote:local),
-    // 因此只要任一片段等于某参与者的本地 ufrag 即可匹配, 否则 STUN 永远匹配不上,
-    // ICE 无法建立。
+    // 不同实现里两个 ufrag 的顺序可能不同，因此两段都会尝试匹配。
+    // 非 STUN 包 (RTP/RTCP/DTLS) 通过已知源地址匹配。
     let ufrags = extract_ufrags(data);
-    let target_id = ufrags
-        .as_ref()
-        .and_then(|(a, b)| {
-            participants.iter()
-                .find_map(|(id, p)| {
-                    if p.matches_ufrag(a) || p.matches_ufrag(b) {
-                        Some(id.clone())
-                    } else {
-                        None
-                    }
-                })
-        })
-        .or_else(|| {
-            // 非 STUN 包 (RTP/RTCP/DTLS)，通过已知源地址匹配
-            participants.iter()
-                .find_map(|(id, p)| {
-                    if p.matches_source(source) {
-                        Some(id.clone())
-                    } else {
-                        None
-                    }
-                })
-        });
+    let target_id = match table.resolve(ufrags, source) {
+        Some(id) => id,
+        None => return,
+    };
 
     trace!(
         "rx udp: {} bytes from {}, ufrags={:?}, target={:?}",
         data.len(), source, ufrags, target_id
     );
 
-    let participant_id = match target_id {
-        Some(id) => id,
-        None => return,
-    };
-
-    // ── 阶段 2: 喂入 str0m 处理 ──
-    let participant = match participants.get_mut(&participant_id) {
-        Some(p) => p,
-        None => return,
-    };
-
-    let receive = match str0m::net::Receive::new(
-        str0m::net::Protocol::Udp,
-        source,
-        local_addr,
-        data,
-    ) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-
-    if participant.rtc.handle_input(
-        str0m::Input::Receive(now, receive)
-    ).is_err() {
-        return;
-    }
-
-    // 记录已知源地址
-    participant.known_source = Some(source);
-
-    // ── 阶段 3: Drain 输出，收集 Transmit 和 MediaData 事件 ──
+    // ── 阶段 2: 喂入 str0m 处理并收集输出 ──
     //
     // 由于 Rust 所有权限制，我们不能在遍历一个参与者的同时修改其他参与者。
-    // 因此分两步:
-    // 1. 先收集当前参与者的所有输出 (Transmit + MediaData 事件)
-    // 2. 再处理 MediaData 事件 (转发给其他订阅者)
+    // 因此先把本参与者的 Transmit 与 MediaData 收集起来，稍后再转发。
 
-    let mut pending_media: Vec<(
-        str0m::media::Mid,
-        str0m::media::MediaTime,
-        str0m::format::PayloadParams,
-        Instant,
-        bytes::Bytes,
-    )> = Vec::new();
+    pending_media.clear();
 
-    loop {
-        match participant.rtc.poll_output() {
-            Ok(str0m::Output::Transmit(transmit)) => {
-                send_batch.push(
-                    transmit.destination,
-                    bytes::Bytes::copy_from_slice(&transmit.contents),
-                );
-            }
+    let mut source_changed = false;
+    let mut old_source: Option<SocketAddr> = None;
+    let mut reschedule: Option<Instant> = None;
 
-            Ok(str0m::Output::Event(event)) => {
-                match event {
-                    str0m::Event::Connected => {
-                        info!("参与者 {} 已连接", participant_id);
-                    }
-                    str0m::Event::IceConnectionStateChange(state) => {
-                        debug!("参与者 {} ICE: {:?}", participant_id, state);
-                    }
-                    str0m::Event::MediaAdded(media) => {
-                        info!(
-                            "参与者 {} 发布媒体 mid={:?} kind={:?}",
-                            participant_id, media.mid, media.kind
-                        );
-                        router.add_publisher(
-                            participant_id.clone(),
-                            media.mid,
-                            media.kind,
-                        );
-                    }
-                    str0m::Event::MediaData(md) => {
-                        // 收集媒体数据, 稍后转发。
-                        // 同时保留入站 PayloadParams 与到达时间, 供订阅者做 PT 重映射。
-                        pending_media.push((
-                            md.mid,
-                            md.time,
-                            md.params,
-                            md.network_time,
-                            bytes::Bytes::copy_from_slice(&md.data),
-                        ));
-                    }
-                    _ => {
-                        debug!("参与者 {} 事件: {:?}", participant_id, event);
+    {
+        let participant = match table.get_mut(&target_id) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let receive = match str0m::net::Receive::new(
+            str0m::net::Protocol::Udp,
+            source,
+            local_addr,
+            data,
+        ) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        if participant.rtc.handle_input(
+            str0m::Input::Receive(now, receive)
+        ).is_err() {
+            return;
+        }
+
+        // 记录/更新远端源地址 (供后续 RTP/RTCP/DTLS 包 O(1) 路由)
+        if participant.known_source != Some(source) {
+            old_source = participant.known_source;
+            participant.known_source = Some(source);
+            source_changed = true;
+        }
+
+        loop {
+            match participant.rtc.poll_output() {
+                Ok(str0m::Output::Transmit(transmit)) => {
+                    // 直接 move str0m 生成的 Vec<u8>，避免逐包 memcpy。
+                    send_batch.push(transmit.destination, transmit.contents.into());
+                }
+
+                Ok(str0m::Output::Event(event)) => {
+                    match event {
+                        str0m::Event::Connected => {
+                            info!("参与者 {} 已连接", target_id);
+                        }
+                        str0m::Event::IceConnectionStateChange(state) => {
+                            debug!("参与者 {} ICE: {:?}", target_id, state);
+                        }
+                        str0m::Event::MediaAdded(media) => {
+                            info!(
+                                "参与者 {} 发布媒体 mid={:?} kind={:?}",
+                                target_id, media.mid, media.kind
+                            );
+                            router.add_publisher(
+                                target_id.to_string(),
+                                media.mid,
+                                media.kind,
+                            );
+                        }
+                        str0m::Event::MediaData(md) => {
+                            // 帧数据是 Arc<[u8]>，直接 move，供订阅者共享，零拷贝。
+                            pending_media.push((
+                                md.mid,
+                                md.time,
+                                md.params,
+                                md.network_time,
+                                md.data,
+                            ));
+                        }
+                        _ => {
+                            debug!("参与者 {} 事件: {:?}", target_id, event);
+                        }
                     }
                 }
-            }
 
-            Ok(str0m::Output::Timeout(_)) => break,
-            Err(e) => {
-                warn!("poll_output 错误: {:?}", e);
-                break;
+                Ok(str0m::Output::Timeout(t)) => {
+                    // 记录下次唤醒时刻, 只在变化时更新定时器表 (避免每包一次哈希写入)
+                    if participant.next_timeout != Some(t) {
+                        participant.next_timeout = Some(t);
+                        reschedule = Some(t);
+                    }
+                    break;
+                }
+                Err(e) => {
+                    warn!("poll_output 错误: {:?}", e);
+                    break;
+                }
             }
         }
     }
 
-    // ── 阶段 4: 转发媒体数据给订阅者 ──
+    // 源地址变化时同步 O(1) 路由索引 (仅连接建立/ICE 迁移时发生)
+    if source_changed {
+        table.update_source_index(&target_id, old_source, source);
+    }
+
+    // 重排本参与者的定时器 (deadline 未变时 schedule 内部直接返回)
+    if let Some(t) = reschedule {
+        wheel.schedule(&target_id, t);
+    }
+
+    // ── 阶段 3: 转发媒体数据给订阅者 ──
     //
     // 现在我们已经释放了对当前参与者的借用，
     // 可以安全地访问所有参与者进行转发。
-    for (mid, time, params, network_time, media_data) in pending_media {
+    for (mid, time, params, network_time, media_data) in pending_media.drain(..) {
         forward_media_to_subscribers(
-            &participant_id,
+            &target_id,
             mid,
             time,
             params,
             network_time,
-            &media_data,
-            participants,
+            media_data,
+            table,
             router,
             send_batch,
+            wheel,
         );
     }
 }
 
-/// 从 STUN 包中提取 ICE ufrag 的两个片段
+/// 从 STUN 包中提取 ICE ufrag 的两个片段 (零分配，借用入参)
 ///
 /// STUN Binding Request 的 USERNAME 属性为 `<ufragA>:<ufragB>`，
 /// 不同实现中两段的顺序可能不同，因此返回两段供调用方匹配。
-fn extract_ufrags(data: &[u8]) -> Option<(String, String)> {
+fn extract_ufrags(data: &[u8]) -> Option<(&str, &str)> {
     // STUN 包最少 20 字节头部
     if data.len() < 20 {
         return None;
     }
 
     // 检查 STUN magic cookie: 0x2112A442 (字节 4-7)
-    if &data[4..8] != &[0x21, 0x12, 0xA4, 0x42] {
+    if data[4..8] != [0x21, 0x12, 0xA4, 0x42] {
         return None;
     }
 
@@ -451,7 +500,7 @@ fn extract_ufrags(data: &[u8]) -> Option<(String, String)> {
             let username_str = std::str::from_utf8(username).ok()?;
             let mut parts = username_str.split(':');
             if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
-                return Some((a.to_string(), b.to_string()));
+                return Some((a, b));
             }
         }
 
@@ -469,31 +518,26 @@ fn extract_ufrags(data: &[u8]) -> Option<(String, String)> {
 /// 将媒体数据转发给所有订阅者
 ///
 /// 这是 SFU 的核心操作。流程:
-/// 1. 通过 Router 查找订阅者列表
-/// 2. 对每个订阅者:
-///    a. 从 participants 中获取订阅者的 Participant
-///    b. 使用 Rtc.writer(mid) 写入媒体数据
-///    c. Drain 订阅者的 poll_output，收集 Transmit 包
+/// 1. 通过 Router 取订阅者切片 (零分配)
+/// 2. 对每个订阅者: 用 Rtc.writer(mid) 写入媒体 → drain poll_output 收集 Transmit
 ///
-/// 注意: 媒体数据使用 Bytes (引用计数)，多个订阅者共享同一底层数据，零拷贝。
+/// `data` 为 `Arc<[u8]>`，多个订阅者共享同一底层帧，仅做引用计数自增，
+/// 完全不拷贝帧内容。
+#[allow(clippy::too_many_arguments)]
 fn forward_media_to_subscribers(
     publisher_id: &str,
     publisher_mid: str0m::media::Mid,
     time: str0m::media::MediaTime,
     params: str0m::format::PayloadParams,
     network_time: Instant,
-    data: &bytes::Bytes,
-    participants: &mut AHashMap<String, Participant>,
+    data: Arc<[u8]>,
+    table: &mut ParticipantTable,
     router: &Router,
     send_batch: &mut SendBatch,
+    wheel: &mut TimerWheel,
 ) {
-    // 查找订阅者列表
-    let subscribers: Vec<(String, str0m::media::Mid)> = router
-        .get_subscribers(publisher_id, publisher_mid)
-        .iter()
-        .map(|sub| (sub.subscriber_id.clone(), sub.subscriber_mid))
-        .collect();
-
+    // 直接借用路由表内的订阅者切片 (无 Vec 分配、无 ID 克隆)
+    let subscribers = router.subscribers(publisher_id, publisher_mid);
     if subscribers.is_empty() {
         return;
     }
@@ -503,12 +547,12 @@ fn forward_media_to_subscribers(
         publisher_id, publisher_mid, subscribers.len()
     );
 
-    // 遍历订阅者，逐个转发
-    for (subscriber_id, subscriber_mid) in subscribers {
-        let subscriber = match participants.get_mut(&subscriber_id) {
+    for sub in subscribers {
+        let subscriber = match table.get_mut(&sub.subscriber_id) {
             Some(p) => p,
             None => continue,
         };
+        let subscriber_mid = sub.subscriber_mid;
 
         // 使用 str0m Writer 转发媒体。
         //
@@ -518,18 +562,26 @@ fn forward_media_to_subscribers(
         if let Some(writer) = subscriber.rtc.writer(subscriber_mid) {
             match writer.match_params(params) {
                 Some(local_pt) => {
-                    // wallclock 使用入站首个包的到达时间 (str0m 推荐做法)
-                    if writer.write(local_pt, network_time, time, data.as_ref()).is_ok() {
+                    // wallclock 使用入站首个包的到达时间 (str0m 推荐做法)。
+                    // `data.clone()` 只增加 Arc 引用计数，无数据拷贝。
+                    if writer.write(local_pt, network_time, time, data.clone()).is_ok() {
                         // Drain 订阅者的输出，收集 Transmit 包
                         loop {
                             match subscriber.rtc.poll_output() {
                                 Ok(str0m::Output::Transmit(transmit)) => {
                                     send_batch.push(
                                         transmit.destination,
-                                        bytes::Bytes::copy_from_slice(&transmit.contents),
+                                        transmit.contents.into(),
                                     );
                                 }
-                                Ok(str0m::Output::Timeout(_)) => break,
+                                Ok(str0m::Output::Timeout(t)) => {
+                                    // 重排该订阅者的定时器 (仅 deadline 变化时写表)
+                                    if subscriber.next_timeout != Some(t) {
+                                        subscriber.next_timeout = Some(t);
+                                        wheel.schedule(&sub.subscriber_id, t);
+                                    }
+                                    break;
+                                }
                                 Ok(_) => {}
                                 Err(_) => break,
                             }
@@ -537,14 +589,14 @@ fn forward_media_to_subscribers(
                     } else {
                         warn!(
                             "订阅者 {} 写入媒体失败 (mid={:?}, pt={:?})",
-                            subscriber_id, subscriber_mid, local_pt
+                            sub.subscriber_id, subscriber_mid, local_pt
                         );
                     }
                 }
                 None => {
                     warn!(
                         "订阅者 {} 未协商到与发布者 {} 匹配的编码 (mid={:?}, pt={:?})",
-                        subscriber_id, publisher_id, subscriber_mid, params.pt()
+                        sub.subscriber_id, publisher_id, subscriber_mid, params.pt()
                     );
                 }
             }
@@ -556,47 +608,92 @@ fn forward_media_to_subscribers(
 // Timer 驱动 — 批量驱动所有 Rtc 实例的定时器
 // ──────────────────────────────────────────────────────────
 
-/// 驱动所有参与者的 Rtc 定时器并收集输出
-fn drive_timers(
-    participants: &mut AHashMap<String, Participant>,
+/// 驱动所有已到期的 Rtc 定时器并收集输出
+fn drive_due_timers(
+    now: Instant,
+    table: &mut ParticipantTable,
     router: &mut Router,
     send_batch: &mut SendBatch,
-    now: Instant,
+    wheel: &mut TimerWheel,
 ) {
-    for (participant_id, participant) in participants.iter_mut() {
-        // 驱动时间前进
-        if participant.rtc.handle_input(
-            str0m::Input::Timeout(now)
-        ).is_err() {
+    for id in wheel.pop_due(now) {
+        // 驱动时间前进。
+        // 成功驱动后把 `next_timeout` 清空: 该 id 已从定时器堆中弹出,
+        // 必须强制重新登记下次 deadline, 即使值恰好未变。
+        let alive = match table.get_mut(&id) {
+            Some(p) => {
+                let ok = p.rtc.handle_input(str0m::Input::Timeout(now)).is_ok();
+                if ok {
+                    p.next_timeout = None;
+                }
+                ok
+            }
+            None => false,
+        };
+        if !alive {
+            wheel.cancel(&id);
             continue;
         }
+        drain_and_schedule(&id, table, router, send_batch, wheel);
+    }
+}
 
-        // Drain 输出 (Transmit + 事件)。
-        // 必须处理 MediaAdded 事件, 否则发布者轨道不会注册到 Router,
-        // 后续 subscribe 会找不到发布轨道而失败。
-        loop {
-            match participant.rtc.poll_output() {
-                Ok(str0m::Output::Transmit(transmit)) => {
-                    send_batch.push(
-                        transmit.destination,
-                        bytes::Bytes::copy_from_slice(&transmit.contents),
+/// 把某个参与者的输出 drain 到 `Output::Timeout`，并把下次 deadline 排入 TimerWheel。
+///
+/// 这是 str0m「送出/收到一个输入后必须 drain 到 Timeout」约定在本 SFU 中的落地点:
+///   - `Transmit`  → 收集到 send_batch
+///   - `MediaAdded` → 注册发布轨道到 Router
+///   - `Timeout(t)` → 记录并重排定时器, 然后结束
+///
+/// `next_timeout` 只在变化时才更新 TimerWheel, 避免热路径反复写定时器表。
+fn drain_and_schedule(
+    id: &str,
+    table: &mut ParticipantTable,
+    router: &mut Router,
+    send_batch: &mut SendBatch,
+    wheel: &mut TimerWheel,
+) {
+    let participant = match table.get_mut(id) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Drain 输出 (Transmit + 事件)。
+    // 必须处理 MediaAdded 事件, 否则发布者轨道不会注册到 Router,
+    // 后续 subscribe 会找不到发布轨道而失败。
+    loop {
+        match participant.rtc.poll_output() {
+            Ok(str0m::Output::Transmit(transmit)) => {
+                send_batch.push(transmit.destination, transmit.contents.into());
+            }
+            Ok(str0m::Output::Event(event)) => match event {
+                str0m::Event::Connected => {
+                    info!("参与者 {} 已连接", id);
+                }
+                str0m::Event::IceConnectionStateChange(state) => {
+                    debug!("参与者 {} ICE: {:?}", id, state);
+                }
+                str0m::Event::MediaAdded(media) => {
+                    info!(
+                        "参与者 {} 发布媒体 mid={:?} kind={:?}",
+                        id, media.mid, media.kind
                     );
+                    router.add_publisher(id.to_string(), media.mid, media.kind);
                 }
-                Ok(str0m::Output::Event(event)) => {
-                    if let str0m::Event::MediaAdded(media) = event {
-                        info!(
-                            "参与者 {} 发布媒体 mid={:?} kind={:?}",
-                            participant_id, media.mid, media.kind
-                        );
-                        router.add_publisher(
-                            participant_id.clone(),
-                            media.mid,
-                            media.kind,
-                        );
-                    }
+                other => {
+                    debug!("参与者 {} 事件: {:?}", id, other);
                 }
-                Ok(str0m::Output::Timeout(_)) => break,
-                Err(_) => break,
+            },
+            Ok(str0m::Output::Timeout(t)) => {
+                if participant.next_timeout != Some(t) {
+                    participant.next_timeout = Some(t);
+                    wheel.schedule(id, t);
+                }
+                break;
+            }
+            Err(e) => {
+                warn!("参与者 {} poll_output 错误: {:?}", id, e);
+                break;
             }
         }
     }
@@ -607,17 +704,20 @@ fn drive_timers(
 // ──────────────────────────────────────────────────────────
 
 /// 处理创建参与者命令
+#[allow(clippy::too_many_arguments)]
 fn handle_create_participant(
-    participants: &mut AHashMap<String, Participant>,
-    _router: &mut Router,
+    table: &mut ParticipantTable,
+    router: &mut Router,
+    send_batch: &mut SendBatch,
+    wheel: &mut TimerWheel,
     participant_id: String,
     room_id: String,
     sdp_offer: String,
     local_addr: SocketAddr,
     reply_tx: Sender<WorkerReply>,
 ) {
-    // 创建新的 Rtc 实例
-    let mut participant = match Participant::new(
+    // 创建新的 Rtc 实例 (local_addr 为对外通告地址, 决定 ICE host 候选)
+    let mut participant = match crate::sfu::participant::Participant::new(
         participant_id.clone(),
         room_id.clone(),
         local_addr,
@@ -644,8 +744,12 @@ fn handle_create_participant(
                 local_candidates: candidates,
             });
 
-            // 添加到参与者表
-            participants.insert(participant_id, participant);
+            // 添加到参与者表 (同时建立 ufrag 索引)
+            table.insert(participant);
+
+            // 立即 drain 初始输出 (STUN Binding Request / DTLS 握手) 并排入定时器。
+            // 否则首次唤醒要等下一个定时器, ICE 建立会被推迟。
+            drain_and_schedule(&participant_id, table, router, send_batch, wheel);
         }
         Err(e) => {
             let _ = reply_tx.send(WorkerReply::Error {

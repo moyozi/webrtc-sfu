@@ -9,7 +9,10 @@ use crossbeam_channel::Sender;
 /// Worker 线程配置
 pub struct WorkerConfig {
     pub cpu_id: usize,
+    /// UDP 实际绑定地址 (通常 0.0.0.0:base_port)
     pub listen_addr: SocketAddr,
+    /// 对外通告地址 (announce_ip:base_port), 用于 ICE host 候选与 Receive destination
+    pub announce_addr: SocketAddr,
     pub batch_size: usize,
     pub send_batch_size: usize,
     pub busy_poll_us: u32,
@@ -44,6 +47,8 @@ pub enum WorkerCommand {
         subscriber_id: String,
         publisher_id: String,
         publisher_mid: String,
+        /// 订阅者自身该轨道的 mid (None = 与 publisher_mid 相同)
+        subscriber_mid: Option<String>,
     },
 
     /// 取消订阅

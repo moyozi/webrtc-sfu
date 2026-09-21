@@ -34,6 +34,12 @@ pub enum SignalingMessage {
         pc_id: String,
         publisher_id: String,
         track_mid: String,
+        /// 订阅者自身对应的 mid (可选)。
+        ///
+        /// 发布者与订阅者的 SDP mid 未必相同 (str0m 会随机分配 mid)。
+        /// 缺省时退化为与 `track_mid` 相同, 兼容浏览器 "0"/"1" 约定。
+        #[serde(default)]
+        subscriber_mid: Option<String>,
     },
 
     #[serde(rename = "unsubscribe")]

@@ -706,15 +706,24 @@ webrtc-sfu/
 cargo build --release
 
 # 运行
-RUST_LOG=info ./target/release/sfu-server
+# 监听地址一律绑定 0.0.0.0, 对外可达地址由 SFU_ANNOUNCE_IP 单独指定
+SFU_ANNOUNCE_IP=203.0.113.10 RUST_LOG=info ./target/release/sfu-server
 # 默认端口: QUIC 信令 udp/5173, WebSocket 信令 tcp/5174, 媒体 udp/5175..
 
 # 环境变量调优
-SFU_WORKERS=4            # worker 线程数 (同时决定媒体端口数量)
-SFU_QUIC_ADDR=0.0.0.0:5173  # QUIC 信令监听地址; 设为 0/off/空 则禁用 QUIC
-SO_BUSY_POLL=50          # 内核忙轮询微秒数 (0=禁用)
-BATCH_SIZE=64            # recvmmsg 批量大小
+SFU_ANNOUNCE_IP=203.0.113.10  # 对外通告 IP — 写入 SDP/ICE host 候选 (必须为客户端可达地址)
+SFU_WORKERS=4                 # worker 线程数 (同时决定媒体端口数量)
+SFU_WS_ADDR=0.0.0.0:5174      # WebSocket 信令监听地址 (默认 0.0.0.0:5174)
+SFU_QUIC_ADDR=0.0.0.0:5173    # QUIC 信令监听地址; 设为 0/off/空 则禁用 QUIC
+SFU_MEDIA_ADDR=0.0.0.0:5175   # 媒体 UDP 绑定地址 (默认 0.0.0.0:5175)
+SO_BUSY_POLL=50               # 内核忙轮询微秒数 (0=禁用)
+BATCH_SIZE=64                 # recvmmsg 批量大小
 ```
+
+> **监听地址 vs 对外通告地址**：服务始终绑定 `0.0.0.0`（由防火墙控制暴露面），
+> 而 ICE host 候选中的地址取自 `SFU_ANNOUNCE_IP`。若未显式配置，启动时会自动
+> 探测本机出口 IP（探测失败则回退 `127.0.0.1` 并告警）。多 worker 时每个 worker
+> 的通告端口 = 媒体端口 = `SFU_MEDIA_ADDR` 端口 + worker 序号。
 
 ---
 

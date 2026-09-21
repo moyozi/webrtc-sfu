@@ -31,6 +31,7 @@ fn main() {
 
     let num_workers = config.num_workers;
     let listen_addr = config.listen_addr;
+    let announce_ip = config.announce_ip;
     let ws_addr = config.ws_listen_addr;
 
     // 每个 worker 占用一个媒体端口 (base + cpu_id), 防止超出 u16 端口上限。
@@ -61,10 +62,16 @@ fn main() {
             listen_addr.ip(),
             listen_addr.port() + cpu_id as u16,
         );
+        // 对外通告地址: announce_ip + 该 worker 的媒体端口。
+        let worker_announce_addr = SocketAddr::new(
+            announce_ip,
+            listen_addr.port() + cpu_id as u16,
+        );
 
         let worker_config = core::WorkerConfig {
             cpu_id,
             listen_addr: worker_listen_addr,
+            announce_addr: worker_announce_addr,
             batch_size: config.batch_size,
             send_batch_size: config.send_batch_size,
             busy_poll_us: config.busy_poll_us,
@@ -82,10 +89,12 @@ fn main() {
     }
 
     info!(
-        "已启动 {} 个 worker 线程, 媒体端口范围: {}..{}",
+        "已启动 {} 个 worker 线程, 监听 {} (媒体端口范围 {}..{}), 对外通告 IP {}",
         num_workers,
+        listen_addr,
         listen_addr.port(),
-        listen_addr.port() + (num_workers as u16).saturating_sub(1)
+        listen_addr.port() + (num_workers as u16).saturating_sub(1),
+        announce_ip
     );
 
     // ── 2. 启动信令服务器 (Tokio Runtime) ──

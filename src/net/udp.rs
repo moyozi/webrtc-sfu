@@ -5,14 +5,17 @@
 //! - recvmmsg: 单次系统调用批量接收 64 个 UDP 包
 //! - sendmmsg: 单次系统调用批量发送多个 UDP 包
 //! - 预分配缓冲区: RecvBatch/SendBatch 在 Worker 启动时分配，热路径零分配
+//! - Transmit 的 Vec<u8> 直接 move 进发送队列，避免逐包 memcpy
 
 use nix::sys::socket::sockopt::{RcvBuf, ReusePort, SndBuf};
 use nix::sys::socket::{
     recvmmsg, sendmmsg, MsgFlags, MultiHeaders, SockaddrStorage,
 };
 use nix::sys::socket::{setsockopt, socket, AddressFamily, SockFlag, SockType};
+use arrayvec::ArrayVec;
 use std::io::IoSlice;
 use std::io::IoSliceMut;
+use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
@@ -24,6 +27,13 @@ pub const BATCH_SIZE: usize = 64;
 
 /// sendmmsg 批量大小
 pub const SEND_BATCH_SIZE: usize = 128;
+
+/// recv/send iov 栈上数组的最大容量。
+///
+/// 批量收发需要 `IoSlice`/`IoSliceMut` 切片，而它们借用 `bufs`/`packets`，
+/// 无法作为结构体字段 (自引用)。这里用固定容量的 `ArrayVec` 在栈上构造，
+/// 避免每次系统调用都堆分配一个 `Vec`。
+pub const MAX_BATCH: usize = 256;
 
 // ──────────────────────────────────────────────────────────
 // UdpSocket — 原始 UDP socket 封装
@@ -132,6 +142,12 @@ pub struct RecvBatch {
 impl RecvBatch {
     /// 创建批量收包缓冲区
     pub fn new(capacity: usize, mtu: usize) -> Self {
+        assert!(
+            capacity <= MAX_BATCH,
+            "recv capacity {} 超过 MAX_BATCH={}",
+            capacity,
+            MAX_BATCH
+        );
         let bufs: Vec<Vec<u8>> = (0..capacity).map(|_| vec![0u8; mtu]).collect();
 
         // 预分配 MultiHeaders (nix 0.29 使用 preallocate)
@@ -160,16 +176,31 @@ impl RecvBatch {
             addrs,
         } = self;
 
-        // 创建 iov (每次调用时创建，因为 IoSliceMut 不能长期存储)
-        // 这只是创建栈上的引用，不涉及堆分配
-        let mut iovs: Vec<[IoSliceMut<'_>; 1]> =
-            bufs.iter_mut().map(|buf| [IoSliceMut::new(buf)]).collect();
+        // 固定容量栈上数组构造 iov，避免每次 recvmmsg 堆分配 Vec。
+        //
+        // 用 `MaybeUninit` 而不是 `ArrayVec`: `ArrayVec` 实现了 `Drop`，而 nix 的
+        // 返回迭代器把 iov 的借用生命周期与 headers 统一为整个函数，会触发
+        // drop-check 报错。`MaybeUninit` 数组不实现 `Drop`，不受影响。
+        let mut storage: [MaybeUninit<[IoSliceMut<'_>; 1]>; MAX_BATCH] =
+            [const { MaybeUninit::uninit() }; MAX_BATCH];
+        let n_bufs = bufs.len();
+        for (slot, buf) in storage.iter_mut().zip(bufs.iter_mut()) {
+            slot.write([IoSliceMut::new(buf)]);
+        }
+
+        // SAFETY: 上面的循环已初始化前 n_bufs 个元素。
+        let iovs: &mut [[IoSliceMut<'_>; 1]] = unsafe {
+            std::slice::from_raw_parts_mut(
+                storage.as_mut_ptr().cast::<[IoSliceMut<'_>; 1]>(),
+                n_bufs,
+            )
+        };
 
         // 执行 recvmmsg — 单次系统调用收最多 capacity 个包
         let results = recvmmsg(
             fd,
             headers,                // &mut MultiHeaders (预分配)
-            &mut iovs,              // &mut [IoSliceMut] (指向 bufs)
+            iovs.iter_mut(),        // 栈上 [IoSliceMut; 1] 数组
             MsgFlags::MSG_DONTWAIT, // 非阻塞
             None,                   // 无超时 (配合 MSG_DONTWAIT)
         )
@@ -181,7 +212,7 @@ impl RecvBatch {
             // address 现在是字段而非方法
             let addr = recv_msg.address
                 .as_ref()
-                .map(|a| nix_to_socketaddr(a))
+                .map(nix_to_socketaddr)
                 .unwrap_or_else(|| {
                     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
                 });
@@ -214,8 +245,9 @@ impl RecvBatch {
 ///
 /// 收集多个待发送的包，然后用 sendmmsg 一次系统调用发出。
 pub struct SendBatch {
-    /// 待发送的包: (目标地址, 数据)
-    packets: Vec<(SocketAddr, bytes::Bytes)>,
+    /// 待发送的包: (目标地址, 数据)。数据为 str0m Transmit 移出的 Vec，
+    /// 避免 `copy_from_slice` 造成的逐包堆分配与内存拷贝。
+    packets: Vec<(SocketAddr, Vec<u8>)>,
     /// 预分配的 nix MultiHeaders
     headers: MultiHeaders<SockaddrStorage>,
     capacity: usize,
@@ -223,6 +255,12 @@ pub struct SendBatch {
 
 impl SendBatch {
     pub fn new(capacity: usize) -> Self {
+        assert!(
+            capacity <= MAX_BATCH,
+            "send capacity {} 超过 MAX_BATCH={}",
+            capacity,
+            MAX_BATCH
+        );
         // 预分配 MultiHeaders (nix 0.29 使用 preallocate)
         let headers = MultiHeaders::<SockaddrStorage>::preallocate(capacity, None);
 
@@ -233,12 +271,12 @@ impl SendBatch {
         }
     }
 
-    /// 添加一个待发送的包
-    pub fn push(&mut self, dest: SocketAddr, data: bytes::Bytes) {
-        if self.packets.len() < self.capacity {
-            self.packets.push((dest, data));
-        }
-        // 如果满了就丢弃 (不应该发生，容量足够大)
+    /// 添加一个待发送的包 (接管 data 所有权，零拷贝)
+    ///
+    /// 不再因超出 `capacity` 而丢弃: `flush` 会按 `capacity` 分块多次
+    /// sendmmsg 发出。大关键帧 x 多订阅者时不会丢包。
+    pub fn push(&mut self, dest: SocketAddr, data: Vec<u8>) {
+        self.packets.push((dest, data));
     }
 
     /// 是否为空
@@ -253,40 +291,54 @@ impl SendBatch {
 
     /// 执行 sendmmsg 批量发包
     ///
-    /// 单次系统调用发送所有排队的包
+    /// 每 `capacity` 个包一次 sendmmsg (headers 预分配上限)，
+    /// 队列超过容量时自动分多批发送，避免丢包。
     pub fn flush(&mut self, fd: RawFd) -> std::io::Result<usize> {
         if self.packets.is_empty() {
             return Ok(0);
         }
 
-        // 准备地址和 iov
-        let addrs: Vec<Option<SockaddrStorage>> = self
-            .packets
-            .iter()
-            .map(|(addr, _)| Some(socketaddr_to_nix(*addr)))
-            .collect();
-
-        let iovs: Vec<[IoSlice<'_>; 1]> = self
-            .packets
-            .iter()
-            .map(|(_, data)| [IoSlice::new(data.as_ref())])
-            .collect();
-
+        let chunk_size = self.capacity.max(1);
         let cmsgs: &[nix::sys::socket::ControlMessage] = &[];
+        let mut total = 0usize;
 
-        // 执行 sendmmsg
-        let results = sendmmsg(
-            fd,
-            &mut self.headers,
-            &iovs,
-            &addrs,
-            cmsgs,
-            MsgFlags::MSG_DONTWAIT,
-        )
-        .map_err(nix_to_io)?;
+        for chunk in self.packets.chunks(chunk_size) {
+            // addrs 不借用 packets，用 ArrayVec (栈上) 即可。
+            let addrs: ArrayVec<Option<SockaddrStorage>, MAX_BATCH> = chunk
+                .iter()
+                .map(|(addr, _)| Some(socketaddr_to_nix(*addr)))
+                .collect();
 
-        let count = results.count();
-        Ok(count)
+            // iov 借用 packets，同 recv: 用无 Drop 的 MaybeUninit 栈数组。
+            let mut storage: [MaybeUninit<[IoSlice<'_>; 1]>; MAX_BATCH] =
+                [const { MaybeUninit::uninit() }; MAX_BATCH];
+            for (slot, (_, data)) in storage.iter_mut().zip(chunk.iter()) {
+                slot.write([IoSlice::new(data.as_slice())]);
+            }
+
+            // SAFETY: 上面的循环已初始化前 chunk.len() 个元素。
+            let iovs: &[[IoSlice<'_>; 1]] = unsafe {
+                std::slice::from_raw_parts(
+                    storage.as_ptr().cast::<[IoSlice<'_>; 1]>(),
+                    chunk.len(),
+                )
+            };
+
+            // 执行 sendmmsg
+            let results = sendmmsg(
+                fd,
+                &mut self.headers,
+                iovs.iter(),
+                addrs.as_slice(),
+                cmsgs,
+                MsgFlags::MSG_DONTWAIT,
+            )
+            .map_err(nix_to_io)?;
+
+            total += results.count();
+        }
+
+        Ok(total)
     }
 }
 

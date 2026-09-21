@@ -46,6 +46,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Misc
 parking_lot = "0.12"
 ahash = "0.8"
+# 固定容量栈上数组 (recv/send 批量 iov 不再每轮堆分配)
+arrayvec = "0.7"
 
 [profile.release]
 opt-level = 3

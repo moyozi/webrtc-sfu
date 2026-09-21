@@ -125,6 +125,7 @@ impl SignalingSession {
                 pc_id,
                 publisher_id,
                 track_mid,
+                subscriber_mid,
             } => {
                 if let Some(sess) = self.sessions.get(&pc_id) {
                     let worker_tx = &self.state.worker_txs[sess.worker_idx];
@@ -133,6 +134,7 @@ impl SignalingSession {
                         subscriber_id: sess.participant_id.clone(),
                         publisher_id: publisher_id.clone(),
                         publisher_mid: track_mid,
+                        subscriber_mid,
                     });
 
                     self.send(SignalingResponse::Subscribed {
