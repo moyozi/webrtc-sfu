@@ -212,6 +212,7 @@ async fn subscriber(
 
     // ── 1. 独立 UDP socket ──
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
+    enlarge_udp_buffers(&udp);
     let local_port = udp.local_addr()?.port();
     let advertised = SocketAddr::new(cfg.advertise_ip, local_port);
 
@@ -441,6 +442,30 @@ fn add_candidates_from_answer(text: &str, rtc: &mut Rtc) {
                 rtc.add_remote_candidate(cand);
             }
         }
+    }
+}
+
+/// 调大压测客户端 UDP socket 收发缓冲区 (默认仅 ~208KB，高路数下易丢包)。
+/// 实际生效值受内核 `rmem_max`/`wmem_max` 限制。
+fn enlarge_udp_buffers(udp: &UdpSocket) {
+    use std::os::fd::AsRawFd;
+    let bytes: i32 = 8 * 1024 * 1024;
+    unsafe {
+        let fd = udp.as_raw_fd();
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &bytes as *const _ as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &bytes as *const _ as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
     }
 }
 

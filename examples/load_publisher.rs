@@ -186,6 +186,7 @@ async fn publisher(
 
     // ── 1. 独立 UDP socket (每个发布者一个源端口, 供 SFU 按源地址路由) ──
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
+    enlarge_udp_buffers(&udp);
     let local_port = udp.local_addr()?.port();
     let advertised = SocketAddr::new(cfg.advertise_ip, local_port);
 
@@ -403,6 +404,30 @@ fn drain(rtc: &mut Rtc, udp: &UdpSocket, next_deadline: &mut Instant, stats: &St
 }
 
 /// 写入一帧媒体 (str0m 会按 MTU 自动分片打包)
+/// 调大压测客户端 UDP socket 收发缓冲区 (默认仅 ~208KB)。
+/// 实际生效值受内核 `rmem_max`/`wmem_max` 限制。
+fn enlarge_udp_buffers(udp: &UdpSocket) {
+    use std::os::fd::AsRawFd;
+    let bytes: i32 = 8 * 1024 * 1024;
+    unsafe {
+        let fd = udp.as_raw_fd();
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &bytes as *const _ as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &bytes as *const _ as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
+}
+
 fn write_media(
     rtc: &mut Rtc,
     mid: Mid,
