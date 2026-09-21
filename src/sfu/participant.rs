@@ -7,11 +7,47 @@
 //! - SDP 协商
 //! - 媒体收发
 
+use crate::sfu::layer::RateWindow;
 use ahash::AHashMap;
+use arrayvec::ArrayVec;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use str0m::bwe::Bitrate;
+use str0m::format::PayloadParams;
+use str0m::media::{Mid, Pt, Rid};
+use str0m::rtp::{SeqNo, Ssrc};
 use tracing::{info, warn, debug};
+
+/// 发布者的一个入站 RTP 层 (simulcast RID 或 SVC 中的一条流)。
+pub struct LayerRx {
+    /// 所属媒体 mid
+    pub mid: Mid,
+    /// simulcast RID (非 simulcast 为 None)
+    pub rid: Option<Rid>,
+    /// 该层的码率估计
+    pub rate: RateWindow,
+    /// SVC: 按时间层 (TID 0..3) 分别估计的码率
+    pub tid_rates: [RateWindow; 4],
+}
+
+/// 订阅者对某条发布轨道的层选择状态。
+pub struct LayerState {
+    /// 当前正在转发的 simulcast 层 (None = 尚未确定)
+    pub current: Option<Rid>,
+    /// 正在等待关键帧的目标 simulcast 层
+    pub pending: Option<Rid>,
+    /// SVC: 当前允许的最大时间层 (None = 不过滤)
+    pub max_tid: Option<u8>,
+    /// 上次重新评估目标的时刻
+    pub last_eval: Instant,
+}
+
+/// 重新评估层选择的最小间隔
+const LAYER_EVAL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// 更新 BWE desired bitrate 的最小间隔
+const DESIRED_BITRATE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 参与者 — 封装 str0m Rtc 实例和相关状态
 pub struct Participant {
@@ -40,6 +76,26 @@ pub struct Participant {
     /// 用于避免收包热路径反复对定时器表做哈希查找: 只有该值变化时才更新 TimerWheel。
     pub next_timeout: Option<Instant>,
 
+    /// 下一个可分配的 SSRC (RTP mode 下每个转发轨道需要一对 main/rtx SSRC)。
+    /// 只在单个 Rtc 内需要唯一，因此从固定基址递增即可。
+    next_ssrc: u32,
+
+    /// 转发发送流的序号计数器 (subscriber_mid → next seq)。
+    /// 层切换/丢层时由 SFU 重新编号，保证订阅者看到的序号连续。
+    tx_seq: AHashMap<Mid, SeqNo>,
+
+    /// 作为发布者: 入站层速率 (SSRC → 层信息)。
+    rx_layers: AHashMap<Ssrc, LayerRx>,
+
+    /// 作为订阅者: 每条发布轨道的层选择状态 (subscriber_mid → state)。
+    layer_states: AHashMap<Mid, LayerState>,
+
+    /// 带宽估计 (bit/s)。订阅者侧来自 `Event::EgressBitrateEstimate`。
+    egress_bitrate: Option<u64>,
+
+    /// 上次更新 BWE desired bitrate 的时刻 (节流)。
+    last_desired_update: Instant,
+
     /// 本地绑定地址
     local_addr: SocketAddr,
 }
@@ -52,6 +108,7 @@ impl Participant {
         id: String,
         room_id: String,
         local_addr: SocketAddr,
+        bwe_initial_bps: u64,
     ) -> Result<Self, String> {
         // 创建 Rtc 实例
         // SFU 使用 ICE Lite 模式 — 只接受 host 类型的候选，不做 server reflexive
@@ -60,10 +117,17 @@ impl Participant {
         let ice_creds = str0m::IceCreds::new();
         let local_ufrag = ice_creds.ufrag.clone();
 
+        // RTP mode: 绕过 str0m 内部的 depacketize/packetize, 收发改用 RtpPacket /
+        // StreamTx::write_rtp。SFU 只做包级转发, 不重组完整帧。
+        //
+        // BWE: 订阅者侧启用带宽估计 (TWCC/REMB), 用于 Simulcast/SVC 层选择。
+        let now = Instant::now();
         let rtc = str0m::Rtc::builder()
             .set_ice_lite(true)
+            .set_rtp_mode(true)
+            .enable_bwe(Some(Bitrate::bps(bwe_initial_bps.max(50_000))))
             .set_local_ice_credentials(ice_creds)
-            .build(Instant::now());
+            .build(now);
 
         info!("参与者 {} 创建, ufrag={}", id, local_ufrag);
 
@@ -76,8 +140,189 @@ impl Participant {
             remote_ufrag: None,
             connected: false,
             next_timeout: None,
+            next_ssrc: 1000,
+            tx_seq: AHashMap::new(),
+            rx_layers: AHashMap::new(),
+            layer_states: AHashMap::new(),
+            egress_bitrate: None,
+            // 置为「久远以前」，使首个包即可应用 desired bitrate。
+            last_desired_update: now - DESIRED_BITRATE_INTERVAL,
             local_addr,
         })
+    }
+
+    /// 记录一个入站 RTP 包的层速率。
+    pub fn observe_rx_packet(
+        &mut self,
+        ssrc: Ssrc,
+        mid: Mid,
+        rid: Option<Rid>,
+        tid: Option<u8>,
+        bytes: usize,
+        now: Instant,
+    ) {
+        let entry = self.rx_layers.entry(ssrc).or_insert_with(|| LayerRx {
+            mid,
+            rid,
+            rate: RateWindow::new(now),
+            tid_rates: std::array::from_fn(|_| RateWindow::new(now)),
+        });
+        // rid 可能首包缺失 (无 RID 扩展) 后续才出现，补齐。
+        if entry.rid.is_none() {
+            entry.rid = rid;
+        }
+        entry.rate.add(bytes, now);
+        if let Some(tid) = tid {
+            entry.tid_rates[(tid & 0x03) as usize].add(bytes, now);
+        }
+    }
+
+    /// 该 mid 的 SVC 时间层累计码率 (tid, 累计 bps)，按 tid 升序。
+    ///
+    /// `cum[t]` = 所有 `tid <= t` 的时间层码率之和，即「目标时间层为 t 时」
+    /// 的发送码率。若只有一个时间层 (tid 0) 则返回空。
+    /// 使用栈上 `ArrayVec`，热路径零堆分配。
+    pub fn temporal_rates(&self, mid: Mid) -> ArrayVec<(u8, u64), 4> {
+        // 先统计每个时间层自身的码率，再求前缀和得到累计码率。
+        let mut own = [0u64; 4];
+        for l in self.rx_layers.values().filter(|l| l.mid == mid) {
+            for (t, o) in own.iter_mut().enumerate() {
+                *o += l.tid_rates[t].bps();
+            }
+        }
+        // 只有存在 >0 的高时间层才认为是 SVC 时间分层。
+        if own[1..].iter().all(|&b| b == 0) {
+            return ArrayVec::new();
+        }
+        let mut cum = [0u64; 4];
+        let mut acc = 0u64;
+        for t in 0..4usize {
+            acc += own[t];
+            cum[t] = acc;
+        }
+        let mut v: ArrayVec<(u8, u64), 4> = ArrayVec::new();
+        for t in 0..4usize {
+            if t == 0 || own[t] > 0 {
+                let _ = v.try_push((t as u8, cum[t]));
+            }
+        }
+        v
+    }
+
+    /// 该 mid 上所有 simulcast 层及其码率，按码率升序。
+    ///
+    /// 使用栈上 `ArrayVec` (最大 5 层)，热路径零堆分配。
+    pub fn layer_rates(&self, mid: Mid) -> ArrayVec<(Rid, u64), 5> {
+        let mut v: ArrayVec<(Rid, u64), 5> = ArrayVec::new();
+        for l in self.rx_layers.values() {
+            if l.mid != mid {
+                continue;
+            }
+            if let Some(rid) = l.rid {
+                if v.try_push((rid, l.rate.bps())).is_err() {
+                    break;
+                }
+            }
+        }
+        v.sort_by_key(|(_, bps)| *bps);
+        v
+    }
+
+    /// 该 mid 上观测到的 simulcast 层数。
+    pub fn rx_layer_count(&self, mid: Mid) -> usize {
+        self.rx_layers
+            .values()
+            .filter(|l| l.mid == mid && l.rid.is_some())
+            .count()
+    }
+
+    /// 取该发送流的下一个序号 (层切换/丢层后保持连续)。
+    pub fn next_tx_seq(&mut self, mid: Mid) -> SeqNo {
+        self.tx_seq.entry(mid).or_default().inc()
+    }
+
+    /// 取得/初始化某条发布轨道的层选择状态。
+    pub fn layer_state_mut(&mut self, mid: Mid, now: Instant) -> &mut LayerState {
+        self.layer_states.entry(mid).or_insert_with(|| LayerState {
+            current: None,
+            pending: None,
+            max_tid: None,
+            last_eval: now - LAYER_EVAL_INTERVAL,
+        })
+    }
+
+    /// 订阅者链路的带宽估计 (bit/s)。
+    pub fn egress_bitrate(&self) -> Option<u64> {
+        self.egress_bitrate
+    }
+
+    /// 更新带宽估计 (来自 `Event::EgressBitrateEstimate`)。
+    pub fn set_egress_bitrate(&mut self, bps: u64) {
+        self.egress_bitrate = Some(bps);
+    }
+
+    /// 设置 BWE 的 desired bitrate (节流)。
+    ///
+    /// 告诉 BWE 系统「希望能发送到多少」，它会通过探测 (padding) 逼近该值。
+    /// 传入所有可能层码率之和，使高带宽订阅者能升到最高层。
+    pub fn maybe_set_desired_bitrate(&mut self, bps: u64, now: Instant) {
+        if bps == 0 {
+            return;
+        }
+        if now.saturating_duration_since(self.last_desired_update)
+            < DESIRED_BITRATE_INTERVAL
+        {
+            return;
+        }
+        self.last_desired_update = now;
+        self.rtc
+            .bwe()
+            .set_desired_bitrate(Bitrate::bps(bps.max(300_000)));
+    }
+
+    /// 是否到达重新评估层选择的时刻 (同时刷新 `last_eval`)。
+    pub fn should_eval_layer(state: &mut LayerState, now: Instant) -> bool {
+        if now.saturating_duration_since(state.last_eval) >= LAYER_EVAL_INTERVAL {
+            state.last_eval = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 声明一个用于向该 mid 转发 RTP 的发送流 (幂等)。
+    ///
+    /// RTP mode 下 str0m 不会替我们分配 SSRC，需要显式 `declare_stream_tx`。
+    /// 同时分配一个 RTX SSRC，这样订阅者发来的 NACK 能由 str0m 从
+    /// rtx cache 中重传 (前提是 SDP 协商了 RTX)。
+    pub fn ensure_tx_stream(&mut self, mid: Mid) {
+        // mid 未在 SDP 中协商 (或已移除) 时无法声明。
+        if self.rtc.media(mid).is_none() {
+            return;
+        }
+        // 已声明则直接复用 (declare_stream_tx 幂等, 但避免无谓调用)。
+        if self.rtc.direct_api().stream_tx_by_mid(mid, None).is_some() {
+            return;
+        }
+        let main = Ssrc::from(self.next_ssrc);
+        self.next_ssrc += 1;
+        let rtx = Ssrc::from(self.next_ssrc);
+        self.next_ssrc += 1;
+        self.rtc
+            .direct_api()
+            .declare_stream_tx(main, Some(rtx), mid, None);
+        debug!("参与者 {} mid={:?} 声明发送流 ssrc={} rtx={}", self.id, mid, main, rtx);
+    }
+
+    /// 查找入站 PT 对应的 PayloadParams (含 RTX)。
+    ///
+    /// RTP mode 下 `Event::RtpPacket` 不携带 params，需要按 PT 回查本 Rtc
+    /// 已协商的 codec 配置。
+    pub fn payload_params_for(&self, pt: Pt) -> Option<PayloadParams> {
+        self.rtc
+            .codec_config()
+            .find(|p| p.pt() == pt || p.resend() == Some(pt))
+            .copied()
     }
 
     /// 处理远端 SDP offer，返回 SDP answer
@@ -237,6 +482,10 @@ impl ParticipantTable {
         Some(p)
     }
 
+    pub fn get(&self, id: &str) -> Option<&Participant> {
+        self.participants.get(id)
+    }
+
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Participant> {
         self.participants.get_mut(id)
     }
@@ -305,6 +554,7 @@ mod tests {
             "p1".into(),
             "room".into(),
             "127.0.0.1:5000".parse().unwrap(),
+            1_000_000,
         )
         .unwrap();
         let ufrag = p.local_ufrag.clone();
@@ -335,5 +585,112 @@ mod tests {
         assert!(table.remove("p1").is_some());
         assert!(table.resolve(Some((&ufrag, "remote")), src).is_none());
         assert!(table.resolve(None, src).is_none());
+    }
+
+    /// `ensure_tx_stream` 应为每个 mid 分配一对 main/rtx SSRC, 且幂等。
+    #[test]
+    fn ensure_tx_stream_is_idempotent() {
+        use str0m::media::MediaKind;
+
+        let mut p = Participant::new(
+            "p1".into(),
+            "room".into(),
+            "127.0.0.1:5000".parse().unwrap(),
+            1_000_000,
+        )
+        .unwrap();
+
+        let mid = Mid::from("0");
+        // 未经 SDP 协商时不应 panic (media 不存在 → 直接返回)。
+        p.ensure_tx_stream(mid);
+        assert!(p.rtc.direct_api().stream_tx_by_mid(mid, None).is_none());
+
+        // 手动声明 media 后应能分配发送流。
+        p.rtc.direct_api().declare_media(mid, MediaKind::Audio);
+        p.ensure_tx_stream(mid);
+        let ssrc = p.rtc.direct_api().stream_tx_by_mid(mid, None).unwrap().ssrc();
+        let rtx = p.rtc.direct_api().stream_tx_by_mid(mid, None).unwrap().rtx();
+        assert!(rtx.is_some());
+        assert_ne!(*ssrc, 0);
+
+        // 幂等: 再次调用复用同一 SSRC。
+        p.ensure_tx_stream(mid);
+        assert_eq!(
+            p.rtc.direct_api().stream_tx_by_mid(mid, None).unwrap().ssrc(),
+            ssrc
+        );
+
+        // 第二个 mid 应分配不同 SSRC。
+        let mid2 = Mid::from("1");
+        p.rtc.direct_api().declare_media(mid2, MediaKind::Video);
+        p.ensure_tx_stream(mid2);
+        assert_ne!(
+            p.rtc.direct_api().stream_tx_by_mid(mid2, None).unwrap().ssrc(),
+            ssrc
+        );
+    }
+
+    /// 入站 simulcast 层速率按 RID 统计并按码率升序返回。
+    #[test]
+    fn layer_rates_sorted_ascending() {
+        let now = Instant::now();
+        let mut p = Participant::new(
+            "p1".into(),
+            "room".into(),
+            "127.0.0.1:5000".parse().unwrap(),
+            1_000_000,
+        )
+        .unwrap();
+        let mid = Mid::from("1");
+
+        // 跨越 500ms 统计窗口 (首包在 +100ms, 到 +600ms 触发)。
+        let low: Ssrc = 10.into();
+        let high: Ssrc = 20.into();
+        for i in 1..=6u64 {
+            let t = now + Duration::from_millis(100 * i);
+            p.observe_rx_packet(low, mid, Some(Rid::from("l")), None, 1000, t);
+            p.observe_rx_packet(high, mid, Some(Rid::from("h")), None, 2000, t);
+        }
+
+        let rates = p.layer_rates(mid);
+        assert_eq!(rates.len(), 2);
+        assert_eq!(rates[0].0, Rid::from("l"));
+        assert_eq!(rates[1].0, Rid::from("h"));
+        assert!(rates[0].1 <= rates[1].1);
+        assert_eq!(p.rx_layer_count(mid), 2);
+
+        // 非 simulcast mid 无层信息。
+        assert!(p.layer_rates(Mid::from("0")).is_empty());
+        assert_eq!(p.rx_layer_count(Mid::from("0")), 0);
+    }
+
+    /// SVC 时间层累计码率随 tid 递增。
+    #[test]
+    fn temporal_rates_are_cumulative() {
+        let now = Instant::now();
+        let mut p = Participant::new(
+            "p1".into(),
+            "room".into(),
+            "127.0.0.1:5000".parse().unwrap(),
+            1_000_000,
+        )
+        .unwrap();
+        let mid = Mid::from("1");
+        let ssrc: Ssrc = 7.into();
+
+        for i in 1..=6u64 {
+            let t = now + Duration::from_millis(100 * i);
+            // tid0 每个时间点 2 个包, tid1 1 个包。
+            p.observe_rx_packet(ssrc, mid, None, Some(0), 1000, t);
+            p.observe_rx_packet(ssrc, mid, None, Some(0), 1000, t);
+            p.observe_rx_packet(ssrc, mid, None, Some(1), 1000, t);
+        }
+
+        let tr = p.temporal_rates(mid);
+        assert_eq!(tr.len(), 2);
+        assert_eq!(tr[0].0, 0);
+        assert_eq!(tr[1].0, 1);
+        // 累计: tid1 包含 tid0。
+        assert!(tr[1].1 > tr[0].1);
     }
 }

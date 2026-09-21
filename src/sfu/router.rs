@@ -44,6 +44,8 @@ pub struct Subscription {
     pub subscriber_mid: Mid,
     /// 选择的 simulcast 层 (None = 自动选择或非 simulcast)
     pub selected_layer: Option<String>,
+    /// 订阅者所在 worker。== 本 worker 则本地送达, 否则需中继。
+    pub worker_idx: usize,
 }
 
 /// 路由引擎
@@ -115,6 +117,7 @@ impl Router {
         publisher_id: &str,
         publisher_mid: &str,
         subscriber_mid: Option<&str>,
+        worker_idx: usize,
     ) {
         let publisher_key = Mid::from(publisher_mid);
         // 订阅者自身该轨道的 mid；缺省退化为发布者 mid，兼容浏览器 "0"/"1" 约定。
@@ -140,6 +143,7 @@ impl Router {
             subscriber_id: subscriber_id.to_string(),
             subscriber_mid,
             selected_layer: None,
+            worker_idx,
         });
 
         // 更新反向索引
@@ -223,6 +227,36 @@ impl Router {
             .unwrap_or(&[])
     }
 
+    /// 反向查找: 给定订阅者及其在自身 Rtc 中的 mid, 找出对应的发布轨道。
+    ///
+    /// 订阅者发来的 PLI/FIR 携带的是订阅者自己的 mid，需要据此找到
+    /// 对应的 (publisher_id, publisher_mid) 才能回传给正确的发布者。
+    /// 非热路径 (关键帧请求不频繁)，返回 owned Vec 以避免借用纠缠。
+    pub fn publisher_for_subscriber_mid(
+        &self,
+        subscriber_id: &str,
+        subscriber_mid: Mid,
+    ) -> Vec<(String, Mid)> {
+        let mut out = Vec::new();
+        let Some(tracks) = self.subscriber_index.get(subscriber_id) else {
+            return out;
+        };
+        for track in tracks {
+            let Some(mids) = self.subscriptions.get(&track.publisher_id) else {
+                continue;
+            };
+            let Some(subs) = mids.get(&track.mid) else {
+                continue;
+            };
+            if subs.iter().any(|s| {
+                s.subscriber_id == subscriber_id && s.subscriber_mid == subscriber_mid
+            }) {
+                out.push((track.publisher_id.clone(), track.mid));
+            }
+        }
+        out
+    }
+
     /// 统计信息
     pub fn stats(&self) -> RouterStats {
         RouterStats {
@@ -257,7 +291,7 @@ mod tests {
         let mut router = Router::new();
 
         // 发布者尚未注册 (MediaAdded 未到达) 时先订阅
-        router.add_subscription("sub-1", "pub-1", "0", None);
+        router.add_subscription("sub-1", "pub-1", "0", None, 0);
         assert_eq!(router.subscribers("pub-1", Mid::from("0")).len(), 1);
 
         // 发布者随后注册, 订阅关系应保留
@@ -265,7 +299,7 @@ mod tests {
         assert_eq!(router.subscribers("pub-1", Mid::from("0")).len(), 1);
 
         // 重复订阅应去重
-        router.add_subscription("sub-1", "pub-1", "0", None);
+        router.add_subscription("sub-1", "pub-1", "0", None, 0);
         assert_eq!(router.subscribers("pub-1", Mid::from("0")).len(), 1);
     }
 
@@ -274,9 +308,8 @@ mod tests {
     fn remove_participant_cleans_subscriptions() {
         let mut router = Router::new();
         router.add_publisher("pub-1".to_string(), Mid::from("0"), MediaKind::Video);
-        router.add_subscription("sub-1", "pub-1", "0", None);
-        router.add_subscription("sub-2", "pub-1", "0", None);
-
+        router.add_subscription("sub-1", "pub-1", "0", None, 0);
+        router.add_subscription("sub-2", "pub-1", "0", None, 0);
         router.remove_participant("sub-1");
         let subs = router.subscribers("pub-1", Mid::from("0"));
         assert_eq!(subs.len(), 1);
@@ -294,15 +327,34 @@ mod tests {
         router.add_publisher("pub-1".to_string(), Mid::from("pubA"), MediaKind::Video);
 
         // 未提供 subscriber_mid 时退化为发布者 mid
-        router.add_subscription("sub-legacy", "pub-1", "pubA", None);
+        router.add_subscription("sub-legacy", "pub-1", "pubA", None, 0);
         // 显式提供不同的 subscriber_mid
-        router.add_subscription("sub-1", "pub-1", "pubA", Some("subA"));
-
+        router.add_subscription("sub-1", "pub-1", "pubA", Some("subA"), 0);
         let subs = router.subscribers("pub-1", Mid::from("pubA"));
         assert_eq!(subs.len(), 2);
         let legacy = subs.iter().find(|s| s.subscriber_id == "sub-legacy").unwrap();
         assert_eq!(legacy.subscriber_mid, Mid::from("pubA"));
         let explicit = subs.iter().find(|s| s.subscriber_id == "sub-1").unwrap();
         assert_eq!(explicit.subscriber_mid, Mid::from("subA"));
+    }
+
+    /// PLI/FIR 反向映射: 由订阅者自己的 mid 找到发布轨道。
+    #[test]
+    fn reverse_lookup_publisher_by_subscriber_mid() {
+        let mut router = Router::new();
+        router.add_publisher("pub-1".to_string(), Mid::from("p0"), MediaKind::Video);
+        router.add_subscription("sub-1", "pub-1", "p0", Some("s0"), 0);
+        let targets = router.publisher_for_subscriber_mid("sub-1", Mid::from("s0"));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "pub-1");
+        assert_eq!(targets[0].1, Mid::from("p0"));
+
+        // 未知 subscriber_mid / 未知订阅者均无结果。
+        assert!(router
+            .publisher_for_subscriber_mid("sub-1", Mid::from("sX"))
+            .is_empty());
+        assert!(router
+            .publisher_for_subscriber_mid("sub-2", Mid::from("s0"))
+            .is_empty());
     }
 }
