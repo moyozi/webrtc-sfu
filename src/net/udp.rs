@@ -8,6 +8,7 @@
 //! - Transmit 的 Vec<u8> 直接 move 进发送队列，避免逐包 memcpy
 
 use nix::sys::socket::sockopt::{RcvBuf, ReusePort, SndBuf};
+use nix::sys::socket::getsockopt;
 use nix::sys::socket::{
     recvmmsg, sendmmsg, MsgFlags, MultiHeaders, SockaddrStorage,
 };
@@ -27,6 +28,10 @@ pub const BATCH_SIZE: usize = 64;
 
 /// sendmmsg 批量大小
 pub const SEND_BATCH_SIZE: usize = 128;
+
+/// SendBatch 最大积压包数 (约 8192 × 1.5KB ≈ 12MB)。
+/// 超过时丢弃最旧的包，避免发送缓冲长时间满时内存无限增长。
+pub const MAX_SEND_BACKLOG: usize = 8192;
 
 /// recv/send iov 栈上数组的最大容量。
 ///
@@ -48,7 +53,7 @@ impl UdpSocket {
     /// 创建 UDP socket 并绑定到指定地址
     ///
     /// `reuse_port = true` 时启用 SO_REUSEPORT，允许多个 Worker 共享同一端口
-    pub fn new(addr: SocketAddr, reuse_port: bool) -> std::io::Result<Self> {
+    pub fn new(addr: SocketAddr, reuse_port: bool, buf_bytes: usize) -> std::io::Result<Self> {
         let family = if addr.is_ipv4() {
             AddressFamily::Inet
         } else {
@@ -68,10 +73,19 @@ impl UdpSocket {
             setsockopt(&fd, ReusePort, &true).map_err(nix_to_io)?;
         }
 
-        // 增大接收/发送缓冲区 (50MB)
-        let buf_size: usize = 50 * 1024 * 1024;
+        // 增大接收/发送缓冲区。实际生效值受内核 `net.core.rmem_max`/
+        // `wmem_max` 限制 (被截断)，这里回读并记录实际值，避免“以为设了很大”。
+        let buf_size = buf_bytes.max(212_992);
         let _ = setsockopt(&fd, RcvBuf, &buf_size);
         let _ = setsockopt(&fd, SndBuf, &buf_size);
+        let actual_rcv = getsockopt(&fd, RcvBuf).unwrap_or(0);
+        let actual_snd = getsockopt(&fd, SndBuf).unwrap_or(0);
+        tracing::debug!(
+            requested = buf_size,
+            rcvbuf = actual_rcv,
+            sndbuf = actual_snd,
+            "UDP socket 缓冲区已设置 (实际值受内核 rmem_max/wmem_max 限制)"
+        );
 
         // 绑定地址
         let nix_addr = socketaddr_to_nix(addr);
@@ -117,6 +131,13 @@ impl UdpSocket {
     /// 获取原始文件描述符 (用于 epoll 注册)
     pub fn raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+
+    /// 回读当前 socket 实际生效的 (rcvbuf, sndbuf) 字节数
+    pub fn buffer_sizes(&self) -> (usize, usize) {
+        let rcv = getsockopt(&self.fd, RcvBuf).unwrap_or(0);
+        let snd = getsockopt(&self.fd, SndBuf).unwrap_or(0);
+        (rcv, snd)
     }
 }
 
@@ -251,6 +272,8 @@ pub struct SendBatch {
     /// 预分配的 nix MultiHeaders
     headers: MultiHeaders<SockaddrStorage>,
     capacity: usize,
+    /// 因积压超限而丢弃的包数 (诊断用)
+    dropped: u64,
 }
 
 impl SendBatch {
@@ -268,6 +291,7 @@ impl SendBatch {
             packets: Vec::with_capacity(capacity),
             headers,
             capacity,
+            dropped: 0,
         }
     }
 
@@ -276,7 +300,18 @@ impl SendBatch {
     /// 不再因超出 `capacity` 而丢弃: `flush` 会按 `capacity` 分块多次
     /// sendmmsg 发出。大关键帧 x 多订阅者时不会丢包。
     pub fn push(&mut self, dest: SocketAddr, data: Vec<u8>) {
+        // 积压超限: 丢弃最旧的包，保留新鲜数据。
+        if self.packets.len() >= MAX_SEND_BACKLOG {
+            let overflow = self.packets.len() - MAX_SEND_BACKLOG + 1;
+            self.packets.drain(0..overflow);
+            self.dropped += overflow as u64;
+        }
         self.packets.push((dest, data));
+    }
+
+    /// 累计因积压超限丢弃的包数
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// 是否为空
@@ -289,10 +324,12 @@ impl SendBatch {
         self.packets.clear();
     }
 
-    /// 执行 sendmmsg 批量发包
+    /// 执行 sendmmsg 批量发包。
     ///
-    /// 每 `capacity` 个包一次 sendmmsg (headers 预分配上限)，
-    /// 队列超过容量时自动分多批发送，避免丢包。
+    /// 尽可能发送队列中的包 (每 `capacity` 个一次 sendmmsg)。
+    /// 若内核发送缓冲已满 (EAGAIN)，`sendmmsg` 只发出前缀，**未发出的部分
+    /// 保留在队列中**，由下一轮事件循环重试，而不是静默丢弃。
+    /// 返回本次实际发出的包数。
     pub fn flush(&mut self, fd: RawFd) -> std::io::Result<usize> {
         if self.packets.is_empty() {
             return Ok(0);
@@ -301,8 +338,12 @@ impl SendBatch {
         let chunk_size = self.capacity.max(1);
         let cmsgs: &[nix::sys::socket::ControlMessage] = &[];
         let mut total = 0usize;
+        let mut done = 0usize; // 已成功发出的前缀长度
 
-        for chunk in self.packets.chunks(chunk_size) {
+        while done < self.packets.len() {
+            let end = (done + chunk_size).min(self.packets.len());
+            let chunk = &self.packets[done..end];
+
             // addrs 不借用 packets，用 ArrayVec (栈上) 即可。
             let addrs: ArrayVec<Option<SockaddrStorage>, MAX_BATCH> = chunk
                 .iter()
@@ -324,7 +365,6 @@ impl SendBatch {
                 )
             };
 
-            // 执行 sendmmsg
             let results = sendmmsg(
                 fd,
                 &mut self.headers,
@@ -335,7 +375,19 @@ impl SendBatch {
             )
             .map_err(nix_to_io)?;
 
-            total += results.count();
+            let sent = results.count();
+            total += sent;
+            done += sent;
+
+            if sent < chunk.len() {
+                // 发送缓冲已满: 保留未发出的尾部，下一轮重试。
+                break;
+            }
+        }
+
+        // 移除已成功发出的前缀，保留未发出的包。
+        if done > 0 {
+            self.packets.drain(0..done);
         }
 
         Ok(total)
