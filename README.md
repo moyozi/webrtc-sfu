@@ -4,6 +4,12 @@
 
 ---
 
+> 📖 **部署与各功能使用请看 [`docs/manual.md`](docs/manual.md)**（安装、配置、浏览器、
+> FFmpeg/GStreamer/OBS 推流、单机/多 worker/跨主机集群、压测、排障）。
+> 跨线程/跨主机中继设计见 [`docs/multi-worker-relay.md`](docs/multi-worker-relay.md)。
+
+---
+
 ## 1. 架构总览
 
 ```
@@ -48,21 +54,34 @@
 
 > **为什么不用 SO_REUSEPORT 共享同一端口？**
 > 内核的 SO_REUSEPORT 按四元组哈希选择 socket，**无法保证**包落到持有该
-> participant 的 worker，于是包会被其它 worker 丢弃。因此改为「房间级分片」：
-> 信令层用 `select_worker(room_id)` 把同一房间的所有参与者（发布者 + 订阅连接）
-> 固定到同一个 worker；每个 worker 监听自己的媒体端口 `base_port + cpu_id`，
-> 并在 ICE 候选里公布该端口。这样客户端直接连到正确的 worker，且同一房间的
-> 发布/订阅转发始终在 worker 内部完成，无需跨 worker 通信。
-> 代价：需要放行一个媒体端口段 (端口数 = worker 数)。
+> participant 的 worker，于是包会被其它 worker 丢弃。因此每个 worker 监听
+> 自己的媒体端口 `base_port + cpu_id`，并在 ICE 候选里公布该端口；信令层为
+> 每个参与者分配 worker (`assign_worker`)，同一房间的参与者尽量均匀分布到
+> 多个 worker。
+
+### 单房间多 Worker（跨线程订阅）
+
+同一房间可跨多个 worker：订阅者与发布者若落在不同 worker，媒体经**进程内
+中继平面**转发 —— 发布者 worker 解密出明文 RTP，通过 `RelayHub` 把
+`Arc<[u8]>` 载荷经 channel 送给订阅者所在 worker，后者用自己的 `Rtc`
+完成 PT 映射 + 逐订阅者 SRTP。详见 [docs/multi-worker-relay.md](docs/multi-worker-relay.md)。
+
+```
+Publisher(w0) --解密--> forward --local--> w0 本地订阅者
+                             \--RelayHub--> w1/w2 订阅者(write_rtp+SRTP)
+```
+
+`num_workers=1` 时无中继，行为与单 worker 完全一致。跨主机中继在设计中，
+复用同一送达路径，仅把 `RelayHub` 换成 UDP 中继（见设计文档 §8）。
 
 ### 核心设计原则
 
 | 原则 | 实现方式 |
 |------|----------|
-| **Share-Nothing** | 每个 Worker 线程独占一个 CPU 核心，拥有独立的 UDP socket (独立端口)、Rtc 实例、路由表，无共享可变状态；房间级分片保证同房间不跨 Worker |
+| **Share-Nothing** | 每个 Worker 线程独占一个 CPU 核心，拥有独立的 UDP socket (独立端口)、Rtc 实例、路由表；同一房间可跨 Worker（经 `RelayHub` 中继），单房间不再受单核上限约束 |
 | **Batch I/O** | 使用 `recvmmsg` 批量收包 (64 packets/syscall)、`sendmmsg` 批量发包，减少 80%+ 系统调用 |
 | **Sans I/O 驱动** | str0m 不做任何网络 I/O，由 Worker 事件循环主动喂数据和驱动时间 |
-| **零拷贝路由** | RTP 包在参与者间转发使用 `Bytes` 引用计数，避免内存拷贝 |
+| **零拷贝路由** | RTP mode 包级转发: `RtpPacket.payload` (`Arc<[u8]>`) 引用计数共享，不重组帧/不重新分包 |
 | **CPU 亲和性** | 每个 Worker 绑定到固定 CPU 核心，减少 cache miss 和上下文切换 |
 
 ---
@@ -182,7 +201,7 @@ enum WorkerReply {
 
 | 优化点 | 说明 |
 |--------|------|
-| **房间级分片** | `select_worker(room_id)` 将同一房间固定到同一 Worker；每个 Worker 监听独立媒体端口 `base_port + cpu_id`，ICE 候选公布该端口，避免内核 SO_REUSEPORT 把包分到错误 Worker |
+| **跨线程中继** | 发布者 worker 解密 RTP 后经 `RelayHub` (channel + 唤醒管道) 把明文载荷中继给订阅者 worker，后者完成 PT 映射与 SRTP；单房间可跨多核 |
 | **SO_BUSY_POLL** | 内核级忙轮询，减少软中断延迟 (需 Linux 3.11+, 适合低延迟场景) |
 | **Edge-Triggered epoll** | 配合 recvmmsg 循环读到 EAGAIN，避免 Level-Triggered 的重复唤醒 |
 | **预分配缓冲区** | RecvBatch/SendBatch 在 Worker 启动时分配，热路径零分配 |
@@ -273,9 +292,9 @@ while let Ok(output) = participant.rtc.poll_output() {
             // 需要发送回客户端的包 (STUN/DTLS/SRTP)
             send_batch.push(t.destination, &t.contents);
         }
-        Output::Event(Event::MediaData { mid, pt, time, data, .. }) => {
-            // 5. 收到媒体数据，通过 Router 转发给订阅者
-            router.forward(participant.id, mid, pt, time, &data, &mut send_batch);
+        Output::Event(Event::RtpPacket(pkt)) => {
+            // 5. RTP mode: 收到单个 RTP 包 (不重组帧), 通过 Router 转发给订阅者
+            router.forward(participant.id, mid, pkt, &mut send_batch);
         }
         Output::Event(_) => { /* 处理其他事件 */ }
         Output::Timeout(_) => break,
@@ -283,8 +302,8 @@ while let Ok(output) = participant.rtc.poll_output() {
 }
 
 // 6. Router.forward 内部:
-//    对每个订阅者, 用其 Rtc.writer(mid) 写入媒体数据
-//    然后 drain 订阅者的 poll_output → 收集 Transmit → send_batch
+//    对每个订阅者, 用其 DirectApi::stream_tx(mid).write_rtp(pkt) 写入 RTP 包
+//    (仅改 PT/SSRC, 不重新分包), 然后 drain 订阅者的 poll_output → send_batch
 ```
 
 ---
@@ -344,7 +363,12 @@ struct Subscription {
                 └─────────────┘ └───────┘ └─────────────┘
 ```
 
-### 5.3 RTP 转发优化
+### 5.3 RTP 包级转发 (RTP mode)
+
+本项目所有 `Rtc` 都以 `set_rtp_mode(true)` 构建: str0m **不再做 depacketize /
+packetize**, `Event::MediaData`（完整帧）被 `Event::RtpPacket`（单个 RTP 包）取代。
+因此转发是**包级**的: 收到一个 RTP 包 → 对每个订阅者只做 PT 映射 + `write_rtp`
+重新加密，不重组帧、不重新分包。
 
 ```rust
 impl Router {
@@ -352,9 +376,7 @@ impl Router {
         &mut self,
         publisher_id: ParticipantId,
         mid: Mid,
-        pt: u8,
-        time: MediaTime,
-        data: &[u8],
+        pkt: RtpPacket,
         send_batch: &mut SendBatch,
     ) {
         // 1. 查找订阅者
@@ -363,32 +385,81 @@ impl Router {
             None => return,
         };
 
-        // 2. 对每个订阅者转发
+        // 2. 入站 PT → 发布者编码参数 (RtpPacket 不携带 params, 需回查)
+        let params = publisher.payload_params_for(pkt.header.payload_type)?;
+
+        // 3. 对每个订阅者转发
         for sub in subs {
             let participant = match self.participants.get_mut(&sub.subscriber_id) {
                 Some(p) => p,
                 None => continue,
             };
 
-            // 3. 使用 str0m Writer 写入媒体数据
-            //    str0m 内部处理 SRTP 加密、RTP 打包
-            if let Some(writer) = participant.rtc.writer(sub.mid) {
-                if writer.write(now, time, pt, data).is_ok() {
-                    // 4. Drain 输出，收集 Transmit
-                    while let Ok(output) = participant.rtc.poll_output() {
-                        match output {
-                            Output::Transmit(t) => {
-                                send_batch.push(t.destination, &t.contents);
-                            }
-                            Output::Timeout(_) => break,
-                            _ => {}
-                        }
-                    }
+            // 4. 映射为订阅者本地 PT, 并确保发送流已声明 (main + rtx SSRC)
+            let local_pt = participant.rtc.codec_config().match_params(params)?.pt();
+            participant.ensure_tx_stream(sub.mid);
+
+            // 5. 包级透传: payload 为 Arc<[u8]> 共享, 仅改 PT/SSRC;
+            //    SRTP 加密由 str0m 在 poll_output 时完成
+            let mut api = participant.rtc.direct_api();
+            if let Some(stream) = api.stream_tx_by_mid(sub.mid, None) {
+                stream.write_rtp(
+                    RtpWrite::new(local_pt, pkt.seq_no, pkt.header.timestamp,
+                                 pkt.timestamp, pkt.payload.clone())
+                        .marker(pkt.header.marker)
+                        .ext_vals(pkt.header.ext_vals.clone())
+                        .nackable(true),
+                );
+            }
+
+            // 6. Drain 输出，收集 Transmit (含 NACK 重传)
+            while let Ok(output) = participant.rtc.poll_output() {
+                match output {
+                    Output::Transmit(t) => send_batch.push(t.destination, t.contents.into()),
+                    Output::Timeout(_) => break,
+                    _ => {}
                 }
             }
         }
     }
 }
+```
+
+### 5.4 带宽估计与分层自适应 (BWE / Simulcast / SVC)
+
+每个 `Rtc` 都以 `enable_bwe` 构建。订阅者连接会收到 TWCC/REMB 反馈，
+str0m 产生 `Event::EgressBitrateEstimate`（下行可用带宽），SFU 据此为每个
+订阅者选层。
+
+**Simulcast (RID)**
+
+1. 发布者每条 simulcast 流带独立 SSRC + RID 扩展；
+2. SFU 用 500ms 滑动窗口 + EWMA 测量每层实际码率（`RateWindow`）；
+3. 每 500ms 按订阅者 BWE（留 10% 余量）选出码率不超限的**最高层**；
+4. 切层时向发布者该 RID 发 PLI，**等到目标层关键帧到达**才真正切换，
+   避免花屏；
+5. 逐订阅者**重写 RTP 序号**，使切层/丢层后订阅者看到的序号始终连续
+   （也是 NACK 重传正确性的前提）。
+
+**SVC (时间层)**
+
+单条 VP8 流内的时间层用自研的 payload-descriptor 解析（`vp8_temporal_id`）
+识别 TID。SFU 按累计时间层码率选择满足 BWE 的最大 TID，丢弃高于它的包；
+同样依赖逐订阅者序号重写。由于 str0m 公开 API 不暴露 VP9/AV1 的空间层索引，
+目前仅支持 **VP8 时间层**降级。
+
+```
+  Publisher (3-layer simulcast)
+  ┌─ rid=h 1.5M ─┐
+  ├─ rid=m 500k ─┤
+  └─ rid=l 150k ─┘
+        │
+        ▼   ┌──────────────────────────────────────┐
+   ─────►   │ Worker: 按每订阅者 BWE 选 RID + 重写序号  │
+            └───────┬───────────────┬───────────────┘
+                    │               │
+              Sub A BWE 2M     Sub B BWE 300k
+              → rid=h          → rid=l
 ```
 
 ---
@@ -419,7 +490,7 @@ struct SendBatch {
 | 数据路径 | 策略 |
 |----------|------|
 | 收包 → str0m | `Receive::new()` 接收 `&[u8]` 引用，零拷贝 |
-| str0m → Router | `Event::MediaData.data` 为 `Vec<u8>`，转换为 `Bytes` |
+| str0m → Router | RTP mode 下 `Event::RtpPacket.payload` 为 `Arc<[u8]>`，多订阅者共享 |
 | Router → 订阅者 str0m | `Bytes` 引用计数克隆，多订阅者共享同一底层数据 |
 | str0m → sendmmsg | `Transmit.contents` 为 `Bytes`，直接传给 sendmmsg |
 
@@ -712,18 +783,74 @@ SFU_ANNOUNCE_IP=203.0.113.10 RUST_LOG=info ./target/release/sfu-server
 
 # 环境变量调优
 SFU_ANNOUNCE_IP=203.0.113.10  # 对外通告 IP — 写入 SDP/ICE host 候选 (必须为客户端可达地址)
-SFU_WORKERS=4                 # worker 线程数 (同时决定媒体端口数量)
+SFU_WORKERS=4                 # worker 线程数; 单房间参与者会均匀分布到这些 worker 上
+                              # (跨 worker 订阅经内存中继, 单房间不再受单核上限约束)
 SFU_WS_ADDR=0.0.0.0:5174      # WebSocket 信令监听地址 (默认 0.0.0.0:5174)
 SFU_QUIC_ADDR=0.0.0.0:5173    # QUIC 信令监听地址; 设为 0/off/空 则禁用 QUIC
 SFU_MEDIA_ADDR=0.0.0.0:5175   # 媒体 UDP 绑定地址 (默认 0.0.0.0:5175)
+SFU_BWE_INITIAL_BPS=1000000   # BWE 初始带宽估计 (bit/s, 默认 1 Mbps)
+SFU_SOCK_BUF_MB=16            # UDP socket 收发缓冲区目标 (MB); 实际值受内核 rmem_max/wmem_max 限制
+
+# 跨主机中继 (单房间跨机扩展)
+SFU_WORKER_OFFSET=0           # 本进程 worker 全局编号起始
+SFU_RELAY_LISTEN=0.0.0.0:5390 # 本进程 relay UDP 监听地址 (启用跨主机中继)
+SFU_RELAY_PEERS=1=10.0.0.2:5390,2=10.0.0.2:5390  # 远端全局 worker -> 对端 relay 地址\n\n# 集群控制面 (集中信令 + worker-only 主机)\nSFU_TOTAL_WORKERS=4           # 整集群 worker 总数 (全局编号 0..total)\nSFU_WORKER_OFFSET=0           # 本进程 worker 全局编号起始\nSFU_SIGNALING=on              # worker-only 进程设 off\nSFU_CONTROL_LISTEN=0.0.0.0:5400                  # 本进程控制面 TCP 监听\nSFU_CONTROL_PEERS=2=10.0.0.2:5400,3=10.0.0.2:5400  # 远端 worker -> 对端控制地址
+
+# WHIP 推流接入 (FFmpeg/GStreamer/OBS 直推 WebRTC)
+SFU_WHIP_ADDR=0.0.0.0:5180    # WHIP HTTP 监听; 不设则不启用
 SO_BUSY_POLL=50               # 内核忙轮询微秒数 (0=禁用)
 BATCH_SIZE=64                 # recvmmsg 批量大小
 ```
+
+> **系统 socket 缓冲区**：内核默认 `rmem_max/wmem_max` 仅 4MB，会把 socket 缓冲
+> 截断到 ~8MB，高 fanout 时造成丢包。建议部署前调大（见 `scripts/sysctl-sfu.sh`）：
+> ```bash
+> sudo sysctl -w net.core.rmem_max=67108864 net.core.wmem_max=67108864
+> sudo sysctl -w net.core.rmem_default=4194304 net.core.wmem_default=4194304
+> sudo sysctl -w net.core.netdev_max_backlog=250000
+> ```
+> 启动日志会打印每个 worker 实际生效的 `rcvbuf/sndbuf`，便于确认。
 
 > **监听地址 vs 对外通告地址**：服务始终绑定 `0.0.0.0`（由防火墙控制暴露面），
 > 而 ICE host 候选中的地址取自 `SFU_ANNOUNCE_IP`。若未显式配置，启动时会自动
 > 探测本机出口 IP（探测失败则回退 `127.0.0.1` 并告警）。多 worker 时每个 worker
 > 的通告端口 = 媒体端口 = `SFU_MEDIA_ADDR` 端口 + worker 序号。
+
+---
+
+## 11.1 WHIP 推流接入 (FFmpeg / GStreamer / OBS)
+
+启用 `SFU_WHIP_ADDR=0.0.0.0:5180` 后，任意 WHIP 客户端可直接以 WebRTC 推流，
+SFU 把它当作普通发布者（房间内 WebSocket 订阅者照常 `subscribe`）。
+
+**FFmpeg**（8.x 自带 `-f whip`，会自行完成 ICE/DTLS/SRTP）:
+```bash
+ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 \
+  -c:v libopenh264 -b:v 2000k -g 60 -pix_fmt yuv420p \
+  -c:a libopus -b:a 96k -ar 48000 -ac 2 \
+  -f whip "http://SFU_HOST:5180/whip?room=demo"
+```
+> FFmpeg 的 whip muxer **视频仅支持 H.264**（`libx264`/`libopenh264`/`h264_nvenc`…），
+> 音频支持 Opus。H.264 + Opus 正好是 WebRTC 可直通的编码，无需转码。
+
+**GStreamer**:
+```bash
+# 推荐 gst-plugins-rs 的 whipsink (webrtc 插件)
+gst-launch-1.0 videotestsrc is-live=true ! video/x-raw,width=1280,height=720,framerate=30/1 \
+  ! x264enc tune=zerolatency ! rtph264pay config-interval=1 pt=96 \
+  ! whipsink whip-endpoint="http://SFU_HOST:5180/whip?room=demo"
+# 或用 webrtcbin 自建 WHIP 客户端；本机的 avmux_whip 因无 location 属性不可用
+```
+
+**OBS**: 添加「WHIP」输出，服务器填 `http://SFU_HOST:5180/whip?room=demo`。
+
+**接口**（RFC 9725 子集）:
+| 方法 | 路径 | 作用 |
+|------|------|------|
+| `OPTIONS` | `/whip` | CORS / 能力探测 |
+| `POST` | `/whip?room=<房间>` | 提交 SDP offer，返回 `201` + SDP answer（含 SFU ICE 候选），响应头 `Location` / `X-Participant-Id` |
+| `PATCH` | `/whip/<id>` | trickle ICE (`application/trickle-ice-sdpfrag`) |
+| `DELETE` | `/whip/<id>` | 停止推流 |
 
 ---
 
@@ -762,9 +889,14 @@ match rtc.poll_output()? {
 // 检查是否接受输入 (用于多路复用)
 if rtc.accepts(&input) { /* 这个包属于这个 Rtc */ }
 
-// 发送媒体 (用于 SFU 转发)
-let writer = rtc.writer(mid);
-writer.write(now, time, pt, &data)?;
+// 发送媒体 (SFU 转发, RTP mode)
+let mut api = rtc.direct_api();
+let stream = api.stream_tx_by_mid(mid, None)?;
+stream.write_rtp(
+    str0m::rtp::RtpWrite::new(pt, seq_no, time, wallclock, payload)
+        .marker(marker)
+        .nackable(true),
+);
 ```
 
 ### nix v0.31 recvmmsg
