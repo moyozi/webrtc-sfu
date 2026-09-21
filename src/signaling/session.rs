@@ -112,12 +112,14 @@ impl SignalingSession {
                 ..
             } => {
                 if let Some(sess) = self.sessions.get(&pc_id) {
-                    let worker_tx = &self.state.worker_txs[sess.worker_idx];
-                    let _ = worker_tx.send(WorkerCommand::AddRemoteCandidate {
-                        participant_id: sess.participant_id.clone(),
-                        candidate,
-                        sdp_mid,
-                    });
+                    self.state.send_worker(
+                        sess.worker_idx,
+                        WorkerCommand::AddRemoteCandidate {
+                            participant_id: sess.participant_id.clone(),
+                            candidate,
+                            sdp_mid,
+                        },
+                    );
                 }
             }
 
@@ -128,14 +130,18 @@ impl SignalingSession {
                 subscriber_mid,
             } => {
                 if let Some(sess) = self.sessions.get(&pc_id) {
-                    let worker_tx = &self.state.worker_txs[sess.worker_idx];
-                    let _ = worker_tx.send(WorkerCommand::Subscribe {
-                        room_id: sess.room_id.clone(),
-                        subscriber_id: sess.participant_id.clone(),
-                        publisher_id: publisher_id.clone(),
-                        publisher_mid: track_mid,
-                        subscriber_mid,
-                    });
+                    let publisher_worker = self.state.worker_of(&publisher_id);
+                    self.state.send_worker(
+                        sess.worker_idx,
+                        WorkerCommand::Subscribe {
+                            room_id: sess.room_id.clone(),
+                            subscriber_id: sess.participant_id.clone(),
+                            publisher_id: publisher_id.clone(),
+                            publisher_mid: track_mid,
+                            subscriber_mid,
+                            publisher_worker,
+                        },
+                    );
 
                     self.send(SignalingResponse::Subscribed {
                         pc_id,
@@ -150,12 +156,16 @@ impl SignalingSession {
                 track_mid,
             } => {
                 if let Some(sess) = self.sessions.get(&pc_id) {
-                    let worker_tx = &self.state.worker_txs[sess.worker_idx];
-                    let _ = worker_tx.send(WorkerCommand::Unsubscribe {
-                        subscriber_id: sess.participant_id.clone(),
-                        publisher_id,
-                        publisher_mid: track_mid,
-                    });
+                    let publisher_worker = self.state.worker_of(&publisher_id);
+                    self.state.send_worker(
+                        sess.worker_idx,
+                        WorkerCommand::Unsubscribe {
+                            subscriber_id: sess.participant_id.clone(),
+                            publisher_id,
+                            publisher_mid: track_mid,
+                            publisher_worker,
+                        },
+                    );
                 }
             }
 
@@ -179,31 +189,19 @@ impl SignalingSession {
             participant_id, room_id, role, pc_id
         );
 
-        // 选择 Worker — 同一房间的发布者/订阅连接必须落在同一 worker
-        let worker_idx = self.state.select_worker(&room_id);
-        let worker_tx = &self.state.worker_txs[worker_idx];
+        // 选择全局 Worker — 房间可跨 worker/主机分布 (订阅经中继平面)
+        let worker_idx = self.state.assign_worker(&room_id, &participant_id);
 
-        // 创建 reply channel
-        let (tx, rx) = crossbeam_channel::bounded(1);
+        // 创建参与者 (本地 worker 走 channel, 远端经控制面往返)
+        let reply = self.state.create_participant(
+            worker_idx,
+            room_id.clone(),
+            participant_id.clone(),
+            sdp,
+        );
 
-        let cmd = WorkerCommand::CreateParticipant {
-            room_id: room_id.clone(),
-            participant_id: participant_id.clone(),
-            sdp_offer: sdp,
-            reply_tx: tx,
-        };
-
-        if worker_tx.send(cmd).is_err() {
-            self.send(SignalingResponse::Error {
-                pc_id: Some(pc_id),
-                error: "Worker 不可用".to_string(),
-            });
-            return;
-        }
-
-        // 等待 Worker 的 SDP answer
-        match rx.recv() {
-            Ok(WorkerReply::SdpAnswer {
+        match reply {
+            Some(WorkerReply::SdpAnswer {
                 sdp_answer,
                 local_candidates,
                 ..
@@ -247,13 +245,13 @@ impl SignalingSession {
                     debug!("已通知房间 {} 内的其他参与者: {} 加入", room_id, participant_id);
                 }
             }
-            Ok(WorkerReply::Error { error, .. }) => {
+            Some(WorkerReply::Error { error, .. }) => {
                 self.send(SignalingResponse::Error {
                     pc_id: Some(pc_id),
                     error,
                 });
             }
-            Err(_) => {
+            None => {
                 self.send(SignalingResponse::Error {
                     pc_id: Some(pc_id),
                     error: "Worker 无响应".to_string(),
@@ -273,6 +271,8 @@ impl SignalingSession {
 
 /// 清理一个 PC 会话: 发布者需离开房间并广播, 订阅连接只移除 Rtc
 fn cleanup_session(state: &SignalingState, sess: &PcSession) {
+    // 释放 worker 计数
+    state.release_worker(&sess.room_id, &sess.participant_id);
     if sess.is_publisher {
         state.leave_room(&sess.room_id, &sess.participant_id);
         state.unregister_sender(&sess.participant_id);
@@ -285,9 +285,12 @@ fn cleanup_session(state: &SignalingState, sess: &PcSession) {
     }
 
     // 通知 Worker 移除参与者 (释放对应的 Rtc)
-    let _ = state.worker_txs[sess.worker_idx].send(WorkerCommand::RemoveParticipant {
-        participant_id: sess.participant_id.clone(),
-    });
+    state.send_worker(
+        sess.worker_idx,
+        WorkerCommand::RemoveParticipant {
+            participant_id: sess.participant_id.clone(),
+        },
+    );
 }
 
 /// 从 `inbound` 读取 JSON 字符串并驱动会话, 直到通道关闭 (连接断开)。

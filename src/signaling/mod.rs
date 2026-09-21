@@ -18,25 +18,32 @@ pub mod protocol;
 pub mod quic;
 pub mod server;
 pub mod session;
+pub mod whip;
 
-use crate::core::WorkerCommand;
+use crate::cluster::WorkerRouter;
+use crate::core::{WorkerCommand, WorkerReply};
 use ahash::AHashMap;
-use crossbeam_channel::Sender;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// 信令服务器全局状态
 pub struct SignalingState {
-    /// Worker 命令发送器 (每个 worker 一个)
-    /// 同一房间的所有参与者 (发布者 + 订阅连接) 必须落在同一个 worker,
-    /// 因为每个 worker 拥有独立的 participants/router, 跨 worker 无法转发媒体。
-    pub worker_txs: Vec<Sender<WorkerCommand>>,
+    /// 统一的 worker 命令路由 (本地 channel 或远端 TCP 控制面)。
+    pub router: Arc<WorkerRouter>,
+    /// 整集群全局 worker 总数 (0..total_workers)。
+    pub total_workers: u32,
+    /// 全局 round-robin 计数器 (房间跨 worker/主机分配)。
+    assign_counter: AtomicUsize,
     /// 房间表: room_id → 房间信息
     pub rooms: Mutex<AHashMap<String, RoomInfo>>,
     /// 信令消息发送器: participant_id → channel sender
     /// 用于向特定参与者推送通知 (participant_joined / participant_left)。
     /// 与传输无关: WebSocket 与 QUIC 连接注册的 sender 语义完全一致。
     pub senders: Mutex<AHashMap<String, mpsc::UnboundedSender<String>>>,
+    /// participant_id → worker_idx (用于订阅时定位发布者所在 worker)
+    pub participant_worker: Mutex<AHashMap<String, usize>>,
 }
 
 /// 房间信息 (信令层)
@@ -47,31 +54,57 @@ pub struct RoomInfo {
 }
 
 impl SignalingState {
-    pub fn new(worker_txs: Vec<Sender<WorkerCommand>>) -> Self {
+    pub fn new(router: Arc<WorkerRouter>, total_workers: u32) -> Self {
         Self {
-            worker_txs,
+            router,
+            total_workers: total_workers.max(1),
+            assign_counter: AtomicUsize::new(0),
             rooms: Mutex::new(AHashMap::new()),
             senders: Mutex::new(AHashMap::new()),
+            participant_worker: Mutex::new(AHashMap::new()),
         }
     }
 
-    /// 按房间选择 worker (稳定哈希)
-    ///
-    /// 同一房间的发布者和订阅连接必须落在同一个 worker 上,
-    /// 否则订阅关系与媒体转发会落到不同的 participants/router 中而失败。
-    /// 不同房间则尽量均匀分布到不同 worker。
-    pub fn select_worker(&self, room_id: &str) -> usize {
-        let n = self.worker_txs.len();
-        if n <= 1 {
-            return 0;
-        }
-        // FNV-1a 64 位稳定哈希
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in room_id.as_bytes() {
-            hash ^= *b as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        (hash as usize) % n
+    /// 为参与者分配**全局** worker: round-robin 覆盖整集群, 使一个房间
+    /// 可以跨 worker / 跨主机分布。
+    pub fn assign_worker(&self, _room_id: &str, participant_id: &str) -> usize {
+        let total = self.total_workers as usize;
+        let idx = self.assign_counter.fetch_add(1, Ordering::Relaxed) % total;
+        self.participant_worker
+            .lock()
+            .insert(participant_id.to_string(), idx);
+        idx
+    }
+
+    /// 创建参与者 (可能需要远端 worker 往返)。
+    pub fn create_participant(
+        &self,
+        global: usize,
+        room_id: String,
+        participant_id: String,
+        sdp_offer: String,
+    ) -> Option<WorkerReply> {
+        self.router
+            .create_participant(global, room_id, participant_id, sdp_offer)
+    }
+
+    /// 发送无需回复的 worker 命令。
+    pub fn send_worker(&self, global: usize, cmd: WorkerCommand) {
+        self.router.send(global, cmd);
+    }
+
+    /// 查询参与者所在 worker (未知默认 0)。
+    pub fn worker_of(&self, participant_id: &str) -> usize {
+        self.participant_worker
+            .lock()
+            .get(participant_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 参与者离开时清除其 worker 绑定。
+    pub fn release_worker(&self, _room_id: &str, participant_id: &str) {
+        self.participant_worker.lock().remove(participant_id);
     }
 
     /// 加入房间

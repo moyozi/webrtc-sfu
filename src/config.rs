@@ -1,5 +1,6 @@
 //! SFU 配置定义
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use tracing::warn;
 
@@ -23,6 +24,26 @@ pub struct SfuConfig {
     pub send_batch_size: usize,
     /// SO_BUSY_POLL 微秒数 (0 = 禁用)
     pub busy_poll_us: u32,
+    /// BWE 初始带宽估计 (bit/s)。订阅者侧用于启动带宽估计。
+    pub bwe_initial_bps: u64,
+    /// UDP socket 收发缓冲区目标大小 (字节)。实际值受内核 rmem_max/wmem_max 限制。
+    pub sock_buf_bytes: usize,
+    /// 本进程 worker 的全局编号起始 (跨主机唯一)
+    pub worker_offset: u32,
+    /// 本进程 relay UDP 监听地址 (跨主机中继; None = 不启用跨主机)
+    pub relay_listen: Option<SocketAddr>,
+    /// 远端 worker 全局编号 → 其所属进程的 relay UDP 地址
+    pub relay_peers: HashMap<u32, SocketAddr>,
+    /// 整集群 worker 总数 (全局编号范围 0..total)
+    pub total_workers: u32,
+    /// 本进程控制面 TCP 监听地址 (接收远端信令命令; None = 不监听)
+    pub control_listen: Option<SocketAddr>,
+    /// 远端 worker 全局编号 → 其所属进程的控制地址
+    pub control_peers: HashMap<u32, SocketAddr>,
+    /// 本进程是否运行信令服务器 (worker-only 进程设 false)
+    pub signaling: bool,
+    /// WHIP 推流接入 HTTP 监听地址 (None = 禁用)
+    pub whip_listen: Option<SocketAddr>,
 }
 
 impl SfuConfig {
@@ -82,6 +103,75 @@ impl SfuConfig {
             },
         };
 
+        // BWE 初始带宽估计 (bit/s)。
+        let bwe_initial_bps = std::env::var("SFU_BWE_INITIAL_BPS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v >= 50_000)
+            .unwrap_or(1_000_000);
+
+        // UDP socket 缓冲区 (MB)，默认 16MB；受内核 rmem_max/wmem_max 截断。
+        let sock_buf_bytes = std::env::var("SFU_SOCK_BUF_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(16)
+            * 1024
+            * 1024;
+
+        // 跨主机中继配置
+        let worker_offset = std::env::var("SFU_WORKER_OFFSET")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let relay_listen = std::env::var("SFU_RELAY_LISTEN")
+            .ok()
+            .and_then(|v| v.parse::<SocketAddr>().ok());
+        let mut relay_peers: HashMap<u32, SocketAddr> = HashMap::new();
+        if let Ok(s) = std::env::var("SFU_RELAY_PEERS") {
+            // 格式: "idx=host:port,idx=host:port"
+            for part in s.split(',') {
+                if let Some((idx, addr)) = part.split_once('=') {
+                    if let (Ok(i), Ok(a)) = (
+                        idx.trim().parse::<u32>(),
+                        addr.trim().parse::<SocketAddr>(),
+                    ) {
+                        relay_peers.insert(i, a);
+                    }
+                }
+            }
+        }
+
+        // 集群控制面 + 全局 worker 分配
+        let total_workers = std::env::var("SFU_TOTAL_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v >= num_workers as u32)
+            .unwrap_or(num_workers as u32);
+        let control_listen = std::env::var("SFU_CONTROL_LISTEN")
+            .ok()
+            .and_then(|v| v.parse::<SocketAddr>().ok());
+        let mut control_peers: HashMap<u32, SocketAddr> = HashMap::new();
+        if let Ok(s) = std::env::var("SFU_CONTROL_PEERS") {
+            for part in s.split(',') {
+                if let Some((idx, addr)) = part.split_once('=') {
+                    if let (Ok(i), Ok(a)) = (
+                        idx.trim().parse::<u32>(),
+                        addr.trim().parse::<SocketAddr>(),
+                    ) {
+                        control_peers.insert(i, a);
+                    }
+                }
+            }
+        }
+        let whip_listen = std::env::var("SFU_WHIP_ADDR")
+            .ok()
+            .and_then(|v| v.parse::<SocketAddr>().ok());
+        let signaling = match std::env::var("SFU_SIGNALING") {
+            Ok(v) => !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false")),
+            Err(_) => true,
+        };
+
         Self {
             listen_addr,
             ws_listen_addr,
@@ -91,6 +181,16 @@ impl SfuConfig {
             batch_size: 64,
             send_batch_size: 128,
             busy_poll_us: 0,
+            bwe_initial_bps,
+            sock_buf_bytes,
+            worker_offset,
+            relay_listen,
+            relay_peers,
+            total_workers,
+            control_listen,
+            control_peers,
+            signaling,
+            whip_listen,
         }
     }
 }
