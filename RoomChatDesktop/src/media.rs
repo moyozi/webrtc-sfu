@@ -11,6 +11,7 @@
 //!   · 合成 ADM: 本模块 `AudioGenerator` 持续推入 440Hz 正弦波供联调。
 
 use std::f32::consts::PI;
+use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -21,6 +22,9 @@ use nokhwa::pixel_format::RgbAFormat;
 use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
 use reactor_webrtc::{PeerConnectionFactory, VideoFrame, VideoTrack};
+use zune_jpeg::zune_core::colorspace::ColorSpace;
+use zune_jpeg::zune_core::options::DecoderOptions;
+use zune_jpeg::JpegDecoder;
 
 use crate::ui::UiEvent;
 
@@ -94,6 +98,24 @@ fn open_camera(index: u32) -> Result<Camera, String> {
         }
     }
     Err(format!("无法打开摄像头 (index={index}): {last_err}"))
+}
+
+/// 把一帧解码为 RGBA。
+///
+/// nokhwa 默认的 `decoding` feature 依赖 mozjpeg, 其导出的 `jpeg_*` 符号与
+/// libwebrtc 内置 libjpeg 冲突, 因此这里关闭该 feature:
+///  · MJPEG 帧用纯 Rust 的 zune-jpeg 解码;
+///  · YUYV 等原始格式仍走 nokhwa 自带的转换。
+fn decode_frame(frame: &nokhwa::Buffer, rgba: &mut [u8]) -> Result<(), String> {
+    if frame.source_frame_format() == FrameFormat::MJPEG {
+        let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
+        let mut dec = JpegDecoder::new_with_options(Cursor::new(frame.buffer()), options);
+        dec.decode_into(rgba).map_err(|e| e.to_string())
+    } else {
+        frame
+            .decode_image_to_buffer::<RgbAFormat>(rgba)
+            .map_err(|e| e.to_string())
+    }
 }
 
 pub struct CameraCapture {
@@ -173,7 +195,7 @@ fn camera_loop(
         if rgba.len() != need {
             rgba.resize(need, 0);
         }
-        if frame.decode_image_to_buffer::<RgbAFormat>(&mut rgba).is_err() {
+        if decode_frame(&frame, &mut rgba).is_err() {
             continue;
         }
 

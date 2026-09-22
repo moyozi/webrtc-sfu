@@ -18,7 +18,10 @@ slint = "1.18"
 reactor-webrtc = "0.18"
 
 # 摄像头采集 (AVFoundation / V4L2 / MSMF); 推帧给 reactor-webrtc 视频轨
-nokhwa = { version = "0.10", features = ["input-native", "camera-sync-impl"] }
+# 注意: 关闭默认 `decoding` feature, 它依赖的 mozjpeg 会导出与 libwebrtc 内置
+# libjpeg 同名的 `jpeg_*` 符号, 静态链接时冲突; MJPEG 由纯 Rust 的 zune-jpeg 解码。
+nokhwa = { version = "0.10", default-features = false, features = ["input-native", "camera-sync-impl"] }
+zune-jpeg = "0.5"
 
 # 信令 (WebSocket 客户端)
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "io-util", "macros"] }
