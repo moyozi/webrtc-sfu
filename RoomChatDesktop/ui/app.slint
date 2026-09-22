@@ -1,0 +1,428 @@
+// RoomChat 桌面客户端 UI — Slint
+//
+// 结构与 Android (Compose) 客户端一致:
+//   · JoinScreen: 输入信令地址 / 房间号 / 昵称后加入
+//   · CallScreen: 视频网格 + 参与者侧栏 (订阅/取消订阅 + 事件日志) + 底部控制栏
+//
+// 视频帧由 Rust 侧 (reactor-webrtc on_frame 回调) 转成 image 属性后推入模型。
+//
+// 语法备忘: 元素级条件用 `if (cond): Element { ... }` (冒号形式);
+//           `if (cond) { ... }` 仅用于回调/函数内的语句。
+
+import { Button, CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
+
+// ── 数据结构 (Rust 侧直接构造) ─────────────────────────────────
+
+export struct LogEntry {
+    time: string,
+    msg: string,
+    level: string, // "info" | "success" | "warn" | "error"
+}
+
+export struct Participant {
+    id: string,
+    status: string, // "idle" | "connecting" | "subscribed" | "error"
+    has_video: bool,
+    image: image,
+}
+
+// ── 小部件 ────────────────────────────────────────────────────
+
+component StatusDot inherits Rectangle {
+    in property <string> status;
+    width: 10px;
+    height: 10px;
+    border-radius: 5px;
+    background: status == "subscribed" ? #2e7d32
+        : status == "connecting" ? #f9a825
+        : status == "error" ? #e53935
+        : #5f6368;
+}
+
+component VideoTile inherits Rectangle {
+    in property <string> tile-title;
+    in property <string> subtitle;
+    in property <image> frame;
+    in property <bool> has-video: true;
+
+    border-radius: 10px;
+    clip: true;
+    background: #000000;
+
+    Image {
+        source: frame;
+        width: 100%;
+        height: 100%;
+        image-fit: contain;
+        visible: has-video;
+    }
+
+    if (!has-video): Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #202329;
+        Text {
+            text: subtitle;
+            color: #b0b3b8;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+    }
+
+    Rectangle {
+        height: 30px;
+        y: parent.height - self.height;
+        width: 100%;
+        background: #000000aa;
+        Text {
+            text: tile-title;
+            color: #ffffff;
+            font-size: 13px;
+            vertical-alignment: center;
+            x: 10px;
+            width: parent.width - 20px;
+            height: 100%;
+            overflow: elide;
+        }
+    }
+}
+
+component ParticipantRow inherits Rectangle {
+    in property <string> pid;
+    in property <string> status;
+    callback sub-clicked();
+    callback unsub-clicked();
+
+    height: 40px;
+    background: transparent;
+    border-radius: 6px;
+
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 8px;
+        alignment: center;
+
+        StatusDot { status: status; }
+
+        Text {
+            text: pid;
+            color: #e6e6e6;
+            font-size: 13px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+
+        Button {
+            text: status == "subscribed" ? "取消" : status == "connecting" ? "连接中..." : "订阅";
+            enabled: status != "connecting";
+            clicked => {
+                if (status == "subscribed") {
+                    unsub-clicked();
+                } else {
+                    sub-clicked();
+                }
+            }
+        }
+    }
+}
+
+component LogLine inherits Text {
+    in property <string> level;
+    color: level == "success" ? #66bb6a
+        : level == "warn" ? #f9a825
+        : level == "error" ? #ef5350
+        : #8ab4f8;
+    font-size: 12px;
+    overflow: elide;
+}
+
+// ── 主窗口 ────────────────────────────────────────────────────
+
+export component AppWindow inherits Window {
+    title: "RoomChat Desktop · WebRTC SFU";
+    width: 1180px;
+    height: 780px;
+    background: #16181d;
+
+    // 共享状态 (Rust 侧读写)
+    in-out property <bool> in_call: false;
+    in-out property <bool> joining: false;
+    in-out property <string> error_text: "";
+    in-out property <string> room_id: "";
+    in-out property <int> participant_count: 1;
+    in-out property <string> connection_state: "未连接";
+    in-out property <bool> audio_enabled: true;
+    in-out property <bool> video_enabled: true;
+    in-out property <image> local_image;
+    in-out property <[Participant]> remote_participants: [];
+    in-out property <[LogEntry]> logs: [];
+
+    // 加入页可编辑输入
+    in-out property <string> server_url: "ws://127.0.0.1:5174";
+    in-out property <string> join_room_id: "room-1";
+    in-out property <string> nickname: "desktop-user";
+    in-out property <bool> use_real_devices: true;
+
+    // 回调 (Rust 侧注册)
+    callback join(string, string, string, bool);
+    callback leave();
+    callback subscribe(string);
+    callback unsubscribe(string);
+    callback toggle_audio(bool);
+    callback toggle_video(bool);
+
+    // ── 加入页 ──
+    if (!root.in_call): Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #16181d;
+
+        VerticalLayout {
+            width: 100%;
+            height: 100%;
+            padding: 24px;
+            alignment: center;
+
+            // 上下弹性留白 (垂直居中)
+            Rectangle { background: transparent; }
+
+            Rectangle {
+                width: 440px;
+                background: #22252c;
+                border-radius: 14px;
+
+                VerticalLayout {
+                    width: 100%;
+                    padding: 24px;
+                    spacing: 10px;
+
+                    Text {
+                        text: "WebRTC SFU 桌面客户端";
+                        color: #ffffff;
+                        font-size: 22px;
+                    }
+                    Text {
+                        text: "多人视频通话 · Slint + reactor-webrtc";
+                        color: #9aa0a6;
+                        font-size: 13px;
+                    }
+                    Rectangle { height: 6px; background: transparent; }
+
+                    Text { text: "信令服务器"; color: #c0c4ca; font-size: 13px; }
+                    LineEdit {
+                        text <=> root.server_url;
+                        placeholder-text: "ws://host:5174";
+                    }
+
+                    Text { text: "房间号"; color: #c0c4ca; font-size: 13px; }
+                    LineEdit { text <=> root.join_room_id; }
+
+                    Text { text: "昵称"; color: #c0c4ca; font-size: 13px; }
+                    LineEdit { text <=> root.nickname; }
+
+                    CheckBox {
+                        text: "使用真实摄像头和麦克风 (需系统授权)";
+                        checked <=> root.use_real_devices;
+                    }
+
+                    Rectangle { height: 4px; background: transparent; }
+
+                    Button {
+                        text: root.joining ? "加入中..." : "加入房间";
+                        enabled: !root.joining;
+                        primary: true;
+                        clicked => {
+                            root.join(root.server_url, root.join_room_id, root.nickname, root.use_real_devices);
+                        }
+                    }
+
+                    if (root.error_text != ""): Text {
+                        text: root.error_text;
+                        color: #ef5350;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+
+                    Text {
+                        text: "媒体端口 UDP 5175+ · 信令端口 WS 5174";
+                        color: #6b7076;
+                        font-size: 11px;
+                    }
+                }
+            }
+
+            Rectangle { background: transparent; }
+        }
+    }
+
+    // ── 通话页 ──
+    if (root.in_call): Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #16181d;
+
+        VerticalLayout {
+            width: 100%;
+            height: 100%;
+            spacing: 0px;
+
+            // 顶栏
+            Rectangle {
+                height: 54px;
+                background: #1e2128;
+
+                HorizontalLayout {
+                    width: 100%;
+                    height: 100%;
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    spacing: 12px;
+                    alignment: center;
+
+                    Text {
+                        text: "房间 " + root.room_id + " · " + root.participant_count + " 人";
+                        color: #ffffff;
+                        font-size: 16px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: "连接: " + root.connection_state;
+                        color: #9aa0a6;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // 主体
+            HorizontalLayout {
+                width: 100%;
+                vertical-stretch: 1;
+                spacing: 0px;
+
+                // 视频区
+                Rectangle {
+                    background: #101216;
+                    horizontal-stretch: 1;
+
+                    ScrollView {
+                        width: 100%;
+                        height: 100%;
+
+                        HorizontalLayout {
+                            padding: 14px;
+                            spacing: 14px;
+                            alignment: start;
+
+                            VideoTile {
+                                width: 460px;
+                                height: 300px;
+                                tile-title: "我 (本地)";
+                                subtitle: root.video_enabled ? "等待本地画面..." : "摄像头已关闭";
+                                frame: root.local_image;
+                                has-video: root.video_enabled;
+                            }
+
+                            for p in root.remote_participants: VideoTile {
+                                width: 460px;
+                                height: 300px;
+                                tile-title: p.id;
+                                subtitle: p.status == "connecting" ? "连接中..."
+                                    : p.status == "error" ? "连接失败"
+                                    : p.has_video ? "等待视频..." : "未收到视频";
+                                frame: p.image;
+                                has-video: p.has_video;
+                            }
+                        }
+                    }
+                }
+
+                // 侧栏
+                Rectangle {
+                    width: 300px;
+                    background: #1a1c22;
+
+                    VerticalLayout {
+                        width: 100%;
+                        height: 100%;
+                        padding: 12px;
+                        spacing: 8px;
+
+                        Text { text: "参与者"; color: #ffffff; font-size: 15px; }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: center;
+                            StatusDot { status: "subscribed"; }
+                            Text {
+                                text: "我 (本地)";
+                                color: #d0d3d8;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                        }
+
+                        for p in root.remote_participants: ParticipantRow {
+                            pid: p.id;
+                            status: p.status;
+                            sub-clicked => { root.subscribe(p.id); }
+                            unsub-clicked => { root.unsubscribe(p.id); }
+                        }
+
+                        Rectangle { height: 4px; background: transparent; }
+                        Text { text: "事件日志"; color: #ffffff; font-size: 15px; }
+
+                        ScrollView {
+                            width: 100%;
+                            vertical-stretch: 1;
+
+                            VerticalLayout {
+                                spacing: 3px;
+
+                                for l in root.logs: LogLine {
+                                    text: l.time + "  " + l.msg;
+                                    level: l.level;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 控制栏
+            Rectangle {
+                height: 68px;
+                background: #1e2128;
+
+                HorizontalLayout {
+                    width: 100%;
+                    height: 100%;
+                    alignment: center;
+                    spacing: 14px;
+
+                    Button {
+                        text: root.audio_enabled ? "麦克风 开" : "麦克风 关";
+                        clicked => { root.toggle_audio(!root.audio_enabled); }
+                    }
+                    Button {
+                        text: root.video_enabled ? "摄像头 开" : "摄像头 关";
+                        clicked => { root.toggle_video(!root.video_enabled); }
+                    }
+                    Button {
+                        text: "挂断并离开";
+                        clicked => { root.leave(); }
+                    }
+                }
+            }
+        }
+    }
+}
