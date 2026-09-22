@@ -12,33 +12,33 @@ path = "src/main.rs"
 
 [dependencies]
 # UI
-slint = "1.18"
+slint = "1.18.1"
 
 # WebRTC 引擎 (libwebrtc 安全封装, 构建时自动下载对应平台预编译库)
-reactor-webrtc = "0.18"
+reactor-webrtc = "0.18.0"
 
 # 摄像头采集 (AVFoundation / V4L2 / MSMF); 推帧给 reactor-webrtc 视频轨
 # 注意: 关闭默认 `decoding` feature, 它依赖的 mozjpeg 会导出与 libwebrtc 内置
 # libjpeg 同名的 `jpeg_*` 符号, 静态链接时冲突; MJPEG 由纯 Rust 的 zune-jpeg 解码。
-nokhwa = { version = "0.10", default-features = false, features = ["input-native", "camera-sync-impl"] }
-zune-jpeg = "0.5"
+nokhwa = { version = "0.10.11", default-features = false, features = ["input-native", "camera-sync-impl"] }
+zune-jpeg = "0.5.15"
 
 # 信令 (WebSocket 客户端)
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "io-util", "macros"] }
-tokio-tungstenite = "0.23"
-futures-util = "0.3"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "net", "time", "io-util", "macros"] }
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"
 
 # 序列化 / 线程通信
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-crossbeam-channel = "0.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+crossbeam-channel = "0.5.17"
 
 # 日志
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [build-dependencies]
-slint-build = "1.18"
+slint-build = "1.18.1"
 
 [profile.release]
 opt-level = 3

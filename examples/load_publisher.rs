@@ -214,7 +214,7 @@ async fn publisher(
     let (mut ws_tx, mut ws_rx) = ws.split();
 
     ws_tx
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "type": "join",
                 "pc_id": "pub",
@@ -229,7 +229,7 @@ async fn publisher(
 
     // 公布本地候选 (trickle ICE)
     ws_tx
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "type": "ice_candidate",
                 "pc_id": "pub",
@@ -368,7 +368,7 @@ async fn publisher(
 
     // 收尾: 通知服务端离开
     let _ = ws_tx
-        .send(Message::Text(
+        .send(Message::text(
             json!({"type": "leave", "pc_id": "pub"}).to_string(),
         ))
         .await;

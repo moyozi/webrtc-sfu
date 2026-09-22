@@ -11,43 +11,43 @@ path = "src/main.rs"
 
 [dependencies]
 # WebRTC stack (Sans I/O, drives from event loop)
-str0m = "0.21"
+str0m = "0.23.1"
 
 # Linux system call bindings
-nix = { version = "0.29", features = ["net", "socket", "uio", "event", "fs", "process", "signal", "sched"] }
-libc = "0.2"
+nix = { version = "0.31.3", features = ["net", "socket", "uio", "event", "fs", "process", "signal", "sched"] }
+libc = "0.2.189"
 
 # Zero-copy byte buffer
-bytes = "1"
+bytes = "1.12.1"
 
 # Lock-free cross-thread channels (signaling → media workers)
-crossbeam-channel = "0.5"
+crossbeam-channel = "0.5.17"
 
 # Async runtime for signaling server only (media path is fully synchronous)
-tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.23"
-futures-util = "0.3"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"
 
 # QUIC 信令 (连接迁移: 移动端 WiFi/蜂窝切换时信令连接不中断)
-quinn = "0.11"
+quinn = "0.11.12"
 # 自签名证书生成 (开发/内网部署)
-rcgen = "0.14"
+rcgen = "0.14.10"
 # 证书指纹 (WebTransport serverCertificateHashes / 客户端固定校验)
-sha2 = "0.10"
+sha2 = "0.11.0"
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Misc
-parking_lot = "0.12"
-ahash = "0.8"
+parking_lot = "0.12.5"
+ahash = "0.8.12"
 # 固定容量栈上数组 (recv/send 批量 iov 不再每轮堆分配)
-arrayvec = "0.7"
+arrayvec = "0.7.8"
 
 [profile.release]
 opt-level = 3

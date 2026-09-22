@@ -56,7 +56,7 @@ async fn handle_connection(
     // 发送任务
     let send_task = tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
-            if ws_sender.send(Message::Text(msg)).await.is_err() {
+            if ws_sender.send(Message::text(msg)).await.is_err() {
                 break;
             }
         }
@@ -73,7 +73,7 @@ async fn handle_connection(
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                if inbound_tx.send(text).is_err() {
+                if inbound_tx.send(text.to_string()).is_err() {
                     break;
                 }
             }

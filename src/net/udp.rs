@@ -92,12 +92,12 @@ impl UdpSocket {
         nix::sys::socket::bind(fd.as_raw_fd(), &nix_addr).map_err(nix_to_io)?;
 
         // 设置非阻塞
+        // nix 0.30+ 的 fcntl 接收 AsFd，不再接受裸 fd。
         let flags =
-            nix::fcntl::fcntl(fd.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFL).map_err(nix_to_io)?;
+            nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFL).map_err(nix_to_io)?;
         let mut flags = nix::fcntl::OFlag::from_bits_truncate(flags);
         flags |= nix::fcntl::OFlag::O_NONBLOCK;
-        nix::fcntl::fcntl(fd.as_raw_fd(), nix::fcntl::FcntlArg::F_SETFL(flags))
-            .map_err(nix_to_io)?;
+        nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFL(flags)).map_err(nix_to_io)?;
 
         Ok(Self { fd })
     }

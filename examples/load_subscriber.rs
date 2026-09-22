@@ -239,7 +239,7 @@ async fn subscriber(
     let (mut ws_tx, mut ws_rx) = ws.split();
 
     ws_tx
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "type": "join",
                 "pc_id": "sub",
@@ -253,7 +253,7 @@ async fn subscriber(
         .await?;
 
     ws_tx
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "type": "ice_candidate",
                 "pc_id": "sub",
@@ -363,7 +363,7 @@ async fn subscriber(
     }
 
     let _ = ws_tx
-        .send(Message::Text(
+        .send(Message::text(
             json!({"type": "leave", "pc_id": "sub"}).to_string(),
         ))
         .await;
@@ -408,7 +408,7 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     ws_tx
-        .send(Message::Text(
+        .send(Message::text(
             json!({
                 "type": "subscribe",
                 "pc_id": "sub",
