@@ -12,3 +12,5 @@ retry = 10
 # 这里与其对齐, 避免 `Undefined symbols` 链接错误。
 [env]
 MACOSX_DEPLOYMENT_TARGET = "13.0"
+# 使用本地下载/解压好的 libwebrtc 预编译包, 跳过构建时自动下载
+REACTOR_WEBRTC_LIB_DIR = "C:/Users/hongs/Downloads/reactor-webrtc-win-x64-release"

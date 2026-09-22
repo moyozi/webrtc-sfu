@@ -5,6 +5,34 @@ fn main() {
     slint_build::compile("ui/app.slint").expect("Slint 编译失败");
     embed_macos_info_plist();
     link_macos_compiler_rt();
+    link_msvc_cpp_stdlib();
+}
+
+/// reactor-webrtc 预编译的 `libwebrtc.lib` 以 `/MT` (静态 CRT + 静态 STL) 构建,
+/// 引用了新版 MSVC STL 的 out-of-line 符号 (`__std_rotate` / `__std_min_element_*`
+/// / `__std_find_*` 等)。rustc 的最终链接不会自动带上 C++ 标准库, 因此会出现:
+///
+/// ```text
+/// libwebrtc.lib(...) : error LNK2019: unresolved external symbol __std_rotate
+/// ```
+///
+/// 这里显式补上匹配 `/MT` 的静态 C++ 标准库 `libcpmt.lib` (与 libwebrtc 一致),
+/// 同时消除 `LNK4098: libcmt.lib conflicts` 的 CRT 混用告警来源。
+fn link_msvc_cpp_stdlib() {
+    if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
+        return;
+    }
+    if std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() != "msvc" {
+        return;
+    }
+    // 注意: 必须用 /DEFAULTLIB 而不是 rustc-link-lib。后者会被 rustc 放到
+    // 链接命令最前面, 早于引入 __std_* 引用的 /WHOLEARCHIVE:libwebrtc.lib,
+    // 链接器不会再回头重扫, 符号依旧未解析。 /DEFAULTLIB 会在所有显式库之后
+    // 补搜, 能正确解析。
+    // libcpmt = /MT 静态 STL; msvcprt = /MD 动态 STL (msvcp140.dll)。
+    // 不同 MSVC 版本把 __std_* 放在不同库里, 两个都挂上最稳。
+    println!("cargo:rustc-link-arg=/DEFAULTLIB:libcpmt.lib");
+    println!("cargo:rustc-link-arg=/DEFAULTLIB:msvcprt.lib");
 }
 
 /// 把 `macos/Info.plist` 嵌入可执行文件的 `__TEXT,__info_plist` 段。
