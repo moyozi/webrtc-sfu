@@ -24,5 +24,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "RoomChat"
+rootProject.name = "RoomChatAndroid"
 include(":app")
