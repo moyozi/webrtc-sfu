@@ -1,0 +1,11 @@
+# reactor-webrtc 的 macOS 预编译 libwebrtc.a 以 macOS 13.0 为目标构建;
+# rustc 默认部署目标是 11.0, 会导致大量 "built for newer macOS version" 警告
+# 以及链接失败 (`___isPlatformVersionAtLeast`)。这里对齐部署目标。
+# (在 Linux/Windows 上该变量被忽略, 无副作用)
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.0"
+
+# 网络容错: 首次构建需下载数百 MB 的 libwebrtc 预编译包
+[net]
+retry = 3
+git-fetch-with-cli = true
