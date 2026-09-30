@@ -1,6 +1,6 @@
 //! RoomChat 桌面客户端入口 (GPUI + gpui-kit)。
 //!
-//! 同一套功能移植自 `RoomChatDesktop` (Slint 版), 线程模型保持一致:
+//! 同一套功能移植自 `RoomChatDesktopSlint` (Slint 版), 线程模型保持一致:
 //!   · 主线程: GPUI 事件循环 + 视图 `RoomChatApp`
 //!   · sfu-client 线程: reactor-webrtc (同步阻塞) + WebSocket 信令
 //!   · camera-capture / audio-gen / video-synth 线程: 本地媒体源

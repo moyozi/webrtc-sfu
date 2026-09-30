@@ -17,9 +17,6 @@ str0m = "0.23.1"
 nix = { version = "0.31.3", features = ["net", "socket", "uio", "event", "fs", "process", "signal", "sched"] }
 libc = "0.2.189"
 
-# Zero-copy byte buffer
-bytes = "1.12.1"
-
 # Lock-free cross-thread channels (signaling → media workers)
 crossbeam-channel = "0.5.17"
 

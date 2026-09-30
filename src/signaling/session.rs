@@ -19,9 +19,9 @@
 //!
 //! 所有消息通过 `pc_id` 路由到对应的参与者/Rtc 实例。
 
-use crate::core::{WorkerCommand, WorkerReply};
 use crate::signaling::protocol::{SignalingMessage, SignalingResponse};
 use crate::signaling::SignalingState;
+use crate::worker::{WorkerCommand, WorkerReply};
 use ahash::AHashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -42,19 +42,21 @@ pub struct PcSession {
 pub struct SignalingSession {
     state: Arc<SignalingState>,
     /// 发往本连接的输出通道 (由传输层消费后写入 socket)
-    msg_tx: mpsc::UnboundedSender<String>,
+    msg_tx: mpsc::Sender<String>,
     /// pc_id → 会话
     sessions: AHashMap<String, PcSession>,
     /// 对端标识 (日志用)
     peer: String,
     /// 传输类型: "websocket" / "quic" (日志用)
     transport: &'static str,
+    /// 发送队列是否已满 (客户端读取过慢) — 置位后由 `run_session` 结束连接。
+    overflow: bool,
 }
 
 impl SignalingSession {
     pub fn new(
         state: Arc<SignalingState>,
-        msg_tx: mpsc::UnboundedSender<String>,
+        msg_tx: mpsc::Sender<String>,
         peer: String,
         transport: &'static str,
     ) -> Self {
@@ -64,21 +66,32 @@ impl SignalingSession {
             sessions: AHashMap::new(),
             peer,
             transport,
+            overflow: false,
         }
     }
 
-    /// 发送一条响应给客户端
-    fn send(&self, resp: SignalingResponse) {
+    /// 发送一条响应给客户端。
+    ///
+    /// 发送队列满 (客户端读取过慢) 时标记会话溢出，由 `run_session` 结束连接，
+    /// 避免每连接队列无界增长。
+    fn send(&mut self, resp: SignalingResponse) {
         match serde_json::to_string(&resp) {
             Ok(s) => {
-                let _ = self.msg_tx.send(s);
+                if self.msg_tx.try_send(s).is_err() {
+                    self.overflow = true;
+                }
             }
             Err(e) => warn!("信令响应序列化失败: {}", e),
         }
     }
 
+    /// 该会话是否因发送队列溢出而应关闭。
+    pub fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
     /// 处理一条来自客户端的原始 JSON 文本消息
-    pub fn handle(&mut self, raw: &str) {
+    pub async fn handle(&mut self, raw: &str) {
         let signal: SignalingMessage = match serde_json::from_str(raw) {
             Ok(s) => s,
             Err(e) => {
@@ -103,7 +116,10 @@ impl SignalingSession {
                 participant_id,
                 sdp,
                 role,
-            } => self.on_join(pc_id, room_id, participant_id, sdp, role),
+            } => {
+                self.on_join(pc_id, room_id, participant_id, sdp, role)
+                    .await
+            }
 
             SignalingMessage::IceCandidate {
                 pc_id,
@@ -177,7 +193,14 @@ impl SignalingSession {
         }
     }
 
-    fn on_join(&mut self, pc_id: String, room_id: String, participant_id: String, sdp: String, role: String) {
+    async fn on_join(
+        &mut self,
+        pc_id: String,
+        room_id: String,
+        participant_id: String,
+        sdp: String,
+        role: String,
+    ) {
         // subscriber 是 recvonly 的订阅连接，不是房间参与者，
         // 不应触发 participant_joined 广播 (否则会形成无限订阅循环)
         let is_publisher = role != "subscriber";
@@ -192,13 +215,17 @@ impl SignalingSession {
         // 选择全局 Worker — 房间可跨 worker/主机分布 (订阅经中继平面)
         let worker_idx = self.state.assign_worker(&room_id, &participant_id);
 
-        // 创建参与者 (本地 worker 走 channel, 远端经控制面往返)
-        let reply = self.state.create_participant(
-            worker_idx,
-            room_id.clone(),
-            participant_id.clone(),
-            sdp,
-        );
+        // 创建参与者 (本地 worker 走 channel, 远端经控制面往返)。
+        // 该调用会阻塞等待 worker 回复 (最长 REPLY_TIMEOUT=10s)，必须放到 blocking
+        // 线程池，否则会堵住 Tokio 的 async 工作线程。
+        let state = self.state.clone();
+        let room_for_task = room_id.clone();
+        let pid_for_task = participant_id.clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            state.create_participant(worker_idx, room_for_task, pid_for_task, sdp)
+        })
+        .await
+        .unwrap_or(None);
 
         match reply {
             Some(WorkerReply::SdpAnswer {
@@ -226,7 +253,8 @@ impl SignalingSession {
                     // 加入房间
                     self.state.join_room(&room_id, &participant_id);
                     // 注册发送器, 供其他参与者的通知推送到本连接
-                    self.state.register_sender(&participant_id, self.msg_tx.clone());
+                    self.state
+                        .register_sender(&participant_id, self.msg_tx.clone());
 
                     // 告诉新加入者房间内已有的参与者 (使其能够订阅对方)
                     for existing in self.state.room_participants(&room_id, &participant_id) {
@@ -242,7 +270,10 @@ impl SignalingSession {
                     .unwrap();
                     self.state.notify_room(&room_id, &participant_id, &notify);
 
-                    debug!("已通知房间 {} 内的其他参与者: {} 加入", room_id, participant_id);
+                    debug!(
+                        "已通知房间 {} 内的其他参与者: {} 加入",
+                        room_id, participant_id
+                    );
                 }
             }
             Some(WorkerReply::Error { error, .. }) => {
@@ -257,7 +288,6 @@ impl SignalingSession {
                     error: "Worker 无响应".to_string(),
                 });
             }
-            _ => {}
         }
     }
 
@@ -298,14 +328,22 @@ fn cleanup_session(state: &SignalingState, sess: &PcSession) {
 /// 传输层把解码后的文本消息投递到 `inbound`, 并消费 `msg_tx` 写回 socket。
 pub async fn run_session(
     state: Arc<SignalingState>,
-    msg_tx: mpsc::UnboundedSender<String>,
-    mut inbound: mpsc::UnboundedReceiver<String>,
+    msg_tx: mpsc::Sender<String>,
+    mut inbound: mpsc::Receiver<String>,
     peer: String,
     transport: &'static str,
 ) {
     let mut session = SignalingSession::new(state, msg_tx, peer, transport);
     while let Some(raw) = inbound.recv().await {
-        session.handle(&raw);
+        session.handle(&raw).await;
+        if session.overflowed() {
+            warn!(
+                transport = session.transport,
+                peer = %session.peer,
+                "信令发送队列已满, 关闭连接"
+            );
+            break;
+        }
     }
     session.finish();
 }

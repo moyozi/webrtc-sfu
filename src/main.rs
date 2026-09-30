@@ -2,27 +2,23 @@
 //!
 //! 基于 str0m (Sans I/O WebRTC) + nix recvmmsg 批量收包 + epoll 事件驱动
 
-// 项目包含尚未使用的脚手架代码 (Room, Track, TimerWheel 等)，暂不警告
-#![allow(dead_code)]
-
 mod cluster;
 mod config;
-mod core;
 mod net;
 mod sfu;
 mod signaling;
+mod worker;
 
 use config::SfuConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 fn main() {
     // 初始化日志
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -60,11 +56,13 @@ fn main() {
     let mut wake_txs = Vec::with_capacity(num_workers);
 
     for _ in 0..num_workers {
-        let (ct, cr) = crossbeam_channel::unbounded::<core::WorkerCommand>();
+        // 有界队列: 控制命令容量大 (低频, 不允许丢), 中继媒体容量小 (可丢)。
+        // 见 worker::CMD_CHANNEL_CAP / worker::RELAY_CHANNEL_CAP。
+        let (ct, cr) = crossbeam_channel::bounded::<worker::WorkerCommand>(worker::CMD_CHANNEL_CAP);
         worker_cmd_txs.push(ct);
         worker_cmd_rxs.push(cr);
 
-        let (rt, rr) = crossbeam_channel::unbounded::<core::RelayedRtp>();
+        let (rt, rr) = crossbeam_channel::bounded::<worker::RelayedRtp>(worker::RELAY_CHANNEL_CAP);
         relay_txs.push(rt);
         relay_rxs.push(rr);
 
@@ -90,7 +88,7 @@ fn main() {
         None => None,
     };
 
-    let relay_hub = Arc::new(core::RelayHub {
+    let relay_hub = Arc::new(worker::RelayHub {
         relay_txs,
         wake_txs,
         cmd_txs: worker_cmd_txs.clone(),
@@ -98,6 +96,8 @@ fn main() {
         local_workers: num_workers as u32,
         peer_addrs: config.relay_peers.clone(),
         endpoint: relay_endpoint.clone(),
+        dropped_relay: std::sync::atomic::AtomicU64::new(0),
+        dropped_cmd: std::sync::atomic::AtomicU64::new(0),
     });
 
     // relay 监听线程: 解码跨主机包, 按 target_worker 重新注入本地通道。
@@ -107,23 +107,26 @@ fn main() {
             .name("sfu-relay".to_string())
             .spawn(move || {
                 let mut buf = [0u8; 4096];
+                // 接收端缓存跨主机中继的 PayloadParams (数据包默认不携带)。
+                let mut params_cache = net::relay::ParamsCache::default();
                 loop {
                     let (n, _src) = match ep.recv_from(&mut buf) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    match net::relay::decode(&buf[..n]) {
+                    match net::relay::decode(&buf[..n], &mut params_cache) {
                         Ok(net::relay::Decoded::Rtp(d)) => {
                             if let Some(li) = hub.local_index(d.target_worker) {
                                 if let Some(tx) = hub.relay_txs.get(li) {
-                                    if tx.send(d.pkt).is_ok() {
+                                    // 有界队列: 满了丢弃该包 (媒体可丢), 避免阻塞 UDP 接收。
+                                    if tx.try_send(d.pkt).is_ok() {
                                         hub.wake(li);
                                     }
                                 }
                             }
                         }
                         Ok(net::relay::Decoded::Control(c)) => {
-                            core::dispatch_relay_control(&hub, c);
+                            worker::dispatch_relay_control(&hub, c);
                         }
                         Err(_) => {}
                     }
@@ -135,17 +138,12 @@ fn main() {
     let mut worker_handles = Vec::with_capacity(num_workers);
     for cpu_id in 0..num_workers {
         // 每个 worker 使用独立媒体端口: base_port + cpu_id。
-        let worker_listen_addr = SocketAddr::new(
-            listen_addr.ip(),
-            listen_addr.port() + cpu_id as u16,
-        );
+        let worker_listen_addr =
+            SocketAddr::new(listen_addr.ip(), listen_addr.port() + cpu_id as u16);
         // 对外通告地址: announce_ip + 该 worker 的媒体端口。
-        let worker_announce_addr = SocketAddr::new(
-            announce_ip,
-            listen_addr.port() + cpu_id as u16,
-        );
+        let worker_announce_addr = SocketAddr::new(announce_ip, listen_addr.port() + cpu_id as u16);
 
-        let worker_config = core::WorkerConfig {
+        let worker_config = worker::WorkerConfig {
             cpu_id,
             listen_addr: worker_listen_addr,
             announce_addr: worker_announce_addr,
@@ -165,7 +163,7 @@ fn main() {
             .name(format!("sfu-worker-{}", cpu_id))
             .stack_size(2 * 1024 * 1024) // 2MB 栈
             .spawn(move || {
-                core::worker::run_worker(worker_config, cmd_rx);
+                worker::run_worker(worker_config, cmd_rx);
             })
             .expect("failed to spawn worker thread");
 
@@ -185,9 +183,10 @@ fn main() {
     let cluster_control = if config.control_peers.is_empty() {
         None
     } else {
-        Some(Arc::new(cluster::ClusterControl::new(
-            config.control_peers.clone(),
-        )))
+        let cc = Arc::new(cluster::ClusterControl::new(config.control_peers.clone()));
+        // 启动远端控制命令的专用发送线程 (避免在信令 async 任务里阻塞建连)。
+        cc.spawn_sender();
+        Some(cc)
     };
     let router = Arc::new(cluster::WorkerRouter::new(
         worker_cmd_txs.clone(),
@@ -210,10 +209,22 @@ fn main() {
     let signaling_state = Arc::new(signaling::SignalingState::new(
         router,
         config.total_workers,
+        config.room_workers.clone(),
+        config.default_worker,
     ));
 
     if !config.signaling {
         info!("本进程为 worker-only (SFU_SIGNALING=off), 不启动信令服务器");
+        // 等待 SIGINT/SIGTERM，再优雅停止各 worker。
+        let shutdown_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create shutdown runtime");
+        shutdown_rt.block_on(wait_for_shutdown());
+        info!("收到关闭信号, 停止 worker");
+        for tx in &worker_cmd_txs {
+            let _ = tx.try_send(worker::WorkerCommand::Shutdown);
+        }
         for handle in worker_handles {
             let _ = handle.join();
         }
@@ -224,10 +235,7 @@ fn main() {
     let quic_tls = match config.quic_listen_addr {
         Some(_) => match signaling::quic::QuicTls::self_signed("localhost") {
             Ok(tls) => {
-                info!(
-                    "QUIC 自签名证书 SHA-256 指纹: {}",
-                    tls.fingerprint_sha256()
-                );
+                info!("QUIC 自签名证书 SHA-256 指纹: {}", tls.fingerprint_sha256());
                 Some(tls)
             }
             Err(e) => {
@@ -258,9 +266,7 @@ fn main() {
             (Some(addr), Some(tls)) => {
                 let quic_state = signaling_state.clone();
                 Some(tokio::spawn(async move {
-                    if let Err(e) =
-                        signaling::quic::run_server(addr, quic_state, tls).await
-                    {
+                    if let Err(e) = signaling::quic::run_server(addr, quic_state, tls).await {
                         error!("QUIC 信令服务器错误: {}", e);
                     }
                 }))
@@ -281,17 +287,44 @@ fn main() {
             })
         });
 
-        let _ = ws_task.await;
+        // 所有信令服务器任务。任一意外退出或收到关闭信号都会结束 select。
+        let mut servers: Vec<tokio::task::JoinHandle<()>> = vec![ws_task];
         if let Some(t) = quic_task {
-            let _ = t.await;
+            servers.push(t);
         }
         if let Some(t) = whip_task {
-            let _ = t.await;
+            servers.push(t);
+        }
+
+        tokio::select! {
+            _ = futures_util::future::join_all(servers) => {
+                error!("信令服务器任务意外结束");
+            }
+            _ = wait_for_shutdown() => {
+                info!("收到关闭信号, 停止信令服务器");
+            }
         }
     });
 
-    // ── 3. 等待 Worker 线程结束 ──
+    // ── 3. 通知 worker 退出并等待线程结束 ──
+    for tx in &worker_cmd_txs {
+        let _ = tx.try_send(worker::WorkerCommand::Shutdown);
+    }
     for handle in worker_handles {
         let _ = handle.join();
+    }
+}
+
+/// 等待 SIGINT / SIGTERM，任一到达即返回。
+///
+/// 用于优雅关闭: 停止信令服务器并向各 worker 发送 `WorkerCommand::Shutdown`，
+/// 而不是让进程被信号硬杀、直接断开所有会话。
+async fn wait_for_shutdown() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("收到 SIGTERM"),
+        _ = sigint.recv() => tracing::info!("收到 SIGINT"),
     }
 }

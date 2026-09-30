@@ -19,7 +19,7 @@ enum SfuError: Error {
 
 /// SFU 客户端 — 单条 WebSocket + 多个 RTCPeerConnection
 ///
-/// 架构与 Web 端 demo/src/lib/sfu.ts 完全对应:
+/// 架构与 Web 端 RoomChatWeb/src/lib/sfu.ts 完全对应:
 ///   - pc_id = "pub"          发布连接 (sendonly), 加入房间
 ///   - pc_id = "sub-<远端id>" 订阅连接 (recvonly), 不加入房间
 ///

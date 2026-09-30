@@ -26,7 +26,6 @@ pub enum SignalingMessage {
         pc_id: String,
         candidate: String,
         sdp_mid: Option<String>,
-        sdp_mline_index: Option<u16>,
     },
 
     #[serde(rename = "subscribe")]
@@ -64,13 +63,6 @@ pub enum SignalingResponse {
         ice_candidates: Vec<String>,
     },
 
-    #[serde(rename = "ice_candidate")]
-    IceCandidate {
-        pc_id: String,
-        candidate: String,
-        sdp_mid: Option<String>,
-    },
-
     #[serde(rename = "participant_joined")]
     ParticipantJoined { participant_id: String },
 
@@ -78,10 +70,7 @@ pub enum SignalingResponse {
     ParticipantLeft { participant_id: String },
 
     #[serde(rename = "subscribed")]
-    Subscribed {
-        pc_id: String,
-        publisher_id: String,
-    },
+    Subscribed { pc_id: String, publisher_id: String },
 
     #[serde(rename = "error")]
     Error {

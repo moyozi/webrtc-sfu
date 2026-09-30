@@ -4,7 +4,7 @@
 **reactor-webrtc** (libwebrtc 安全封装) + **nokhwa** (摄像头采集) 的桌面视频通话
 客户端, 对接本仓库的 WebRTC SFU 服务端。
 
-功能与 `RoomChatDesktop` (Slint 版)、`RoomChat` (Android/Compose)、`demo`
+功能与 `RoomChatDesktopSlint` (Slint 版)、`RoomChat` (Android/Compose)、`RoomChatWeb`
 (Web/React) 客户端保持一致, 是 Slint 版本的 GPUI 重写。
 
 ```

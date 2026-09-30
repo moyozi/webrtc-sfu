@@ -1,10 +1,12 @@
 # 单房间多 Worker / 跨线程 & 跨主机订阅
 
 > **实现状态**
-> - 第一阶段（跨线程订阅）: ✅ 已实现 (`RelayHub` + `deliver_to_subscribers`)，
->   已用 `SFU_WORKERS=4 + 压测工具` 验证：分布到 4 个 worker 的订阅者均能满速收流。
+> - 第一阶段（跨线程订阅）: ✅ 已实现 (`RelayHub` + `deliver_to_subscribers`，
+>   分别在 `src/worker/relay.rs` 与 `src/worker/forward.rs`)，
+>   已用 `SFU_WORKERS=4 SFU_ROOM_WORKERS="load=0,1,2,3" + 压测工具` 验证：
+>   分布到 4 个 worker 的订阅者均能满速收流。
 > - 第二阶段（跨主机媒体中继）: ✅ 已实现并单测：
->   - `src/net/relay.rs`: `RelayedRtp`/控制消息的紧凑二进制编解码 + UDP 端点；
+>   - `src/net/relay.rs`: 中继 RTP/控制消息的紧凑二进制编解码 + UDP 端点；
 >   - `RelayHub` 支持**全局 worker 编号**：本进程范围内走进程内 channel，
 >     范围外经 UDP 发往对端进程的 relay 端口；
 >   - 每进程一个 relay 监听线程，解码后按 `target_worker` 重新注入本地中继/命令通道，
@@ -15,9 +17,10 @@
 
 ## 1. 现状与问题
 
-- `SignalingState::select_worker(room_id)` 用房间哈希把**同一房间的所有参与者**
-  固定到同一个 worker；每个 worker 是单线程事件循环，独占一张
-  `ParticipantTable` + `Router`。
+- `SignalingState` 默认按房间 id 哈希把**同一房间的所有参与者**固定到同一个
+  worker（同房间同 worker，不同房间自动分散）；每个 worker 是单线程事件循环，
+  独占一张 `ParticipantTable` + `Router`。要让房间跨 worker 需在
+  `SFU_ROOM_WORKERS` 中显式配置。
 - 因此**单房间容量 = 单核容量**（压测约 150–200 路 @1.5Mbps）。
 - 跨 worker 无法转发媒体，因为订阅者的 SRTP/RTP 状态在各自 worker 的
   `Rtc` 里，而发布者的 `Rtc` 在另一个 worker。
@@ -56,7 +59,7 @@ Publisher(MID A, worker 0)                    Subscriber(MID B, worker 1)
 ## 4. 控制流
 
 ```
-Subscriber join → select_worker_for_room(room)   // 房间跨 worker 负载均衡
+Subscriber join → assign_worker(room)   // 默认同房间同 worker; 配置后房间跨 worker
 Subscribe(publisher_id, publisher_mid, publisher_worker)
         │
         ├─ publisher_worker == self ─► 本地 add_subscription + PLI
@@ -131,7 +134,10 @@ trait RelayTransport: Send + Sync {
 采用「**集中信令 + worker-only 主机**」部署模型：一个进程跑信令，其余进程只跑
 worker（`SFU_SIGNALING=off`）。信令通过 `src/cluster` 把命令路由到任意全局 worker：
 
-- **全局 worker 分配**：`assign_worker` 在 `0..SFU_TOTAL_WORKERS` round-robin。
+- **全局 worker 分配**：`assign_worker` **默认按房间 id 哈希固定到一个全局
+  worker**（可用 `SFU_DEFAULT_WORKER` 强制全落同一 worker）；只有
+  `SFU_ROOM_WORKERS` 显式配置的房间才会跨 worker —— 单个 worker 钉定, 多个
+  worker 则在房间内轮转（全局编号, 可跨主机）。
 - **远端 worker 命令通道**：`cluster::ClusterControl` + TCP 控制监听；`WorkerRouter`
   对本地走 channel、对远端走 TCP。`CreateParticipant` 用 `req_id` 请求/响应关联
   （SDP answer 经同一连接回传），其余命令 fire-and-forget。
@@ -143,6 +149,8 @@ worker（`SFU_SIGNALING=off`）。信令通过 `src/cluster` 把命令路由到�
   SFU_SIGNALING=off               # 进程 B 只跑 worker
   SFU_CONTROL_LISTEN=0.0.0.0:5401
   SFU_CONTROL_PEERS=0=10.0.0.1:5400,1=10.0.0.1:5400
+  # 信令进程(A) 上配置房间跨主机:
+  # SFU_ROOM_WORKERS="load=0,1,2,3"
   ```
 - **验证**: 同机两进程（模拟两主机，信令+worker0,1 / worker-only+worker2,3），
   16 订阅者满速 17.3 Mbps；B 进程经控制面创建 16 个参与者并跨主机收流。

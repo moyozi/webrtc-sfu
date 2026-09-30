@@ -49,9 +49,9 @@ async fn handle_connection(
     info!("WebSocket 连接: {}", peer_addr);
 
     // 输出通道: SignalingSession 写入, 本函数下方的 send_task 消费并发送
-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<String>();
+    let (msg_tx, mut msg_rx) = mpsc::channel::<String>(crate::signaling::SIGNALING_CHANNEL_CAP);
     // 输入通道: 本函数读取 WebSocket 后写入, SignalingSession 消费
-    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<String>();
+    let (inbound_tx, inbound_rx) = mpsc::channel::<String>(crate::signaling::SIGNALING_CHANNEL_CAP);
 
     // 发送任务
     let send_task = tokio::spawn(async move {
@@ -73,7 +73,8 @@ async fn handle_connection(
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                if inbound_tx.send(text.to_string()).is_err() {
+                // 会话消费过慢时关闭连接，避免输入队列无界增长。
+                if inbound_tx.try_send(text.to_string()).is_err() {
                     break;
                 }
             }

@@ -7,13 +7,11 @@
 //! - 预分配缓冲区: RecvBatch/SendBatch 在 Worker 启动时分配，热路径零分配
 //! - Transmit 的 Vec<u8> 直接 move 进发送队列，避免逐包 memcpy
 
-use nix::sys::socket::sockopt::{RcvBuf, ReusePort, SndBuf};
-use nix::sys::socket::getsockopt;
-use nix::sys::socket::{
-    recvmmsg, sendmmsg, MsgFlags, MultiHeaders, SockaddrStorage,
-};
-use nix::sys::socket::{setsockopt, socket, AddressFamily, SockFlag, SockType};
 use arrayvec::ArrayVec;
+use nix::sys::socket::getsockopt;
+use nix::sys::socket::sockopt::{RcvBuf, ReusePort, SndBuf};
+use nix::sys::socket::{recvmmsg, sendmmsg, MsgFlags, MultiHeaders, SockaddrStorage};
+use nix::sys::socket::{setsockopt, socket, AddressFamily, SockFlag, SockType};
 use std::io::IoSlice;
 use std::io::IoSliceMut;
 use std::mem::MaybeUninit;
@@ -22,12 +20,6 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 /// MTU — WebRTC RTP 包最大 1500 字节 (以太网 MTU)
 pub const MTU: usize = 1500;
-
-/// recvmmsg 批量大小
-pub const BATCH_SIZE: usize = 64;
-
-/// sendmmsg 批量大小
-pub const SEND_BATCH_SIZE: usize = 128;
 
 /// SendBatch 最大积压包数 (约 8192 × 1.5KB ≈ 12MB)。
 /// 超过时丢弃最旧的包，避免发送缓冲长时间满时内存无限增长。
@@ -64,8 +56,7 @@ impl UdpSocket {
             socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None).map_err(nix_to_io)?;
 
         // 设置 SO_REUSEADDR
-        setsockopt(&fd, nix::sys::socket::sockopt::ReuseAddr, &true)
-            .map_err(nix_to_io)?;
+        setsockopt(&fd, nix::sys::socket::sockopt::ReuseAddr, &true).map_err(nix_to_io)?;
 
         // 设置 SO_REUSEPORT — 让多个 Worker 线程的 socket 绑定同一端口
         // 内核会对每个连接的包做 hash，保证同一个 ICE 连接始终到同一个 Worker
@@ -93,8 +84,7 @@ impl UdpSocket {
 
         // 设置非阻塞
         // nix 0.30+ 的 fcntl 接收 AsFd，不再接受裸 fd。
-        let flags =
-            nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFL).map_err(nix_to_io)?;
+        let flags = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFL).map_err(nix_to_io)?;
         let mut flags = nix::fcntl::OFlag::from_bits_truncate(flags);
         flags |= nix::fcntl::OFlag::O_NONBLOCK;
         nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFL(flags)).map_err(nix_to_io)?;
@@ -231,7 +221,8 @@ impl RecvBatch {
         let mut count = 0;
         for recv_msg in results {
             // address 现在是字段而非方法
-            let addr = recv_msg.address
+            let addr = recv_msg
+                .address
                 .as_ref()
                 .map(nix_to_socketaddr)
                 .unwrap_or_else(|| {
@@ -359,10 +350,7 @@ impl SendBatch {
 
             // SAFETY: 上面的循环已初始化前 chunk.len() 个元素。
             let iovs: &[[IoSlice<'_>; 1]] = unsafe {
-                std::slice::from_raw_parts(
-                    storage.as_ptr().cast::<[IoSlice<'_>; 1]>(),
-                    chunk.len(),
-                )
+                std::slice::from_raw_parts(storage.as_ptr().cast::<[IoSlice<'_>; 1]>(), chunk.len())
             };
 
             let results = sendmmsg(

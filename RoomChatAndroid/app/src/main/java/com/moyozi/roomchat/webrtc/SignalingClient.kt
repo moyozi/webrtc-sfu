@@ -10,7 +10,7 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * 信令客户端 — WebSocket 封装 (对应 Web 端 demo/src/lib/signaling.ts)
+ * 信令客户端 — WebSocket 封装 (对应 Web 端 RoomChatWeb/src/lib/signaling.ts)
  *
  * 与 SFU 信令服务器交换 JSON 文本消息。整个会话只维护一条 WebSocket,
  * 所有 RTCPeerConnection 复用该连接 (通过 pc_id 区分)。

@@ -1917,7 +1917,6 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "arrayvec",
- "bytes",
  "crossbeam-channel",
  "futures-util",
  "libc",

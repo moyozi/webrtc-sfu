@@ -99,11 +99,13 @@ impl TimerWheel {
         due
     }
 
-    /// 当前登记的定时器数量
+    /// 当前登记的定时器数量 (仅测试使用)。
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.current.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.current.is_empty()
     }
@@ -154,7 +156,9 @@ mod tests {
         // 改到更早，应只在新的时刻到期一次
         wheel.schedule("a", now + Duration::from_millis(5));
 
-        assert!(wheel.pop_due(now + Duration::from_millis(5)).contains(&"a".to_string()));
+        assert!(wheel
+            .pop_due(now + Duration::from_millis(5))
+            .contains(&"a".to_string()));
         // 原 100ms 的历史条目应被惰性丢弃，不再触发
         assert!(wheel.pop_due(now + Duration::from_millis(200)).is_empty());
         assert_eq!(wheel.len(), 0);

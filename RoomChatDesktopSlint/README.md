@@ -1,12 +1,12 @@
-# RoomChat Desktop
+# RoomChat Desktop · Slint
 
 基于 **Slint** (UI) + **reactor-webrtc** (libwebrtc 安全封装) + **nokhwa** (摄像头采集)
 的桌面视频通话客户端, 对接本仓库的 WebRTC SFU 服务端。功能与 `RoomChat`
-(Android/Compose)、`demo` (Web/React) 客户端保持一致。
+(Android/Compose)、`RoomChatWeb` (Web/React) 客户端保持一致。
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ RoomChatDesktop (本目录)                                      │
+│ RoomChatDesktopSlint (本目录)                                      │
 │                                                              │
 │   Slint 主线程                    sfu-client 线程             │
 │   ┌────────────────┐  命令      ┌──────────────────────────┐ │
@@ -50,7 +50,7 @@
 ### 运行
 
 ```bash
-cd RoomChatDesktop
+cd RoomChatDesktopSlint
 cargo run --release
 ```
 
@@ -61,7 +61,7 @@ cargo run --release
 
 ```bash
 ./macos/bundle.sh
-open "target/release/RoomChat Desktop.app"
+open "target/release/RoomChat Desktop Slint.app"
 ```
 
 ### macOS 权限与链接说明
@@ -141,7 +141,7 @@ nokhwa Camera.frame()
 ## 目录结构
 
 ```
-RoomChatDesktop/
+RoomChatDesktopSlint/
 ├── Cargo.toml
 ├── build.rs                 # Slint 编译 + macOS Info.plist 嵌入 + compiler-rt 链接
 ├── .cargo/config.toml       # 网络容错 + macOS 部署目标

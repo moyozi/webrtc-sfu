@@ -1,5 +1,5 @@
 [package]
-name = "roomchat-desktop"
+name = "roomchat-desktop-slint"
 version = "0.1.0"
 edition = "2021"
 description = "RoomChat 桌面客户端 — Slint UI + reactor-webrtc (libwebrtc)"
@@ -7,7 +7,7 @@ license = "MIT"
 publish = false
 
 [[bin]]
-name = "roomchat-desktop"
+name = "roomchat-desktop-slint"
 path = "src/main.rs"
 
 [dependencies]

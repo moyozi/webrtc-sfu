@@ -17,7 +17,7 @@ use str0m::bwe::Bitrate;
 use str0m::format::PayloadParams;
 use str0m::media::{Mid, Pt, Rid};
 use str0m::rtp::{SeqNo, Ssrc};
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 /// 发布者的一个入站 RTP 层 (simulcast RID 或 SVC 中的一条流)。
 pub struct LayerRx {
@@ -46,6 +46,40 @@ pub struct LayerState {
 /// 重新评估层选择的最小间隔
 const LAYER_EVAL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// 订阅者向某个 mid 转发时需要的全部可变状态。
+///
+/// 这是把原先分散在 `tx_seq` / `layer_states` / `ensure_tx_stream` 里的状态
+/// 合并后的单一结构，热路径取一次 `tx_tracks` 条目即可读写全部字段。
+pub struct TxTrack {
+    /// 下一个发送序号 (层切换/丢层时由 SFU 重新编号，保证订阅者看到的连续)。
+    pub seq: SeqNo,
+    /// 层选择状态 (simulcast / SVC 时间层)。
+    pub layer: LayerState,
+    /// 是否已向 str0m 声明发送流 (main/rtx SSRC)。
+    pub declared: bool,
+    /// 缓存「发布者 PayloadParams」，避免每包重新匹配编解码。
+    pub cached_params: Option<PayloadParams>,
+    /// 与 `cached_params` 对应的订阅者本地 PT。
+    pub cached_pt: Pt,
+}
+
+impl TxTrack {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            seq: SeqNo::default(),
+            layer: LayerState {
+                current: None,
+                pending: None,
+                max_tid: None,
+                last_eval: now - LAYER_EVAL_INTERVAL,
+            },
+            declared: false,
+            cached_params: None,
+            cached_pt: Pt::from(0u8),
+        }
+    }
+}
+
 /// 更新 BWE desired bitrate 的最小间隔
 const DESIRED_BITRATE_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -53,9 +87,6 @@ const DESIRED_BITRATE_INTERVAL: Duration = Duration::from_secs(2);
 pub struct Participant {
     /// 参与者唯一 ID
     pub id: String,
-
-    /// 所在房间 ID
-    pub room_id: String,
 
     /// str0m Rtc 实例 — 处理所有 WebRTC 协议
     pub rtc: str0m::Rtc,
@@ -66,29 +97,22 @@ pub struct Participant {
     /// 本地 ICE ufrag (用于快速包路由)
     pub local_ufrag: String,
 
-    /// 远端 ICE ufrag
-    pub remote_ufrag: Option<String>,
-
-    /// 是否已连接 (ICE + DTLS 完成)
-    pub connected: bool,
-
     /// 上次 `poll_output()` 返回的 `Output::Timeout` 时刻。
     /// 用于避免收包热路径反复对定时器表做哈希查找: 只有该值变化时才更新 TimerWheel。
     pub next_timeout: Option<Instant>,
 
     /// 下一个可分配的 SSRC (RTP mode 下每个转发轨道需要一对 main/rtx SSRC)。
     /// 只在单个 Rtc 内需要唯一，因此从固定基址递增即可。
-    next_ssrc: u32,
-
-    /// 转发发送流的序号计数器 (subscriber_mid → next seq)。
-    /// 层切换/丢层时由 SFU 重新编号，保证订阅者看到的序号连续。
-    tx_seq: AHashMap<Mid, SeqNo>,
+    pub next_ssrc: u32,
 
     /// 作为发布者: 入站层速率 (SSRC → 层信息)。
     rx_layers: AHashMap<Ssrc, LayerRx>,
 
-    /// 作为订阅者: 每条发布轨道的层选择状态 (subscriber_mid → state)。
-    layer_states: AHashMap<Mid, LayerState>,
+    /// 作为订阅者: 每条转发轨道的发送状态 (subscriber_mid → state)。
+    ///
+    /// 合并了序号计数、层选择、发送流声明与 PT 映射缓存，使媒体转发热路径
+    /// 对每个订阅者每包只做一次 HashMap 查找。
+    pub tx_tracks: AHashMap<Mid, TxTrack>,
 
     /// 带宽估计 (bit/s)。订阅者侧来自 `Event::EgressBitrateEstimate`。
     egress_bitrate: Option<u64>,
@@ -129,21 +153,17 @@ impl Participant {
             .set_local_ice_credentials(ice_creds)
             .build(now);
 
-        info!("参与者 {} 创建, ufrag={}", id, local_ufrag);
+        info!(room = %room_id, "参与者 {} 创建, ufrag={}", id, local_ufrag);
 
         Ok(Self {
             id,
-            room_id,
             rtc,
             known_source: None,
             local_ufrag,
-            remote_ufrag: None,
-            connected: false,
             next_timeout: None,
             next_ssrc: 1000,
-            tx_seq: AHashMap::new(),
             rx_layers: AHashMap::new(),
-            layer_states: AHashMap::new(),
+            tx_tracks: AHashMap::new(),
             egress_bitrate: None,
             // 置为「久远以前」，使首个包即可应用 desired bitrate。
             last_desired_update: now - DESIRED_BITRATE_INTERVAL,
@@ -228,29 +248,6 @@ impl Participant {
         v
     }
 
-    /// 该 mid 上观测到的 simulcast 层数。
-    pub fn rx_layer_count(&self, mid: Mid) -> usize {
-        self.rx_layers
-            .values()
-            .filter(|l| l.mid == mid && l.rid.is_some())
-            .count()
-    }
-
-    /// 取该发送流的下一个序号 (层切换/丢层后保持连续)。
-    pub fn next_tx_seq(&mut self, mid: Mid) -> SeqNo {
-        self.tx_seq.entry(mid).or_default().inc()
-    }
-
-    /// 取得/初始化某条发布轨道的层选择状态。
-    pub fn layer_state_mut(&mut self, mid: Mid, now: Instant) -> &mut LayerState {
-        self.layer_states.entry(mid).or_insert_with(|| LayerState {
-            current: None,
-            pending: None,
-            max_tid: None,
-            last_eval: now - LAYER_EVAL_INTERVAL,
-        })
-    }
-
     /// 订阅者链路的带宽估计 (bit/s)。
     pub fn egress_bitrate(&self) -> Option<u64> {
         self.egress_bitrate
@@ -269,9 +266,7 @@ impl Participant {
         if bps == 0 {
             return;
         }
-        if now.saturating_duration_since(self.last_desired_update)
-            < DESIRED_BITRATE_INTERVAL
-        {
+        if now.saturating_duration_since(self.last_desired_update) < DESIRED_BITRATE_INTERVAL {
             return;
         }
         self.last_desired_update = now;
@@ -288,30 +283,6 @@ impl Participant {
         } else {
             false
         }
-    }
-
-    /// 声明一个用于向该 mid 转发 RTP 的发送流 (幂等)。
-    ///
-    /// RTP mode 下 str0m 不会替我们分配 SSRC，需要显式 `declare_stream_tx`。
-    /// 同时分配一个 RTX SSRC，这样订阅者发来的 NACK 能由 str0m 从
-    /// rtx cache 中重传 (前提是 SDP 协商了 RTX)。
-    pub fn ensure_tx_stream(&mut self, mid: Mid) {
-        // mid 未在 SDP 中协商 (或已移除) 时无法声明。
-        if self.rtc.media(mid).is_none() {
-            return;
-        }
-        // 已声明则直接复用 (declare_stream_tx 幂等, 但避免无谓调用)。
-        if self.rtc.direct_api().stream_tx_by_mid(mid, None).is_some() {
-            return;
-        }
-        let main = Ssrc::from(self.next_ssrc);
-        self.next_ssrc += 1;
-        let rtx = Ssrc::from(self.next_ssrc);
-        self.next_ssrc += 1;
-        self.rtc
-            .direct_api()
-            .declare_stream_tx(main, Some(rtx), mid, None);
-        debug!("参与者 {} mid={:?} 声明发送流 ssrc={} rtx={}", self.id, mid, main, rtx);
     }
 
     /// 查找入站 PT 对应的 PayloadParams (含 RTX)。
@@ -349,7 +320,8 @@ impl Participant {
         let candidate = str0m::Candidate::host(
             local_addr_to_candidate_addr(self.local_addr()),
             str0m::net::Protocol::Udp,
-        ).map_err(|e| format!("创建 ICE 候选失败: {}", e))?;
+        )
+        .map_err(|e| format!("创建 ICE 候选失败: {}", e))?;
 
         self.rtc.add_local_candidate(candidate);
 
@@ -366,11 +338,7 @@ impl Participant {
     }
 
     /// 添加远端 ICE 候选 (Trickle ICE)
-    pub fn add_remote_candidate(
-        &mut self,
-        candidate_str: &str,
-        sdp_mid: Option<String>,
-    ) {
+    pub fn add_remote_candidate(&mut self, candidate_str: &str, sdp_mid: Option<String>) {
         // sdp_mid 目前未使用 — str0m 的 add_remote_candidate 内部通过 SDP 协商确定 mid
         let _ = sdp_mid;
         // 解析候选字符串
@@ -378,10 +346,7 @@ impl Participant {
         match str0m::Candidate::from_sdp_string(candidate_str) {
             Ok(candidate) => {
                 self.rtc.add_remote_candidate(candidate);
-                debug!(
-                    "参与者 {} 添加远端候选: {}",
-                    self.id, candidate_str
-                );
+                debug!("参与者 {} 添加远端候选: {}", self.id, candidate_str);
             }
             Err(e) => {
                 warn!(
@@ -404,16 +369,6 @@ impl Participant {
             addr.ip(),
             addr.port()
         )]
-    }
-
-    /// 检查此参与者是否匹配给定的 ICE ufrag
-    pub fn matches_ufrag(&self, ufrag: &str) -> bool {
-        self.local_ufrag == ufrag
-    }
-
-    /// 检查此参与者的已知源地址是否匹配
-    pub fn matches_source(&self, source: SocketAddr) -> bool {
-        self.known_source == Some(source)
     }
 
     /// 本地地址
@@ -482,17 +437,8 @@ impl ParticipantTable {
         Some(p)
     }
 
-    pub fn get(&self, id: &str) -> Option<&Participant> {
-        self.participants.get(id)
-    }
-
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Participant> {
         self.participants.get_mut(id)
-    }
-
-    /// 遍历所有参与者 (供 Timer 驱动使用)
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut Participant)> {
-        self.participants.iter_mut()
     }
 
     /// O(1) 解析包所属参与者
@@ -500,11 +446,7 @@ impl ParticipantTable {
     /// 先尝试 STUN ufrag (两段顺序都试)，再退回源地址匹配。
     /// STUN USERNAME 为 `ufragA:ufragB`，两段顺序因实现而异，
     /// 只要任一段等于本地 ufrag 即可命中。
-    pub fn resolve(
-        &self,
-        ufrags: Option<(&str, &str)>,
-        source: SocketAddr,
-    ) -> Option<Arc<str>> {
+    pub fn resolve(&self, ufrags: Option<(&str, &str)>, source: SocketAddr) -> Option<Arc<str>> {
         if let Some((a, b)) = ufrags {
             if let Some(id) = self.ufrag_index.get(a) {
                 return Some(id.clone());
@@ -520,26 +462,13 @@ impl ParticipantTable {
     ///
     /// 调用方在持有参与者可变借用时已更新 `known_source` 字段，这里只负责
     /// 同步索引，避免热路径为了更新索引再做一次参与者查找。
-    pub fn update_source_index(
-        &mut self,
-        id: &str,
-        old: Option<SocketAddr>,
-        new: SocketAddr,
-    ) {
+    pub fn update_source_index(&mut self, id: &str, old: Option<SocketAddr>, new: SocketAddr) {
         if let Some(old) = old {
             if self.source_index.get(&old).map(|v| &**v) == Some(id) {
                 self.source_index.remove(&old);
             }
         }
         self.source_index.insert(new, Arc::from(id));
-    }
-
-    pub fn len(&self) -> usize {
-        self.participants.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.participants.is_empty()
     }
 }
 
@@ -587,49 +516,6 @@ mod tests {
         assert!(table.resolve(None, src).is_none());
     }
 
-    /// `ensure_tx_stream` 应为每个 mid 分配一对 main/rtx SSRC, 且幂等。
-    #[test]
-    fn ensure_tx_stream_is_idempotent() {
-        use str0m::media::MediaKind;
-
-        let mut p = Participant::new(
-            "p1".into(),
-            "room".into(),
-            "127.0.0.1:5000".parse().unwrap(),
-            1_000_000,
-        )
-        .unwrap();
-
-        let mid = Mid::from("0");
-        // 未经 SDP 协商时不应 panic (media 不存在 → 直接返回)。
-        p.ensure_tx_stream(mid);
-        assert!(p.rtc.direct_api().stream_tx_by_mid(mid, None).is_none());
-
-        // 手动声明 media 后应能分配发送流。
-        p.rtc.direct_api().declare_media(mid, MediaKind::Audio);
-        p.ensure_tx_stream(mid);
-        let ssrc = p.rtc.direct_api().stream_tx_by_mid(mid, None).unwrap().ssrc();
-        let rtx = p.rtc.direct_api().stream_tx_by_mid(mid, None).unwrap().rtx();
-        assert!(rtx.is_some());
-        assert_ne!(*ssrc, 0);
-
-        // 幂等: 再次调用复用同一 SSRC。
-        p.ensure_tx_stream(mid);
-        assert_eq!(
-            p.rtc.direct_api().stream_tx_by_mid(mid, None).unwrap().ssrc(),
-            ssrc
-        );
-
-        // 第二个 mid 应分配不同 SSRC。
-        let mid2 = Mid::from("1");
-        p.rtc.direct_api().declare_media(mid2, MediaKind::Video);
-        p.ensure_tx_stream(mid2);
-        assert_ne!(
-            p.rtc.direct_api().stream_tx_by_mid(mid2, None).unwrap().ssrc(),
-            ssrc
-        );
-    }
-
     /// 入站 simulcast 层速率按 RID 统计并按码率升序返回。
     #[test]
     fn layer_rates_sorted_ascending() {
@@ -657,11 +543,9 @@ mod tests {
         assert_eq!(rates[0].0, Rid::from("l"));
         assert_eq!(rates[1].0, Rid::from("h"));
         assert!(rates[0].1 <= rates[1].1);
-        assert_eq!(p.rx_layer_count(mid), 2);
 
         // 非 simulcast mid 无层信息。
         assert!(p.layer_rates(Mid::from("0")).is_empty());
-        assert_eq!(p.rx_layer_count(Mid::from("0")), 0);
     }
 
     /// SVC 时间层累计码率随 tid 递增。

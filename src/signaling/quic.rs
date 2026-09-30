@@ -69,8 +69,8 @@ pub async fn run_server(
     state: Arc<SignalingState>,
     tls: QuicTls,
 ) -> io::Result<()> {
-    let mut server_config = quinn::ServerConfig::with_single_cert(vec![tls.cert], tls.key)
-        .map_err(io::Error::other)?;
+    let mut server_config =
+        quinn::ServerConfig::with_single_cert(vec![tls.cert], tls.key).map_err(io::Error::other)?;
 
     // 连接迁移依赖 keep-alive 让对端在地址变化后尽快验证新路径；
     // idle timeout 不宜过短, 否则移动端切换网络期间空窗会被判定超时。
@@ -118,9 +118,9 @@ async fn handle_connection(
     let (mut send, mut recv) = conn.accept_bi().await?;
 
     // 输出通道: SignalingSession 写入, writer 任务消费并发送
-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<String>();
+    let (msg_tx, mut msg_rx) = mpsc::channel::<String>(crate::signaling::SIGNALING_CHANNEL_CAP);
     // 输入通道: reader 写入, SignalingSession 消费
-    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<String>();
+    let (inbound_tx, inbound_rx) = mpsc::channel::<String>(crate::signaling::SIGNALING_CHANNEL_CAP);
 
     // 发送任务
     let writer = tokio::spawn(async move {
@@ -145,7 +145,8 @@ async fn handle_connection(
         match read_frame(&mut recv).await {
             Ok(Some(frame)) => match String::from_utf8(frame) {
                 Ok(text) => {
-                    if inbound_tx.send(text).is_err() {
+                    // 会话消费过慢时关闭连接，避免输入队列无界增长。
+                    if inbound_tx.try_send(text).is_err() {
                         break;
                     }
                 }

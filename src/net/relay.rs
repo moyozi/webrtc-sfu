@@ -16,7 +16,7 @@
 //! 帧格式为手写的紧凑二进制 (避免逐包 JSON/依赖)。`PayloadParams` 用
 //! serde_json 编码并随每个数据包携带 (接收端按 `(publisher_id, mid)` 缓存)。
 
-use crate::core::RelayedRtp;
+use crate::worker::RelayedRtp;
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -83,13 +83,12 @@ struct Writer {
 
 impl Writer {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(1500) }
+        Self {
+            buf: Vec::with_capacity(1500),
+        }
     }
     fn u8(&mut self, v: u8) {
         self.buf.push(v);
-    }
-    fn u16(&mut self, v: u16) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
     }
     fn u32(&mut self, v: u32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
@@ -129,10 +128,6 @@ impl<'a> Reader<'a> {
         let b = *self.buf.get(self.pos).ok_or_else(truncated)?;
         self.pos += 1;
         Ok(b)
-    }
-    fn u16(&mut self) -> io::Result<u16> {
-        let s = self.take(2)?;
-        Ok(u16::from_le_bytes([s[0], s[1]]))
     }
     fn u32(&mut self) -> io::Result<u32> {
         let s = self.take(4)?;
@@ -181,7 +176,11 @@ fn bad_data() -> io::Error {
 // ──────────────────────────────────────────────────────────
 
 /// 编码一个中继 RTP 包 (target_worker = 接收端本地的目标 worker 全局编号)。
-pub fn encode_rtp(target_worker: u32, pkt: &RelayedRtp) -> Vec<u8> {
+///
+/// `include_params` 为 true 时随包携带完整 `PayloadParams` (JSON)，否则仅写
+/// 0 长度占位，由接收端从 `ParamsCache` 取。发送方应周期性携带一次，
+/// 以容忍中继 UDP 丢包。
+pub fn encode_rtp(target_worker: u32, pkt: &RelayedRtp, include_params: bool) -> Vec<u8> {
     let mut w = Writer::new();
     w.u8(MSG_RTP);
     w.u32(target_worker);
@@ -203,9 +202,13 @@ pub fn encode_rtp(target_worker: u32, pkt: &RelayedRtp) -> Vec<u8> {
         Some(false) => 0,
         None => 0xff,
     });
-    // params (JSON, 逐包携带; 接收端按 publisher/mid 缓存)
-    let params_json = serde_json::to_vec(&pkt.params).unwrap_or_default();
-    w.bytes(&params_json);
+    // params: 仅按需携带完整 JSON, 否则 0 长度占位 (接收端缓存)
+    if include_params {
+        let params_json = serde_json::to_vec(&pkt.params).unwrap_or_default();
+        w.bytes(&params_json);
+    } else {
+        w.bytes(&[]);
+    }
     // payload
     w.bytes(&pkt.payload);
     w.buf
@@ -274,8 +277,36 @@ pub fn encode_request_keyframe(
 // 解码
 // ──────────────────────────────────────────────────────────
 
+/// 跨主机中继接收端的参数缓存。
+///
+/// 数据包仅在发送端周期性携带参数时才会更新本缓存，其余包 (0 长度 params)
+/// 从缓存取，避免每包 JSON 解析。按 `(publisher_id, mid)` 组织，`get` 不分配。
+#[derive(Default)]
+pub struct ParamsCache {
+    map: HashMap<String, HashMap<Mid, PayloadParams>>,
+}
+
+impl ParamsCache {
+    fn get(&self, publisher_id: &str, mid: Mid) -> Option<PayloadParams> {
+        self.map
+            .get(publisher_id)
+            .and_then(|m| m.get(&mid))
+            .copied()
+    }
+
+    fn put(&mut self, publisher_id: &str, mid: Mid, params: PayloadParams) {
+        self.map
+            .entry(publisher_id.to_string())
+            .or_default()
+            .insert(mid, params);
+    }
+}
+
 /// 解码一个 relay UDP 包。
-pub fn decode(buf: &[u8]) -> io::Result<Decoded> {
+///
+/// `cache` 保存各 `(publisher_id, mid)` 最近一次收到的 `PayloadParams`；
+/// 数据包未携带参数时从缓存取。
+pub fn decode(buf: &[u8], cache: &mut ParamsCache) -> io::Result<Decoded> {
     let mut r = Reader::new(buf);
     let msg = r.u8()?;
     let target_worker = r.u32()?;
@@ -297,8 +328,23 @@ pub fn decode(buf: &[u8]) -> io::Result<Decoded> {
             let audio_level = r.i16()?;
             let va = r.u8()?;
             let params_json = r.bytes()?;
-            let params: PayloadParams =
-                serde_json::from_slice(params_json).map_err(|_| bad_data())?;
+            let params = if params_json.is_empty() {
+                match cache.get(&publisher_id, publisher_mid) {
+                    Some(p) => p,
+                    None => {
+                        // 参数尚未到达 (或缓存被丢包跳过): 丢弃该数据包。
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "relay 数据包缺少参数且无缓存",
+                        ));
+                    }
+                }
+            } else {
+                let p: PayloadParams =
+                    serde_json::from_slice(params_json).map_err(|_| bad_data())?;
+                cache.put(&publisher_id, publisher_mid, p);
+                p
+            };
             let payload = r.bytes()?.to_vec();
 
             // audio_level 用 i8::MIN 作为 None 哨兵
@@ -401,6 +447,8 @@ impl RelayEndpoint {
         Ok(Self { sock })
     }
 
+    /// 监听地址 (仅测试使用)。
+    #[cfg(test)]
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.sock.local_addr()
     }
@@ -415,12 +463,6 @@ impl RelayEndpoint {
         self.sock.recv_from(buf)
     }
 }
-
-/// 进程级 relay 端点共享句柄 (worker 用于发送跨主机包)。
-pub type RelayEndpointRef = Arc<RelayEndpoint>;
-
-/// 全局 worker → 对端进程 relay 地址的映射。
-pub type PeerAddrs = HashMap<u32, SocketAddr>;
 
 #[cfg(test)]
 mod tests {
@@ -450,8 +492,9 @@ mod tests {
             arrival: Instant::now(),
             payload: Arc::from(&[1u8, 2, 3, 4, 5][..]),
         };
-        let buf = encode_rtp(4, &pkt);
-        match decode(&buf).unwrap() {
+        let buf = encode_rtp(4, &pkt, true);
+        let mut cache = ParamsCache::default();
+        match decode(&buf, &mut cache).unwrap() {
             Decoded::Rtp(d) => {
                 assert_eq!(d.target_worker, 4);
                 assert_eq!(&*d.pkt.publisher_id, "pub-1");
@@ -467,12 +510,22 @@ mod tests {
             }
             _ => panic!("expected RTP"),
         }
+
+        // 后续包不携带 params, 应从缓存解出同一份参数。
+        let lean = encode_rtp(4, &pkt, false);
+        assert!(lean.len() < buf.len(), "省略 params 的包应更小");
+        match decode(&lean, &mut cache).unwrap() {
+            Decoded::Rtp(d) => assert_eq!(d.pkt.params, pkt.params),
+            _ => panic!("expected RTP"),
+        }
+        // 空缓存时缺少 params 应报错 (而不是解出错误的参数)。
+        assert!(decode(&lean, &mut ParamsCache::default()).is_err());
     }
 
     #[test]
     fn control_roundtrip() {
         let b = encode_register(7, "p", Mid::from("0"), 2, "sub-1", Some(Mid::from("s")));
-        match decode(&b).unwrap() {
+        match decode(&b, &mut ParamsCache::default()).unwrap() {
             Decoded::Control(DecodedControl::Register {
                 target_worker,
                 publisher_id,
@@ -491,7 +544,7 @@ mod tests {
         }
 
         let b = encode_request_keyframe(3, "p", Mid::from("1"), Some(Rid::from("l")));
-        match decode(&b).unwrap() {
+        match decode(&b, &mut ParamsCache::default()).unwrap() {
             Decoded::Control(DecodedControl::RequestKeyframe { rid, .. }) => {
                 assert_eq!(rid, Some(Rid::from("l")));
             }
@@ -501,8 +554,8 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated() {
-        assert!(decode(&[]).is_err());
-        assert!(decode(&[MSG_RTP, 0, 0]).is_err());
+        assert!(decode(&[], &mut ParamsCache::default()).is_err());
+        assert!(decode(&[MSG_RTP, 0, 0], &mut ParamsCache::default()).is_err());
     }
 
     /// 两个进程级端点通过 UDP 真实收发一个 relay 包。
@@ -525,12 +578,12 @@ mod tests {
             arrival: Instant::now(),
             payload: Arc::from(&[9u8, 8, 7][..]),
         };
-        let buf = encode_rtp(0, &pkt);
+        let buf = encode_rtp(0, &pkt, true);
         a.send_to(&buf, b_addr).unwrap();
 
         let mut rbuf = [0u8; 2048];
         let (n, _src) = b.recv_from(&mut rbuf).unwrap();
-        match decode(&rbuf[..n]).unwrap() {
+        match decode(&rbuf[..n], &mut ParamsCache::default()).unwrap() {
             Decoded::Rtp(d) => assert_eq!(&*d.pkt.payload, &[9u8, 8, 7]),
             _ => panic!("expected RTP"),
         }

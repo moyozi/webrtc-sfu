@@ -18,8 +18,8 @@
 //! 支持: `OPTIONS`(CORS) / `POST /whip?room=...`(建流) /
 //! `PATCH /whip/{id}`(trickle ICE) / `DELETE /whip/{id}`(停止)。
 
-use crate::core::WorkerCommand;
 use crate::signaling::SignalingState;
+use crate::worker::WorkerCommand;
 use ahash::AHashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,11 +32,6 @@ struct HttpRequest {
     method: String,
     target: String,
     body: Vec<u8>,
-}
-
-struct HttpRequestHead {
-    method: String,
-    target: String,
 }
 
 struct WhipSession {
@@ -66,11 +61,17 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>>
             if buf.is_empty() {
                 return Ok(None);
             }
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no header end"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "no header end",
+            ));
         }
         buf.extend_from_slice(&tmp[..n]);
         if buf.len() > 1 << 20 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "header too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "header too large",
+            ));
         }
     };
 
@@ -244,16 +245,11 @@ async fn handle(
         Some(r) => r,
         None => return Ok(()),
     };
-    let HttpRequestHead { method, .. } = HttpRequestHead {
-        method: req.method.clone(),
-        target: req.target.clone(),
-    };
+    let method = req.method.clone();
     let (path, query) = parse_head(&req);
 
     match method.as_str() {
-        "OPTIONS" => {
-            write_response(&mut stream, "204 No Content", "text/plain", &[], b"").await
-        }
+        "OPTIONS" => write_response(&mut stream, "204 No Content", "text/plain", &[], b"").await,
         "POST" if path == "/whip" => {
             let room = query_param(&query, "room").unwrap_or_else(|| "default".to_string());
             let sdp_offer = String::from_utf8_lossy(&req.body).to_string();
@@ -270,15 +266,18 @@ async fn handle(
 
             let id = new_id(seq.fetch_add(1, Ordering::Relaxed));
             let worker_idx = state.assign_worker(&room, &id);
-            let reply = state.create_participant(
-                worker_idx,
-                room.clone(),
-                id.clone(),
-                sdp_offer,
-            );
+            // create_participant 可能阻塞等待 worker 回复 (最长 10s)，放到 blocking 线程池。
+            let state_for_task = state.clone();
+            let room_for_task = room.clone();
+            let id_for_task = id.clone();
+            let reply = tokio::task::spawn_blocking(move || {
+                state_for_task.create_participant(worker_idx, room_for_task, id_for_task, sdp_offer)
+            })
+            .await
+            .unwrap_or(None);
 
             match reply {
-                Some(crate::core::WorkerReply::SdpAnswer {
+                Some(crate::worker::WorkerReply::SdpAnswer {
                     sdp_answer,
                     local_candidates,
                     ..
@@ -288,9 +287,11 @@ async fn handle(
                     state.notify_room(
                         &room,
                         &id,
-                        &serde_json::to_string(&crate::signaling::protocol::SignalingResponse::ParticipantJoined {
-                            participant_id: id.clone(),
-                        })
+                        &serde_json::to_string(
+                            &crate::signaling::protocol::SignalingResponse::ParticipantJoined {
+                                participant_id: id.clone(),
+                            },
+                        )
                         .unwrap(),
                     );
                     sessions.lock().insert(
@@ -308,12 +309,15 @@ async fn handle(
                         &mut stream,
                         "201 Created",
                         "application/sdp",
-                        &[("Location", location.as_str()), ("X-Participant-Id", id.as_str())],
+                        &[
+                            ("Location", location.as_str()),
+                            ("X-Participant-Id", id.as_str()),
+                        ],
                         answer.as_bytes(),
                     )
                     .await
                 }
-                Some(crate::core::WorkerReply::Error { error, .. }) => {
+                Some(crate::worker::WorkerReply::Error { error, .. }) => {
                     warn!("WHIP 建流失败: {}", error);
                     write_response(
                         &mut stream,
@@ -334,23 +338,14 @@ async fn handle(
                     )
                     .await
                 }
-                Some(_) => {
-                    write_response(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        "text/plain",
-                        &[],
-                        b"unexpected worker reply",
-                    )
-                    .await
-                }
             }
         }
         "PATCH" if path.starts_with("/whip/") => {
             let id = path.trim_start_matches("/whip/").to_string();
-            let session = sessions.lock().get(&id).map(|s| {
-                (s.participant_id.clone(), s.worker_idx)
-            });
+            let session = sessions
+                .lock()
+                .get(&id)
+                .map(|s| (s.participant_id.clone(), s.worker_idx));
             let Some((participant_id, worker_idx)) = session else {
                 return write_response(
                     &mut stream,
@@ -398,7 +393,14 @@ async fn handle(
             write_response(&mut stream, "200 OK", "text/plain", &[], b"").await
         }
         _ => {
-            write_response(&mut stream, "404 Not Found", "text/plain", &[], b"not found").await
+            write_response(
+                &mut stream,
+                "404 Not Found",
+                "text/plain",
+                &[],
+                b"not found",
+            )
+            .await
         }
     }
 }
@@ -425,7 +427,10 @@ mod tests {
 
     #[test]
     fn query_parsing() {
-        assert_eq!(query_param("room=demo&x=1", "room").as_deref(), Some("demo"));
+        assert_eq!(
+            query_param("room=demo&x=1", "room").as_deref(),
+            Some("demo")
+        );
         assert_eq!(query_param("room=demo", "missing"), None);
     }
 }

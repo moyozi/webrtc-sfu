@@ -36,6 +36,12 @@ pub struct SfuConfig {
     pub relay_peers: HashMap<u32, SocketAddr>,
     /// 整集群 worker 总数 (全局编号范围 0..total)
     pub total_workers: u32,
+    /// 房间 → 允许的全局 worker 列表 (房间级分片配置)。
+    /// 未配置 / 未匹配 `*` 的房间按房间 id 哈希固定 (或 `default_worker` 覆盖)。
+    pub room_workers: HashMap<String, Vec<u32>>,
+    /// 未显式配置房间时的默认全局 worker 覆盖。
+    /// `None` = 默认按房间 id 哈希固定到一个 worker。
+    pub default_worker: Option<u32>,
     /// 本进程控制面 TCP 监听地址 (接收远端信令命令; None = 不监听)
     pub control_listen: Option<SocketAddr>,
     /// 远端 worker 全局编号 → 其所属进程的控制地址
@@ -95,9 +101,7 @@ impl SfuConfig {
                     ip
                 }
                 None => {
-                    warn!(
-                        "未配置 SFU_ANNOUNCE_IP 且自动探测失败, 回退 127.0.0.1 (仅本机可连)"
-                    );
+                    warn!("未配置 SFU_ANNOUNCE_IP 且自动探测失败, 回退 127.0.0.1 (仅本机可连)");
                     IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
                 }
             },
@@ -132,10 +136,9 @@ impl SfuConfig {
             // 格式: "idx=host:port,idx=host:port"
             for part in s.split(',') {
                 if let Some((idx, addr)) = part.split_once('=') {
-                    if let (Ok(i), Ok(a)) = (
-                        idx.trim().parse::<u32>(),
-                        addr.trim().parse::<SocketAddr>(),
-                    ) {
+                    if let (Ok(i), Ok(a)) =
+                        (idx.trim().parse::<u32>(), addr.trim().parse::<SocketAddr>())
+                    {
                         relay_peers.insert(i, a);
                     }
                 }
@@ -148,6 +151,44 @@ impl SfuConfig {
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v >= num_workers as u32)
             .unwrap_or(num_workers as u32);
+
+        // 房间级 worker 配置 (可选):
+        //   SFU_ROOM_WORKERS="roomA=0;roomB=1,2,3;*=0,1,2,3"
+        // - 未配置: 每个房间按房间 id 哈希固定到一个 worker (同房间同 worker,
+        //   不同房间尽量分散)。
+        // - 单机多 worker: 给房间配置多个本地 worker 编号, 房间内参与者轮转分布。
+        // - 多主机多 worker: 编号使用整集群全局 worker (0..SFU_TOTAL_WORKERS),
+        //   可跨主机; `*` 规则作为未列出房间的兜底。
+        let mut room_workers: HashMap<String, Vec<u32>> = HashMap::new();
+        if let Ok(s) = std::env::var("SFU_ROOM_WORKERS") {
+            for rule in s.split(';') {
+                let rule = rule.trim();
+                if rule.is_empty() {
+                    continue;
+                }
+                let Some((room, list)) = rule.split_once('=') else {
+                    warn!("忽略非法 SFU_ROOM_WORKERS 规则 (缺少 '='): {}", rule);
+                    continue;
+                };
+                let room = room.trim().to_string();
+                let workers: Vec<u32> = list
+                    .split(',')
+                    .filter_map(|w| w.trim().parse::<u32>().ok())
+                    .filter(|w| *w < total_workers)
+                    .collect();
+                if room.is_empty() || workers.is_empty() {
+                    warn!("忽略无有效内容的 SFU_ROOM_WORKERS 规则: {}", rule);
+                    continue;
+                }
+                room_workers.insert(room, workers);
+            }
+        }
+        // 可选: 强制所有未配置房间落到同一个 worker (不设则按房间哈希)。
+        let default_worker = std::env::var("SFU_DEFAULT_WORKER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|w| *w < total_workers);
+
         let control_listen = std::env::var("SFU_CONTROL_LISTEN")
             .ok()
             .and_then(|v| v.parse::<SocketAddr>().ok());
@@ -155,10 +196,9 @@ impl SfuConfig {
         if let Ok(s) = std::env::var("SFU_CONTROL_PEERS") {
             for part in s.split(',') {
                 if let Some((idx, addr)) = part.split_once('=') {
-                    if let (Ok(i), Ok(a)) = (
-                        idx.trim().parse::<u32>(),
-                        addr.trim().parse::<SocketAddr>(),
-                    ) {
+                    if let (Ok(i), Ok(a)) =
+                        (idx.trim().parse::<u32>(), addr.trim().parse::<SocketAddr>())
+                    {
                         control_peers.insert(i, a);
                     }
                 }
@@ -168,7 +208,12 @@ impl SfuConfig {
             .ok()
             .and_then(|v| v.parse::<SocketAddr>().ok());
         let signaling = match std::env::var("SFU_SIGNALING") {
-            Ok(v) => !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false")),
+            Ok(v) => {
+                !(v.is_empty()
+                    || v == "0"
+                    || v.eq_ignore_ascii_case("off")
+                    || v.eq_ignore_ascii_case("false"))
+            }
             Err(_) => true,
         };
 
@@ -187,6 +232,8 @@ impl SfuConfig {
             relay_listen,
             relay_peers,
             total_workers,
+            room_workers,
+            default_worker,
             control_listen,
             control_peers,
             signaling,
@@ -204,10 +251,4 @@ fn detect_local_ip() -> Option<IpAddr> {
     // 任意公网地址即可, 不会产生实际流量。
     socket.connect("8.8.8.8:80").ok()?;
     socket.local_addr().ok().map(|addr| addr.ip())
-}
-
-fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
 }

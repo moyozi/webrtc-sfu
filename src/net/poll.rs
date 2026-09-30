@@ -3,9 +3,7 @@
 //! 使用 Edge-Triggered 模式，配合 recvmmsg 循环读到 EAGAIN，
 //! 避免水平触发的重复唤醒。
 
-use nix::sys::epoll::{
-    Epoll, EpollEvent, EpollFlags, EpollCreateFlags,
-};
+use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
 use std::os::fd::{BorrowedFd, RawFd};
 use std::time::Duration;
 
@@ -19,8 +17,7 @@ pub struct Poll {
 impl Poll {
     /// 创建 epoll 实例
     pub fn new() -> std::io::Result<Self> {
-        let epoll = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC)
-            .map_err(nix_to_io)?;
+        let epoll = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).map_err(nix_to_io)?;
 
         Ok(Self {
             epoll,
@@ -32,10 +29,7 @@ impl Poll {
     ///
     /// 使用 EPOLLIN (可读) + EPOLLET (边缘触发)
     pub fn add(&self, fd: RawFd) -> std::io::Result<()> {
-        let event = EpollEvent::new(
-            EpollFlags::EPOLLIN | EpollFlags::EPOLLET,
-            fd as u64,
-        );
+        let event = EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, fd as u64);
 
         // nix 0.29: Epoll::add 接受 impl AsFd，需要 BorrowedFd
         // SAFETY: fd 在此调用期间有效
@@ -55,13 +49,12 @@ impl Poll {
     /// 注意: `timeout` 超过 65535ms 会被截断 (epoll 超时单位限制)。
     pub fn wait(&mut self, timeout: Option<Duration>) -> std::io::Result<usize> {
         // nix 0.29: Epoll::wait 泛型超时接受 Option<u16> (None = 无限等待)
-        let timeout_ms: Option<u16> =
-            timeout.map(|d| d.as_millis().min(u16::MAX as u128) as u16);
+        let timeout_ms: Option<u16> = timeout.map(|d| d.as_millis().min(u16::MAX as u128) as u16);
 
-        let n = self.epoll.wait(
-            &mut self.events,
-            timeout_ms,
-        ).map_err(nix_to_io)?;
+        let n = self
+            .epoll
+            .wait(&mut self.events, timeout_ms)
+            .map_err(nix_to_io)?;
 
         Ok(n)
     }

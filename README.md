@@ -55,14 +55,20 @@
 > **为什么不用 SO_REUSEPORT 共享同一端口？**
 > 内核的 SO_REUSEPORT 按四元组哈希选择 socket，**无法保证**包落到持有该
 > participant 的 worker，于是包会被其它 worker 丢弃。因此每个 worker 监听
-> 自己的媒体端口 `base_port + cpu_id`，并在 ICE 候选里公布该端口；信令层为
-> 每个参与者分配 worker (`assign_worker`)，同一房间的参与者尽量均匀分布到
-> 多个 worker。
+> 自己的媒体端口 `base_port + cpu_id`，并在 ICE 候选里公布该端口；信令层通过
+> `assign_worker` 按房间分配 worker。**默认按房间 id 哈希把每个房间固定到一个
+> worker**（同房间同 worker，不同房间自动分散）；单房间要跨 worker（单机多
+> worker / 多主机多 worker）需要显式配置 `SFU_ROOM_WORKERS`（见下）。
 
 ### 单房间多 Worker（跨线程订阅）
 
-同一房间可跨多个 worker：订阅者与发布者若落在不同 worker，媒体经**进程内
-中继平面**转发 —— 发布者 worker 解密出明文 RTP，通过 `RelayHub` 把
+> **默认不启用**：同一房间的参与者默认全部落在哈希得到的那一个 worker 上。
+> 若要让某个房间跨 worker，需要显式配置该房间，例如
+> `SFU_ROOM_WORKERS="load=0,1,2,3"`（单机多 worker）或
+> `SFU_ROOM_WORKERS="load=0,2,4,6"`（多主机多 worker，编号为整集群全局 worker）。
+
+配置后，同一房间可跨多个 worker：订阅者与发布者若落在不同 worker，媒体经
+**进程内中继平面**转发 —— 发布者 worker 解密出明文 RTP，通过 `RelayHub` 把
 `Arc<[u8]>` 载荷经 channel 送给订阅者所在 worker，后者用自己的 `Rtc`
 完成 PT 映射 + 逐订阅者 SRTP。详见 [docs/multi-worker-relay.md](docs/multi-worker-relay.md)。
 
@@ -78,7 +84,7 @@ Publisher(w0) --解密--> forward --local--> w0 本地订阅者
 
 | 原则 | 实现方式 |
 |------|----------|
-| **Share-Nothing** | 每个 Worker 线程独占一个 CPU 核心，拥有独立的 UDP socket (独立端口)、Rtc 实例、路由表；同一房间可跨 Worker（经 `RelayHub` 中继），单房间不再受单核上限约束 |
+| **Share-Nothing** | 每个 Worker 线程独占一个 CPU 核心，拥有独立的 UDP socket (独立端口)、Rtc 实例、路由表；显式配置 `SFU_ROOM_WORKERS` 后同一房间可跨 Worker（经 `RelayHub` 中继），单房间不再受单核上限约束 |
 | **Batch I/O** | 使用 `recvmmsg` 批量收包 (64 packets/syscall)、`sendmmsg` 批量发包，减少 80%+ 系统调用 |
 | **Sans I/O 驱动** | str0m 不做任何网络 I/O，由 Worker 事件循环主动喂数据和驱动时间 |
 | **零拷贝路由** | RTP mode 包级转发: `RtpPacket.payload` (`Arc<[u8]>`) 引用计数共享，不重组帧/不重新分包 |
@@ -677,7 +683,7 @@ INFO QUIC 信令服务器启动: quic://192.168.31.112:5173
 ```
 
 客户端可固定校验该指纹（`examples/quic_signaling_client.rs` 已实现）。生产环境
-应换用受信证书；浏览器接入 QUIC 需经 **WebTransport**（HTTP/3），当前 demo
+应换用受信证书；浏览器接入 QUIC 需经 **WebTransport**（HTTP/3），当前 RoomChatWeb
 页面仍走 WebSocket。
 
 **参考客户端**（含 `/migrate` 迁移演示）：
@@ -741,28 +747,33 @@ webrtc-sfu/
 └── src/
     ├── main.rs                  ← 入口: 启动 workers + signaling
     ├── config.rs                ← 配置定义
-    ├── net/
+    ├── net/                     ← 网络原语
     │   ├── mod.rs
     │   ├── udp.rs               ← recvmmsg/sendmmsg UDP socket (nix)
-    │   └── poll.rs              ← epoll 封装 (nix)
-    ├── core/
+    │   ├── poll.rs              ← epoll 封装 (nix)
+    │   └── relay.rs             ← 跨主机中继的紧凑二进制编解码 + UDP 端点
+    ├── worker/                  ← per-core 事件循环与跨 worker 中继
+    │   ├── mod.rs               ← WorkerConfig/Command/Reply、模块接线
+    │   ├── event_loop.rs        ← Worker 线程主循环 (核心)
+    │   ├── packet.rs            ← UDP 包 → str0m 实例路由 + 创建参与者
+    │   ├── forward.rs           ← RTP 包级转发 / simulcast·SVC 选层 / 中继投递
+    │   ├── output.rs            ← str0m 输出 drain 与定时器调度
+    │   ├── relay.rs             ← 跨 worker 中继总线 (RelayHub)
+    │   └── timer.rs             ← deadline 驱动的最小堆定时器
+    ├── sfu/                     ← SFU 核心数据结构
     │   ├── mod.rs
-    │   ├── worker.rs            ← Worker 事件循环 (核心)
-    │   └── timer.rs             ← 定时器轮
-    ├── sfu/
-    │   ├── mod.rs
-    │   ├── room.rs              ← Room 管理
-    │   ├── participant.rs       ← Participant + str0m Rtc 封装
-    │   ├── router.rs            ← RTP 路由引擎
-    │   └── track.rs             ← 轨道表示
-    └── signaling/
-        ├── mod.rs               ← SignalingState (房间表 / sender 表 / worker 选择)
-        ├── protocol.rs          ← 信令 JSON 协议 (与传输无关)
-        ├── session.rs           ← 传输无关会话状态机 (WS/QUIC 共用)
-        ├── server.rs            ← WebSocket 传输层
-        └── quic.rs              ← QUIC 传输层 (quinn) + 自签名证书
-└── examples/
-    └── quic_signaling_client.rs ← QUIC 信令客户端参考实现 (含连接迁移)
+    │   ├── participant.rs       ← Participant + str0m Rtc 封装 + 路由索引
+    │   ├── router.rs            ← 发布者→订阅者路由表
+    │   └── layer.rs             ← simulcast/SVC 选层与码率估计
+    ├── signaling/               ← 信令层 (WebSocket / QUIC / WHIP)
+    │   ├── mod.rs               ← SignalingState (房间表 / sender 表 / worker 选择)
+    │   ├── protocol.rs          ← 信令 JSON 协议 (与传输无关)
+    │   ├── session.rs           ← 传输无关会话状态机 (WS/QUIC 共用)
+    │   ├── server.rs            ← WebSocket 传输层
+    │   ├── quic.rs              ← QUIC 传输层 (quinn) + 自签名证书
+    │   └── whip.rs              ← WHIP 推流接入 (HTTP)
+    └── cluster/                 ← 多进程集群控制面
+        └── mod.rs               ← 远端 worker 命令路由 (TCP)
 ```
 
 ---
@@ -783,8 +794,12 @@ SFU_ANNOUNCE_IP=203.0.113.10 RUST_LOG=info ./target/release/sfu-server
 
 # 环境变量调优
 SFU_ANNOUNCE_IP=203.0.113.10  # 对外通告 IP — 写入 SDP/ICE host 候选 (必须为客户端可达地址)
-SFU_WORKERS=4                 # worker 线程数; 单房间参与者会均匀分布到这些 worker 上
-                              # (跨 worker 订阅经内存中继, 单房间不再受单核上限约束)
+SFU_WORKERS=4                 # 本进程 worker 线程数 (媒体端口数)
+SFU_DEFAULT_WORKER=0          # 可选: 强制未配置房间全落该 worker; 不设则按房间哈希
+SFU_ROOM_WORKERS="load=0;roomA=1,2;*=0,1,2,3"
+                              # 房间 -> 全局 worker 列表; 缺省按房间哈希固定到单个 worker。
+                              # 单机多 worker / 多主机多 worker 均在此显式配置
+                              # (编号为整集群全局 worker; 跨 worker 订阅经 RelayHub 中继)
 SFU_WS_ADDR=0.0.0.0:5174      # WebSocket 信令监听地址 (默认 0.0.0.0:5174)
 SFU_QUIC_ADDR=0.0.0.0:5173    # QUIC 信令监听地址; 设为 0/off/空 则禁用 QUIC
 SFU_MEDIA_ADDR=0.0.0.0:5175   # 媒体 UDP 绑定地址 (默认 0.0.0.0:5175)

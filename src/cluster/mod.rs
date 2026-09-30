@@ -12,8 +12,8 @@
 //!
 //! 消息格式: `u32 be 长度 + serde_json 负载`。
 
-use crate::core::{WorkerCommand, WorkerReply};
-use crossbeam_channel::Sender;
+use crate::worker::{WorkerCommand, WorkerReply};
+use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -27,6 +27,10 @@ use tracing::{info, warn};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// CreateParticipant 等待远端 worker 回复的超时。
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// 向本地 worker 命令队列投递 (有界队列可能暂满) 的超时。
+const CMD_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// fire-and-forget 控制命令的发送队列容量。
+const CTRL_QUEUE_CAP: usize = 4_096;
 /// 单帧最大长度 (16 MiB, 防异常长度前缀)。
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
@@ -122,19 +126,56 @@ struct Conn {
 pub struct ClusterControl {
     /// 全局 worker → 其所属进程的控制地址
     peer_addrs: HashMap<u32, SocketAddr>,
-    conns: Mutex<HashMap<SocketAddr, Arc<Conn>>>,
+    conns: Arc<Mutex<HashMap<SocketAddr, Arc<Conn>>>>,
     pending: Arc<Mutex<HashMap<u64, Sender<ControlReply>>>>,
     next_req: AtomicU64,
+    /// fire-and-forget 命令的发送队列 (由专用线程消费)。
+    ///
+    /// 远端建连 (`TcpStream::connect_timeout`) 会阻塞，因此不能放在信令的 async
+    /// 任务里直接执行。这里只入队，实际发送在 `spawn_sender` 启动的线程完成。
+    tx_queue: Sender<(u32, ControlBody)>,
+    rx_queue: Mutex<Option<Receiver<(u32, ControlBody)>>>,
+}
+
+/// 从连接缓存中移除指定连接 (仅当仍是同一个 `Arc` 时，避免误删重连后的新连接)。
+fn drop_conn(conns: &Mutex<HashMap<SocketAddr, Arc<Conn>>>, addr: SocketAddr, conn: &Arc<Conn>) {
+    let mut map = conns.lock().unwrap();
+    if let Some(cur) = map.get(&addr) {
+        if Arc::ptr_eq(cur, conn) {
+            map.remove(&addr);
+        }
+    }
 }
 
 impl ClusterControl {
     pub fn new(peer_addrs: HashMap<u32, SocketAddr>) -> Self {
+        let (tx_queue, rx_queue) = crossbeam_channel::bounded(CTRL_QUEUE_CAP);
         Self {
             peer_addrs,
-            conns: Mutex::new(HashMap::new()),
+            conns: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_req: AtomicU64::new(1),
+            tx_queue,
+            rx_queue: Mutex::new(Some(rx_queue)),
         }
+    }
+
+    /// 启动 fire-and-forget 命令的发送线程。
+    ///
+    /// 需在 `Arc<ClusterControl>` 上调用 (线程需共享连接缓存与 pending 表)。
+    pub fn spawn_sender(self: &Arc<Self>) {
+        let Some(rx) = self.rx_queue.lock().unwrap().take() else {
+            return;
+        };
+        let this = self.clone();
+        std::thread::Builder::new()
+            .name("sfu-ctl-tx".to_string())
+            .spawn(move || {
+                while let Ok((target, body)) = rx.recv() {
+                    this.send_request(target, 0, body);
+                }
+            })
+            .expect("failed to spawn control sender thread");
     }
 
     fn conn_for(&self, target: u32) -> Option<Arc<Conn>> {
@@ -148,18 +189,24 @@ impl ClusterControl {
         let conn = Arc::new(Conn {
             writer: Mutex::new(stream),
         });
-        // 读取线程: 把回复按 req_id 派发到 pending
+        // 读取线程: 把回复按 req_id 派发到 pending; 连接断开时从缓存移除，
+        // 使后续请求能重新建连而不是写死 socket。
         let pending = self.pending.clone();
+        let conns = self.conns.clone();
+        let conn_for_thread = conn.clone();
         std::thread::Builder::new()
             .name(format!("sfu-ctl-rx-{}", target))
-            .spawn(move || while let Ok(frame) = read_frame(&mut reader) {
-                let resp: ControlResponse = match serde_json::from_slice(&frame) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                if let Some(tx) = pending.lock().unwrap().remove(&resp.req_id) {
-                    let _ = tx.send(resp.reply);
+            .spawn(move || {
+                while let Ok(frame) = read_frame(&mut reader) {
+                    let resp: ControlResponse = match serde_json::from_slice(&frame) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    if let Some(tx) = pending.lock().unwrap().remove(&resp.req_id) {
+                        let _ = tx.send(resp.reply);
+                    }
                 }
+                drop_conn(&conns, addr, &conn_for_thread);
             })
             .ok()?;
         self.conns.lock().unwrap().insert(addr, conn.clone());
@@ -167,6 +214,9 @@ impl ClusterControl {
     }
 
     fn send_request(&self, target: u32, req_id: u64, body: ControlBody) -> bool {
+        let Some(addr) = self.peer_addrs.get(&target).copied() else {
+            return false;
+        };
         let Some(conn) = self.conn_for(target) else {
             warn!("无法连接远端 worker {} 的控制地址", target);
             return false;
@@ -180,7 +230,13 @@ impl ClusterControl {
             return false;
         };
         let mut w = conn.writer.lock().unwrap();
-        write_frame(&mut w, &bytes).is_ok()
+        if write_frame(&mut w, &bytes).is_err() {
+            // 写失败说明连接已失效: 丢弃缓存连接，下次调用重连。
+            drop(w);
+            drop_conn(&self.conns, addr, &conn);
+            return false;
+        }
+        true
     }
 
     /// 同步创建参与者: 发送请求并等待远端 worker 的 SDP answer。
@@ -228,9 +284,11 @@ impl ClusterControl {
         }
     }
 
-    /// 发送无需回复的命令。
+    /// 发送无需回复的命令 (非阻塞: 入队后由发送线程处理)。
     pub fn send(&self, target: u32, body: ControlBody) {
-        let _ = self.send_request(target, 0, body);
+        if self.tx_queue.try_send((target, body)).is_err() {
+            warn!("集群控制发送队列已满, 丢弃发往 worker {} 的命令", target);
+        }
     }
 }
 
@@ -304,7 +362,7 @@ fn handle_conn(
                     sdp_offer,
                     reply_tx: rtx,
                 };
-                if tx.send(cmd).is_err() {
+                if tx.send_timeout(cmd, CMD_SEND_TIMEOUT).is_err() {
                     continue;
                 }
                 // 等待 worker 回复后，用同一连接写回 (每请求一线程，避免头阻塞)
@@ -349,14 +407,24 @@ fn handle_conn(
                 candidate,
                 sdp_mid,
             } => {
-                let _ = tx.send(WorkerCommand::AddRemoteCandidate {
-                    participant_id,
-                    candidate,
-                    sdp_mid,
-                });
+                if tx
+                    .try_send(WorkerCommand::AddRemoteCandidate {
+                        participant_id,
+                        candidate,
+                        sdp_mid,
+                    })
+                    .is_err()
+                {
+                    warn!("本地 worker {} 命令队列已满, 丢弃 AddRemoteCandidate", li);
+                }
             }
             ControlBody::RemoveParticipant { participant_id } => {
-                let _ = tx.send(WorkerCommand::RemoveParticipant { participant_id });
+                if tx
+                    .try_send(WorkerCommand::RemoveParticipant { participant_id })
+                    .is_err()
+                {
+                    warn!("本地 worker {} 命令队列已满, 丢弃 RemoveParticipant", li);
+                }
             }
             ControlBody::Subscribe {
                 room_id,
@@ -366,14 +434,19 @@ fn handle_conn(
                 subscriber_mid,
                 publisher_worker,
             } => {
-                let _ = tx.send(WorkerCommand::Subscribe {
-                    room_id,
-                    subscriber_id,
-                    publisher_id,
-                    publisher_mid,
-                    subscriber_mid,
-                    publisher_worker,
-                });
+                if tx
+                    .try_send(WorkerCommand::Subscribe {
+                        room_id,
+                        subscriber_id,
+                        publisher_id,
+                        publisher_mid,
+                        subscriber_mid,
+                        publisher_worker,
+                    })
+                    .is_err()
+                {
+                    warn!("本地 worker {} 命令队列已满, 丢弃 Subscribe", li);
+                }
             }
             ControlBody::Unsubscribe {
                 subscriber_id,
@@ -381,12 +454,17 @@ fn handle_conn(
                 publisher_mid,
                 publisher_worker,
             } => {
-                let _ = tx.send(WorkerCommand::Unsubscribe {
-                    subscriber_id,
-                    publisher_id,
-                    publisher_mid,
-                    publisher_worker,
-                });
+                if tx
+                    .try_send(WorkerCommand::Unsubscribe {
+                        subscriber_id,
+                        publisher_id,
+                        publisher_mid,
+                        publisher_worker,
+                    })
+                    .is_err()
+                {
+                    warn!("本地 worker {} 命令队列已满, 丢弃 Unsubscribe", li);
+                }
             }
         }
     }
@@ -444,7 +522,10 @@ impl WorkerRouter {
                 sdp_offer,
                 reply_tx: tx,
             };
-            self.local_txs.get(li)?.send(cmd).ok()?;
+            self.local_txs
+                .get(li)?
+                .send_timeout(cmd, CMD_SEND_TIMEOUT)
+                .ok()?;
             return rx.recv_timeout(REPLY_TIMEOUT).ok();
         }
         self.control
@@ -456,7 +537,9 @@ impl WorkerRouter {
     pub fn send(&self, global: usize, cmd: WorkerCommand) {
         if let Some(li) = self.local_index(global) {
             if let Some(tx) = self.local_txs.get(li) {
-                let _ = tx.send(cmd);
+                if tx.try_send(cmd).is_err() {
+                    warn!("本地 worker {} 命令队列已满, 丢弃命令", global);
+                }
             }
             return;
         }
@@ -549,8 +632,11 @@ mod tests {
         });
         // 模拟本地 worker: 收到 CreateParticipant 后回 SDP answer
         std::thread::spawn(move || {
-            if let Ok(WorkerCommand::CreateParticipant { participant_id, reply_tx, .. }) =
-                crx.recv()
+            if let Ok(WorkerCommand::CreateParticipant {
+                participant_id,
+                reply_tx,
+                ..
+            }) = crx.recv()
             {
                 let _ = reply_tx.send(WorkerReply::SdpAnswer {
                     participant_id,

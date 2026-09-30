@@ -14,7 +14,7 @@
 6. [快速启动（单机）](#6-快速启动单机)
 7. [多 worker 横向扩展](#7-多-worker-横向扩展)
 8. [跨主机集群部署](#8-跨主机集群部署)
-9. [浏览器使用（demo）](#9-浏览器使用demo)
+9. [浏览器使用（RoomChatWeb）](#9-浏览器使用roomchatweb)
 10. [WHIP 推流接入（FFmpeg / GStreamer / OBS）](#10-whip-推流接入ffmpeg--gstreamer--obs)
 11. [信令协议（JSON）](#11-信令协议json)
 12. [媒体功能说明](#12-媒体功能说明)
@@ -29,7 +29,7 @@
 ```
                    ┌─────────────────────────────────────────────────────┐
    浏览器 / App ──ws/quic──► │ 信令层 (WS 5174 / QUIC 5173 / WHIP 5180)              │
-                   │   assign_worker() → 全局 worker 分配                  │
+                   │   assign_worker() → 按房间哈希分配全局 worker                │
                    └───────────────┬─────────────────────────────────────┘
                                    │ WorkerCommand (本地 channel / 跨主机 TCP 5400)
         ┌──────────────────────────┼──────────────────────────┐
@@ -44,7 +44,8 @@
 
 - **信令层**：WebSocket / QUIC 承载同一套 JSON 协议；WHIP 走 HTTP。
 - **Worker**：每 worker 一个线程 + 独立 UDP 媒体端口，独占 CPU 核（Share-Nothing），
-  内部跑 str0m（RTP mode）。同一房间可跨 worker/主机。
+  内部跑 str0m（RTP mode）。默认同房间同 worker；配置 `SFU_ROOM_WORKERS` 后
+  同一房间可跨 worker/主机。
 - **RelayHub**：跨 worker 媒体中继。进程内走 channel，跨主机走 UDP。
 - **ClusterControl**：跨主机时，信令通过 TCP 把命令路由到远端 worker。
 
@@ -150,6 +151,8 @@ sudo firewall-cmd --reload
 |---|---|---|
 | `SFU_ANNOUNCE_IP` | 自动探测 | **对外通告 IP**，写入 SDP/ICE host 候选。生产必须显式设置（客户端可达地址）。 |
 | `SFU_WORKERS` | `1` | worker 线程数（= 媒体端口数）。 |
+| `SFU_DEFAULT_WORKER` | 未设 | 可选覆盖：强制未配置房间全落该 worker（默认按房间 id 哈希固定到单个 worker）。 |
+| `SFU_ROOM_WORKERS` | 未设 | 房间级分片：`room=w1,w2;*=...`，配置多个 worker 后房间才跨 worker（单机多 worker / 多主机多 worker 都需配置）。 |
 | `SFU_WS_ADDR` | `0.0.0.0:5174` | WebSocket 信令绑定地址。 |
 | `SFU_MEDIA_ADDR` | `0.0.0.0:5175` | 媒体 UDP 绑定基地址。 |
 | `SFU_QUIC_ADDR` | `0.0.0.0:5173` | QUIC 信令地址；设 `0`/`off`/空 则禁用。 |
@@ -163,7 +166,7 @@ sudo firewall-cmd --reload
 | `SFU_RELAY_PEERS` | 未设 | `idx=host:port,...`，远端全局 worker → 对端 relay 地址。 |
 | `SFU_CONTROL_LISTEN` | 未设 | 本进程控制面 TCP 监听。 |
 | `SFU_CONTROL_PEERS` | 未设 | `idx=host:port,...`，远端全局 worker → 对端控制地址。 |
-| `RUST_LOG` | `info` | 日志级别，如 `info` / `sfu_server::core::worker=debug`。 |
+| `RUST_LOG` | `info` | 日志级别，如 `info` / `sfu_server::worker::event_loop=debug`。 |
 
 > 说明：`batch_size`(64)、`send_batch_size`(128)、`busy_poll_us`(0) 目前为编译期默认，无对应环境变量。
 
@@ -214,14 +217,28 @@ journalctl -u sfu-server -f
 
 ## 7. 多 worker 横向扩展
 
-- 单房间容量上限 = 单核。设置 `SFU_WORKERS=N` 后，**同一房间的参与者会 round-robin
-  分布到 N 个 worker**，跨 worker 的订阅经 `RelayHub`（进程内）自动中继，无需额外配置。
+**默认行为：按房间 id 哈希把每个房间固定到一个 worker**（同房间同 worker，
+不同房间自动分散到 `SFU_WORKERS` 个 worker 上）。这样单房间始终在单核内运行，
+行为可预测；多个房间天然负载均衡。也可用 `SFU_DEFAULT_WORKER` 强制未配置房间
+全部落到同一 worker。
+
+要让**单个房间**跨 worker，必须**显式配置该房间**（`SFU_ROOM_WORKERS`）：
+
+| 配置 | 含义 |
+|---|---|
+| `roomA=3` | roomA 全部参与者固定到全局 worker 3 |
+| `roomB=0,1,2,3` | roomB 参与者轮转分布到 worker 0..3（单机多 worker） |
+| `*=0,1,2,3` | 未单独配置的房间的兑底规则 |
+
+- 跨 worker 的订阅经 `RelayHub`（进程内）自动中继，无需其他配置。
 - 建议 `SFU_WORKERS` = 物理核数（每 worker 自 pin 一核）。
 - 媒体端口段相应扩大：`[base, base+N-1]`。
 
 ```bash
-SFU_ANNOUNCE_IP=192.168.1.10 SFU_WORKERS=8 ./target/release/sfu-server
-# 放行 UDP 5175-5182
+# 4 worker，房间按哈希自动分散；只有 roomB 额外跨 worker
+SFU_ANNOUNCE_IP=192.168.1.10 SFU_WORKERS=4 SFU_ROOM_WORKERS="roomB=0,1,2,3" \
+  ./target/release/sfu-server
+# 放行 UDP 5175-5178
 ```
 
 ---
@@ -240,6 +257,12 @@ SFU_ANNOUNCE_IP=192.168.1.10 SFU_WORKERS=8 ./target/release/sfu-server
 整集群 worker 用全局编号 `0..SFU_TOTAL_WORKERS`。每台主机的
 `[SFU_WORKER_OFFSET, SFU_WORKER_OFFSET + SFU_WORKERS)` 为本地编号。
 
+> **单房间跨主机需要配置房间**：`SFU_ROOM_WORKERS` 使用同一套全局编号。
+> 未配置的房间按房间 id 哈希落在某个全局 worker（也可能落在 Host B 上）；
+> 如果希望某个房间跨主机，需显式配置。例如 Host A 上配置
+> `SFU_ROOM_WORKERS="load=0,2"` 可让 load 房间在 Host A 的 worker0 与 Host B
+> 的 worker2 之间分布，媒体经跨主机 relay 中继。
+
 ### 8.3 示例：2 台主机 × 2 worker
 
 **Host A**（信令 + worker 0,1）：
@@ -248,6 +271,8 @@ SFU_SIGNALING=on
 SFU_WORKERS=2
 SFU_TOTAL_WORKERS=4
 SFU_WORKER_OFFSET=0
+# 只有 load 房间跨主机（全局 worker 0 与 2）；其余房间全在 worker 0
+SFU_ROOM_WORKERS=load=0,2
 SFU_ANNOUNCE_IP=10.0.0.1
 SFU_WS_ADDR=0.0.0.0:5174
 SFU_MEDIA_ADDR=0.0.0.0:5175
@@ -281,10 +306,10 @@ SFU_RELAY_PEERS=0=10.0.0.1:5390,1=10.0.0.1:5390
 
 ---
 
-## 9. 浏览器使用（demo）
+## 9. 浏览器使用（RoomChatWeb）
 
 ```bash
-cd demo
+cd RoomChatWeb
 npm install
 npm run dev        # 打开 http://localhost:5173
 ```
@@ -293,10 +318,10 @@ npm run dev        # 打开 http://localhost:5173
 1. **发布**：点「加入」→ 授摄像头/麦克风 → 发布。
 2. **订阅**：房间内其他人加入后，在侧栏点订阅。
 
-默认服务器地址在 `demo/src/components/JoinScreen.tsx`，可改为你的 SFU 地址后构建：
+默认服务器地址在 `RoomChatWeb/src/components/JoinScreen.tsx`，可改为你的 SFU 地址后构建：
 
 ```bash
-npm run build      # 产出 demo/dist 静态文件，用 nginx 托管
+npm run build      # 产出 RoomChatWeb/dist 静态文件，用 nginx 托管
 ```
 
 ---
@@ -465,7 +490,7 @@ WebSocket 与 QUIC 承载**完全相同**的 JSON 消息。一条连接可承载
 
 ```bash
 RUST_LOG=info ./target/release/sfu-server
-# 更详细: RUST_LOG=sfu_server::core::worker=debug
+# 更详细: RUST_LOG=sfu_server::worker::event_loop=debug
 ```
 
 关键日志：
@@ -481,7 +506,7 @@ RUST_LOG=info ./target/release/sfu-server
 | 客户端 ICE 连不上 | `SFU_ANNOUNCE_IP` 是否客户端可达；媒体 UDP 端口段是否放行 |
 | 有信令但无画面 | 检查媒体端口段防火墙；`announce_ip` 是否为真实网卡地址 |
 | 高并发丢包 | 执行 `scripts/sysctl-sfu.sh`；确认日志 `rcvbuf/sndbuf` 已变大 |
-| 单房间到 ~200 路劣化 | 提升 `SFU_WORKERS`（跨 worker 自动中继） |
+| 单房间到 ~200 路劣化 | 提升 `SFU_WORKERS` 并配置 `SFU_ROOM_WORKERS` 让该房间跨 worker（经 RelayHub 中继） |
 | FFmpeg WHIP 报编码错误 | whip muxer 视频**仅支持 H.264**，用 `libopenh264`/`libx264` |
 | 订阅无画面（WHIP 源） | 确认订阅 `--publisher <X-Participant-Id>:<amid>:<vmid>`，mid 见日志 |
 
