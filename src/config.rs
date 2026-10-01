@@ -51,6 +51,8 @@ pub struct SfuConfig {
     pub signaling: bool,
     /// WHIP 推流接入 HTTP 监听地址 (None = 禁用)
     pub whip_listen: Option<SocketAddr>,
+    /// WHEP 拉流接入 HTTP 监听地址 (None = 禁用)
+    pub whep_listen: Option<SocketAddr>,
     /// JWT 用户鉴权配置 (未配置密钥时禁用)
     pub jwt: JwtSettings,
 }
@@ -210,6 +212,9 @@ impl SfuConfig {
         let whip_listen = std::env::var("SFU_WHIP_ADDR")
             .ok()
             .and_then(|v| v.parse::<SocketAddr>().ok());
+        let whep_listen = std::env::var("SFU_WHEP_ADDR")
+            .ok()
+            .and_then(|v| v.parse::<SocketAddr>().ok());
         let signaling = match std::env::var("SFU_SIGNALING") {
             Ok(v) => {
                 !(v.is_empty()
@@ -243,6 +248,7 @@ impl SfuConfig {
             control_peers,
             signaling,
             whip_listen,
+            whep_listen,
             jwt,
         }
     }

@@ -82,6 +82,32 @@ impl WorkerRouter {
             .create_participant(global as u32, room_id, participant_id, sdp_offer)
     }
 
+    /// 查询发布者已发布的轨道 (mid, kind)，用于 WHEP 按发布者订阅。
+    pub fn publisher_tracks(
+        &self,
+        global: usize,
+        publisher_id: String,
+    ) -> Option<Vec<(String, String)>> {
+        if let Some(li) = self.local_index(global) {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let cmd = WorkerCommand::GetPublisherTracks {
+                publisher_id,
+                reply_tx: tx,
+            };
+            self.local_txs
+                .get(li)?
+                .send_timeout(cmd, CMD_SEND_TIMEOUT)
+                .ok()?;
+            return match rx.recv_timeout(REPLY_TIMEOUT).ok()? {
+                WorkerReply::PublisherTracks { tracks, .. } => Some(tracks),
+                _ => None,
+            };
+        }
+        self.control
+            .as_ref()?
+            .publisher_tracks(global as u32, publisher_id)
+    }
+
     /// 发送无需回复的命令。
     pub fn send(&self, global: usize, cmd: WorkerCommand) {
         if let Some(li) = self.local_index(global) {

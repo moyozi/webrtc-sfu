@@ -515,6 +515,9 @@ impl SignalingSession {
             Some(WorkerReply::Error { error, .. }) => {
                 self.send_error(Some(pc_id), ErrorCode::WorkerError, error);
             }
+            Some(_) => {
+                self.send_error(Some(pc_id), ErrorCode::Internal, "worker 返回了非预期响应");
+            }
             None => {
                 self.send_error(
                     Some(pc_id),

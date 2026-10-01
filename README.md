@@ -916,7 +916,9 @@ webrtc-sfu/
     │   ├── session.rs           ← 传输无关会话状态机 (WS/QUIC 共用)
     │   ├── server.rs            ← WebSocket 传输层
     │   ├── quic.rs              ← QUIC 传输层 (quinn) + 自签名证书
-    │   └── whip.rs              ← WHIP 推流接入 (HTTP)
+    │   ├── http.rs             ← WHIP/WHEP 共用 HTTP 原语 + SDP 工具
+    │   ├── whip.rs             ← WHIP 推流接入 (HTTP ingest)
+    │   └── whep.rs             ← WHEP 拉流接入 (HTTP egress)
     └── cluster/                 ← 控制面路由
         └── mod.rs               ← WorkerRouter: 本地 channel / 远端 gRPC
 ```
@@ -975,6 +977,8 @@ SFU_CONTROL_PEERS=2=10.0.0.2:5600,3=10.0.0.2:5600  # 远端全局 worker -> 其 
 
 # WHIP 推流接入 (FFmpeg/GStreamer/OBS 直推 WebRTC)
 SFU_WHIP_ADDR=0.0.0.0:5180    # WHIP HTTP 监听; 不设则不启用
+# WHEP 拉流接入 (浏览器/播放器)
+SFU_WHEP_ADDR=0.0.0.0:5181    # WHEP HTTP 监听; 不设则不启用
 SO_BUSY_POLL=50               # 内核忙轮询微秒数 (0=禁用)
 BATCH_SIZE=64                 # recvmmsg 批量大小
 ```
@@ -1028,6 +1032,32 @@ gst-launch-1.0 videotestsrc is-live=true ! video/x-raw,width=1280,height=720,fra
 | `POST` | `/whip?room=<房间>` | 提交 SDP offer，返回 `201` + SDP answer（含 SFU ICE 候选），响应头 `Location` / `X-Participant-Id` |
 | `PATCH` | `/whip/<id>` | trickle ICE (`application/trickle-ice-sdpfrag`) |
 | `DELETE` | `/whip/<id>` | 停止推流 |
+
+## 11.2 WHEP 拉流接入 (浏览器 / 播放器)
+
+WHEP 是 WHIP 的对称能力（e**g**ress）：启用 `SFU_WHEP_ADDR=0.0.0.0:5181`
+后，任意 WHEP 客户端可拉取某发布者的音视频。服务端把 WHEP 客户端当作普通
+**订阅者**：按客户端 offer 的 m-section 与发布者实际轨道按 kind 匹配后自动
+`subscribe`（无需客户端知道发布者的 mid）。
+
+```bash
+# 拉取 room=demo 中发布者 alice 的音视频
+curl -X POST -H 'Content-Type: application/sdp' \
+  --data-binary @offer.sdp \
+  "http://SFU_HOST:5181/whep?room=demo&publisher=alice"
+# 本仓库附带简易客户端 (str0m):
+#   cargo run --example whep_client -- --url http://SFU_HOST:5181 --room demo --publisher alice
+```
+
+**接口**（与 WHIP 对称）:
+| 方法 | 路径 | 作用 |
+|------|------|------|
+| `OPTIONS` | `/whep` | CORS / 能力探测 |
+| `POST` | `/whep?room=<房间>&publisher=<发布者>` | 提交 SDP offer（recvonly），返回 `201` + SDP answer，响应头 `Location` / `X-Participant-Id`；未知发布者返回 `404` |
+| `PATCH` | `/whep/<id>` | trickle ICE |
+| `DELETE` | `/whep/<id>` | 停止拉流 |
+
+> 启用 JWT 鉴权时，WHEP 同样需要 `Authorization: Bearer` 或 `?token=`。
 
 ---
 

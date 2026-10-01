@@ -78,7 +78,9 @@ pub fn command_to_proto(cmd: WorkerCommand) -> Option<pb::Command> {
             publisher_mid,
             rid: rid.map(|r| r.to_string()),
         }),
-        WorkerCommand::CreateParticipant { .. } | WorkerCommand::Shutdown => return None,
+        WorkerCommand::CreateParticipant { .. }
+        | WorkerCommand::GetPublisherTracks { .. }
+        | WorkerCommand::Shutdown => return None,
     };
     Some(pb::Command { kind: Some(kind) })
 }

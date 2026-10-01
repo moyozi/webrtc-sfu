@@ -15,10 +15,12 @@
 //! 连接仍由 Connection ID 标识而不断开, 信令无需重连即可恢复。
 
 pub mod auth;
+pub mod http;
 pub mod protocol;
 pub mod quic;
 pub mod server;
 pub mod session;
+pub mod whep;
 pub mod whip;
 
 use crate::cluster::WorkerRouter;
@@ -139,6 +141,13 @@ impl SignalingState {
     /// 发送无需回复的 worker 命令。
     pub fn send_worker(&self, global: usize, cmd: WorkerCommand) {
         self.router.send(global, cmd);
+    }
+
+    /// 查询发布者已发布的轨道 (mid, kind)。
+    pub fn publisher_tracks(&self, global: usize, publisher_id: String) -> Vec<(String, String)> {
+        self.router
+            .publisher_tracks(global, publisher_id)
+            .unwrap_or_default()
     }
 
     /// 查询参与者所在 worker (未知默认 0)。

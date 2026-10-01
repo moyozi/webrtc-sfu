@@ -134,6 +134,42 @@ impl GrpcControl {
             }
         }
     }
+
+    /// 同步查询发布者已发布的轨道 (mid, kind)。
+    pub fn publisher_tracks(
+        &self,
+        target: u32,
+        publisher_id: String,
+    ) -> Option<Vec<(String, String)>> {
+        let addr = *self.peers.get(&target)?;
+        let cache = self.client_cache.clone();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.runtime.spawn(async move {
+            let result = async {
+                let mut client = media_client(addr, &cache).await.ok()?;
+                let req = tonic::Request::new(pb::GetPublisherTracksRequest {
+                    target_worker: target,
+                    publisher_id,
+                });
+                let resp = tokio::time::timeout(RPC_TIMEOUT, client.get_publisher_tracks(req))
+                    .await
+                    .ok()?
+                    .ok()?
+                    .into_inner();
+                if resp.ok {
+                    Some(resp.tracks.into_iter().map(|t| (t.mid, t.kind)).collect())
+                } else {
+                    None
+                }
+            }
+            .await;
+            let _ = reply_tx.send(result);
+        });
+        reply_rx
+            .recv_timeout(RPC_TIMEOUT + Duration::from_secs(1))
+            .ok()
+            .flatten()
+    }
 }
 
 async fn media_client(

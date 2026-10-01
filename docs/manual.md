@@ -15,7 +15,7 @@
 7. [多 worker 横向扩展](#7-多-worker-横向扩展)
 8. [跨主机集群部署](#8-跨主机集群部署)
 9. [浏览器使用（RoomChatWeb）](#9-浏览器使用roomchatweb)
-10. [WHIP 推流接入（FFmpeg / GStreamer / OBS）](#10-whip-推流接入ffmpeg--gstreamer--obs)
+10. [WHIP 推流 / WHEP 拉流接入](#10-whip-推流--whep-拉流接入)
 11. [信令协议（JSON）](#11-信令协议json)
 12. [媒体功能说明](#12-媒体功能说明)
 13. [压测工具](#13-压测工具)
@@ -70,6 +70,7 @@
 | QUIC 信令 | UDP | 5173 | 否 | `SFU_QUIC_ADDR`；移动端优先 |
 | 媒体（RTP/RTCP/STUN/DTLS） | UDP | 5175 … 5175+N-1 | 是 | `SFU_MEDIA_ADDR`，N=`SFU_WORKERS` |
 | WHIP 推流接入 | TCP | 5180 | 按需 | `SFU_WHIP_ADDR` |
+| WHEP 拉流接入 | TCP | 5181 | 按需 | `SFU_WHEP_ADDR` |
 | 跨主机中继 | UDP | 5390 | 跨主机时 | `SFU_RELAY_LISTEN` |
 | 跨主机控制 | TCP | 5400 | 跨主机时 | `SFU_CONTROL_LISTEN` |
 
@@ -138,6 +139,7 @@ sudo firewall-cmd --permanent --add-port=5174/tcp     # WS
 sudo firewall-cmd --permanent --add-port=5173/udp     # QUIC
 sudo firewall-cmd --permanent --add-port=5175-5178/udp # 媒体段 (N=4)
 sudo firewall-cmd --permanent --add-port=5180/tcp     # WHIP
+sudo firewall-cmd --permanent --add-port=5181/tcp     # WHEP
 sudo firewall-cmd --reload
 ```
 
@@ -159,6 +161,7 @@ sudo firewall-cmd --reload
 | `SFU_BWE_INITIAL_BPS` | `1000000` | 订阅者侧 BWE 初始带宽（bit/s）。 |
 | `SFU_SOCK_BUF_MB` | `16` | 媒体 socket 收/发缓冲区目标（MB），受内核上限截断。 |
 | `SFU_WHIP_ADDR` | 未设 | WHIP 推流 HTTP 监听；不设则不启用。 |
+| `SFU_WHEP_ADDR` | 未设 | WHEP 拉流 HTTP 监听；不设则不启用。 |
 | `SFU_SIGNALING` | `on` | 本进程是否跑信令；worker-only 进程设 `off`。 |
 | `SFU_TOTAL_WORKERS` | `=SFU_WORKERS` | 整集群 worker 总数（全局编号 `0..total`）。 |
 | `SFU_WORKER_OFFSET` | `0` | 本进程 worker 的全局编号起始。 |
@@ -228,6 +231,7 @@ SFU_WS_ADDR=0.0.0.0:5174 \
 SFU_MEDIA_ADDR=0.0.0.0:5175 \
 SFU_QUIC_ADDR=0.0.0.0:5173 \
 SFU_WHIP_ADDR=0.0.0.0:5180 \
+SFU_WHEP_ADDR=0.0.0.0:5181 \
 RUST_LOG=info \
 ./target/release/sfu-server
 ```
@@ -240,6 +244,7 @@ UDP socket 缓冲区生效值 ... rcvbuf=33554432 sndbuf=33554432
 已启动 4 个 worker 线程, 监听 0.0.0.0:5175 (媒体端口范围 5175..5178), 对外通告 IP 192.168.1.10
 QUIC 信令服务器启动: quic://0.0.0.0:5173
 WHIP 推流接入监听: http://0.0.0.0:5180
+WHEP 拉流接入监听: http://0.0.0.0:5181
 ```
 
 ### systemd 服务
@@ -366,7 +371,7 @@ npm run build      # 产出 RoomChatWeb/dist 静态文件，用 nginx 托管
 
 ---
 
-## 10. WHIP 推流接入（FFmpeg / GStreamer / OBS）
+## 10. WHIP 推流 / WHEP 拉流接入
 
 启用：`SFU_WHIP_ADDR=0.0.0.0:5180`。推流者会被当作房间内的普通发布者，
 WebSocket 订阅者可直接订阅。
@@ -409,6 +414,25 @@ gst-launch-1.0 videotestsrc is-live=true ! \
 ### 10.3 OBS
 
 输出 → 添加「WHIP」→ 服务器填 `http://<SFU_IP>:5180/whip?room=demo`。
+
+### 10.4 WHEP 拉流接入（浏览器 / 播放器）
+
+启用：`SFU_WHEP_ADDR=0.0.0.0:5181`。WHEP 是 WHIP 的对称能力（egress）：
+客户端向 `POST /whep?room=<房间>&publisher=<发布者>` 提交 recvonly 的 SDP
+offer，服务端把该客户端当作普通**订阅者**，按 offer 的 m-section 与发布者
+实际轨道按 kind 匹配后自动 `subscribe`（客户端无需知道发布者的 mid）。
+
+```bash
+curl -X POST -H 'Content-Type: application/sdp' --data-binary @offer.sdp \
+  "http://<SFU_IP>:5181/whep?room=demo&publisher=alice"
+# 未知发布者 → 404; 缺 publisher / 空 SDP / 无 audio·video m-line → 400
+# 本仓库附带 str0m 验证客户端:
+#   cargo run --example whep_client -- --url http://<SFU_IP>:5181 --room demo --publisher alice
+```
+
+接口与 WHIP 对称：`OPTIONS /whep`、`POST /whep?room=&publisher=`、
+`PATCH /whep/{id}`（trickle ICE）、`DELETE /whep/{id}`。启用 JWT 时同样需要
+`Authorization: Bearer` 或 `?token=`。
 
 ### 10.4 WHIP 接口（RFC 9725 子集）
 

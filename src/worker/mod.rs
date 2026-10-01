@@ -84,6 +84,12 @@ pub enum WorkerCommand {
     /// 移除参与者
     RemoveParticipant { participant_id: String },
 
+    /// 查询发布者已发布的轨道 (WHEP 等“按发布者订阅”用)
+    GetPublisherTracks {
+        publisher_id: String,
+        reply_tx: Sender<WorkerReply>,
+    },
+
     /// 订阅发布者的轨道
     Subscribe {
         room_id: String,
@@ -141,6 +147,9 @@ pub enum WorkerReply {
         sdp_answer: String,
         local_candidates: Vec<String>,
     },
+
+    /// 发布者的已发布轨道: (mid, kind) 列表; kind 为 "audio"/"video"
+    PublisherTracks { tracks: Vec<(String, String)> },
 
     /// 错误
     Error {

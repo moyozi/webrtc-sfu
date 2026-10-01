@@ -132,6 +132,11 @@ pub(super) fn process_packet(
                                 "参与者 {} 发布媒体 mid={:?} kind={:?}",
                                 target_id, media.mid, media.kind
                             );
+                            participant.record_media_added(
+                                media.mid,
+                                media.kind,
+                                media.direction,
+                            );
                         }
                         str0m::Event::RtpPacket(pkt) => {
                             // RTP mode: 直接收集 RTP 包。优先用 RTP header 扩展里的

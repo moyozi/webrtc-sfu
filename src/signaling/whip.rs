@@ -25,26 +25,12 @@ use ahash::AHashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
-struct HttpRequest {
-    method: String,
-    target: String,
-    /// 头部 (键统一转小写)
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl HttpRequest {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
-    }
-}
+use super::http::{
+    inject_candidates, parse_candidates, parse_head, query_param, read_request, write_response,
+};
 
 struct WhipSession {
     participant_id: String,
@@ -55,173 +41,6 @@ struct WhipSession {
 /// 生成一个不会与 WS 侧冲突的 participant id。
 fn new_id(seq: u64) -> String {
     format!("whip-{}", seq)
-}
-
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-async fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
-    let header_end = loop {
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-            break pos + 4;
-        }
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            if buf.is_empty() {
-                return Ok(None);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "no header end",
-            ));
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.len() > 1 << 20 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "header too large",
-            ));
-        }
-    };
-
-    let head = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
-    let target = parts.next().unwrap_or_default().to_string();
-
-    let mut content_length = 0usize;
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for l in lines {
-        let Some((k, v)) = l.split_once(':') else {
-            continue;
-        };
-        let key = k.trim().to_ascii_lowercase();
-        let val = v.trim().to_string();
-        if key == "content-length" {
-            content_length = val.parse().unwrap_or(0);
-        }
-        headers.push((key, val));
-    }
-
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_length {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&tmp[..n]);
-    }
-    body.truncate(content_length);
-
-    Ok(Some(HttpRequest {
-        method,
-        target,
-        headers,
-        body,
-    }))
-}
-
-fn parse_head(req: &HttpRequest) -> (String, String) {
-    // 返回 (path, query)
-    let (path, query) = match req.target.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (req.target.clone(), String::new()),
-    };
-    (path, query)
-}
-
-fn query_param(query: &str, key: &str) -> Option<String> {
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key {
-                return Some(percent_decode(v));
-            }
-        }
-    }
-    None
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// 把 SFU 的 ICE 候选注入 SDP answer (WHIP 非 trickle 场景)。
-fn inject_candidates(sdp: &str, candidates: &[String]) -> String {
-    let mut out = String::with_capacity(sdp.len() + 128);
-    for line in sdp.lines() {
-        out.push_str(line);
-        out.push_str("\r\n");
-        if line.starts_with("a=ice-pwd:") {
-            for c in candidates {
-                out.push_str("a=");
-                out.push_str(c);
-                out.push_str("\r\n");
-            }
-        }
-    }
-    out
-}
-
-async fn write_response(
-    stream: &mut TcpStream,
-    status: &str,
-    content_type: &str,
-    extra: &[(&str, &str)],
-    body: &[u8],
-) -> io::Result<()> {
-    let mut head = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        status,
-        content_type,
-        body.len()
-    );
-    // CORS (浏览器 WHIP 客户端)
-    head.push_str("Access-Control-Allow-Origin: *\r\n");
-    head.push_str("Access-Control-Allow-Methods: POST, PATCH, DELETE, OPTIONS\r\n");
-    head.push_str("Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
-    for (k, v) in extra {
-        head.push_str(k);
-        head.push_str(": ");
-        head.push_str(v);
-        head.push_str("\r\n");
-    }
-    head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await
-}
-
-/// 从 trickle-ice SDP fragment 中提取 (mid, candidate)。
-fn parse_candidates(frag: &str) -> Vec<(Option<String>, String)> {
-    let mut out = Vec::new();
-    let mut cur_mid: Option<String> = None;
-    for line in frag.lines() {
-        if let Some(m) = line.strip_prefix("a=mid:") {
-            cur_mid = Some(m.trim().to_string());
-        } else if let Some(c) = line.strip_prefix("a=candidate:") {
-            out.push((cur_mid.clone(), format!("candidate:{}", c.trim())));
-        }
-    }
-    out
 }
 
 /// 启动 WHIP ingrest HTTP 服务。
@@ -377,6 +196,16 @@ async fn handle(
                         "text/plain",
                         &[],
                         error.as_bytes(),
+                    )
+                    .await
+                }
+                Some(_) => {
+                    write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "text/plain",
+                        &[],
+                        b"unexpected worker reply",
                     )
                     .await
                 }

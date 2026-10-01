@@ -314,6 +314,16 @@ fn main() {
         }));
     }
 
+    // WHEP 拉流接入 (浏览器/播放器)
+    if let Some(addr) = config.whep_listen {
+        let state = signaling_state.clone();
+        servers.push(rt.spawn(async move {
+            if let Err(e) = signaling::whep::run_server(addr, state).await {
+                error!("WHEP 信令服务器错误: {}", e);
+            }
+        }));
+    }
+
     rt.block_on(async move {
         tokio::select! {
             _ = futures_util::future::join_all(servers) => {

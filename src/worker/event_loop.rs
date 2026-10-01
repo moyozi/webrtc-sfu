@@ -17,7 +17,7 @@ use super::output::{drain_and_schedule, drive_due_timers};
 use super::packet::{handle_create_participant, process_packet, PendingRtp};
 use super::relay::{RelayControl, RelayedRtp};
 use super::timer::TimerWheel;
-use super::{WorkerCommand, WorkerConfig};
+use super::{WorkerCommand, WorkerConfig, WorkerReply};
 use crate::net::poll::Poll;
 use crate::net::udp::{RecvBatch, SendBatch, UdpSocket, MTU};
 use crate::sfu::participant::ParticipantTable;
@@ -28,7 +28,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use str0m::media::Mid;
+use str0m::media::{MediaKind, Mid};
 use tracing::{debug, error, info, warn};
 
 /// epoll 最长等待时间。
@@ -277,6 +277,27 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                     info!("参与者 {} 已移除", participant_id);
                 }
 
+                WorkerCommand::GetPublisherTracks {
+                    publisher_id,
+                    reply_tx,
+                } => {
+                    let reply = match table.get_mut(&publisher_id) {
+                        Some(p) => {
+                            let tracks = p
+                                .published_tracks()
+                                .into_iter()
+                                .map(|(mid, kind)| (mid.to_string(), kind_to_str(kind)))
+                                .collect();
+                            WorkerReply::PublisherTracks { tracks }
+                        }
+                        None => WorkerReply::Error {
+                            participant_id: publisher_id,
+                            error: "publisher 不存在".to_string(),
+                        },
+                    };
+                    let _ = reply_tx.try_send(reply);
+                }
+
                 WorkerCommand::Subscribe {
                     room_id: _,
                     subscriber_id,
@@ -463,6 +484,14 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
         }
     }
 }
+/// `MediaKind` → 协议字符串。
+fn kind_to_str(kind: MediaKind) -> String {
+    match kind {
+        MediaKind::Audio => "audio".to_string(),
+        MediaKind::Video => "video".to_string(),
+    }
+}
+
 /// 清空唤醒管道 (非阻塞读到 EAGAIN)。
 fn drain_wake(wake_rx: &UnixStream) {
     use std::io::Read;

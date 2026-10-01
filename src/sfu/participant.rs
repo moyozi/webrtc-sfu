@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use str0m::bwe::Bitrate;
 use str0m::format::PayloadParams;
-use str0m::media::{Mid, Pt, Rid};
+use str0m::media::{Direction, MediaKind, Mid, Pt, Rid};
 use str0m::rtp::{SeqNo, Ssrc};
 use tracing::{debug, info, warn};
 
@@ -114,6 +114,10 @@ pub struct Participant {
     /// 对每个订阅者每包只做一次 HashMap 查找。
     pub tx_tracks: AHashMap<Mid, TxTrack>,
 
+    /// 作为发布者: 已协商的入站媒体 (mid → kind)。仅记录 SFU 接收方向。
+    /// 供 WHEP 等“按发布者订阅”查询发布轨道。
+    published: AHashMap<Mid, MediaKind>,
+
     /// 带宽估计 (bit/s)。订阅者侧来自 `Event::EgressBitrateEstimate`。
     egress_bitrate: Option<u64>,
 
@@ -164,6 +168,7 @@ impl Participant {
             next_ssrc: 1000,
             rx_layers: AHashMap::new(),
             tx_tracks: AHashMap::new(),
+            published: AHashMap::new(),
             egress_bitrate: None,
             // 置为「久远以前」，使首个包即可应用 desired bitrate。
             last_desired_update: now - DESIRED_BITRATE_INTERVAL,
@@ -283,6 +288,23 @@ impl Participant {
         } else {
             false
         }
+    }
+
+    /// 记录 `Event::MediaAdded`: 仅保留 SFU 接收方向 (发布者轨道)。
+    ///
+    /// 发布者 (sendonly) 在 SFU 侧为 RecvOnly; 订阅者 (recvonly) 为 SendOnly。
+    /// 重协商移除/改变方向时同步删除。
+    pub fn record_media_added(&mut self, mid: Mid, kind: MediaKind, direction: Direction) {
+        if matches!(direction, Direction::RecvOnly | Direction::SendRecv) {
+            self.published.insert(mid, kind);
+        } else {
+            self.published.remove(&mid);
+        }
+    }
+
+    /// 已发布的 (mid, kind) 列表 (仅发布者轨道)。
+    pub fn published_tracks(&self) -> Vec<(Mid, MediaKind)> {
+        self.published.iter().map(|(m, k)| (*m, *k)).collect()
     }
 
     /// 查找入站 PT 对应的 PayloadParams (含 RTX)。
