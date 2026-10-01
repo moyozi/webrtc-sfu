@@ -18,6 +18,7 @@
 //! 支持: `OPTIONS`(CORS) / `POST /whip?room=...`(建流) /
 //! `PATCH /whip/{id}`(trickle ICE) / `DELETE /whip/{id}`(停止)。
 
+use crate::signaling::auth::extract_token;
 use crate::signaling::SignalingState;
 use crate::worker::WorkerCommand;
 use ahash::AHashMap;
@@ -31,7 +32,18 @@ use tracing::{info, warn};
 struct HttpRequest {
     method: String,
     target: String,
+    /// 头部 (键统一转小写)
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+impl HttpRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 struct WhipSession {
@@ -83,14 +95,17 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>>
     let target = parts.next().unwrap_or_default().to_string();
 
     let mut content_length = 0usize;
+    let mut headers: Vec<(String, String)> = Vec::new();
     for l in lines {
-        if let Some(v) = l
-            .split_once(':')
-            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-            .map(|(_, v)| v)
-        {
-            content_length = v.trim().parse().unwrap_or(0);
+        let Some((k, v)) = l.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let val = v.trim().to_string();
+        if key == "content-length" {
+            content_length = val.parse().unwrap_or(0);
         }
+        headers.push((key, val));
     }
 
     let mut body = buf[header_end..].to_vec();
@@ -106,6 +121,7 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>>
     Ok(Some(HttpRequest {
         method,
         target,
+        headers,
         body,
     }))
 }
@@ -248,8 +264,44 @@ async fn handle(
     let method = req.method.clone();
     let (path, query) = parse_head(&req);
 
+    // OPTIONS 为 CORS 预检, 不携带业务鉴权信息, 放行。
+    if method == "OPTIONS" {
+        return write_response(&mut stream, "204 No Content", "text/plain", &[], b"").await;
+    }
+
+    // 启用鉴权时, POST/PATCH/DELETE 均需携带有效 JWT。
+    let auth = state.auth.clone();
+    if auth.is_enabled() {
+        let token = extract_token(req.header("authorization"), Some(query.as_str()));
+        let verified = token.as_deref().map(|t| auth.verify(t));
+        match verified {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => {
+                warn!("WHIP 鉴权失败: {}", e);
+                return write_response(
+                    &mut stream,
+                    "401 Unauthorized",
+                    "text/plain",
+                    &[],
+                    e.as_bytes(),
+                )
+                .await;
+            }
+            None if auth.is_required() => {
+                return write_response(
+                    &mut stream,
+                    "401 Unauthorized",
+                    "text/plain",
+                    &[],
+                    b"missing bearer token",
+                )
+                .await;
+            }
+            None => {}
+        }
+    }
+
     match method.as_str() {
-        "OPTIONS" => write_response(&mut stream, "204 No Content", "text/plain", &[], b"").await,
         "POST" if path == "/whip" => {
             let room = query_param(&query, "room").unwrap_or_else(|| "default".to_string());
             let sdp_offer = String::from_utf8_lossy(&req.body).to_string();

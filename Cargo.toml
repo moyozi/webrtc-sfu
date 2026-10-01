@@ -45,6 +45,9 @@ parking_lot = "0.12.5"
 ahash = "0.8.12"
 # 固定容量栈上数组 (recv/send 批量 iov 不再每轮堆分配)
 arrayvec = "0.7.8"
+jsonwebtoken = "9"
+tonic = "0.12"
+prost = "0.13"
 
 [profile.release]
 opt-level = 3
@@ -52,3 +55,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[build-dependencies]
+tonic-build = "0.12"

@@ -14,6 +14,7 @@
 //! (`session.rs`)。QUIC 天然支持连接迁移: 移动端从 WiFi 切到蜂窝时 IP 变化,
 //! 连接仍由 Connection ID 标识而不断开, 信令无需重连即可恢复。
 
+pub mod auth;
 pub mod protocol;
 pub mod quic;
 pub mod server;
@@ -21,6 +22,7 @@ pub mod session;
 pub mod whip;
 
 use crate::cluster::WorkerRouter;
+use crate::signaling::protocol::ParticipantInfo;
 use crate::worker::{WorkerCommand, WorkerReply};
 use ahash::AHashMap;
 use parking_lot::Mutex;
@@ -57,12 +59,14 @@ pub struct SignalingState {
     pub senders: Mutex<AHashMap<String, mpsc::Sender<String>>>,
     /// participant_id → worker_idx (用于订阅时定位发布者所在 worker)
     pub participant_worker: Mutex<AHashMap<String, usize>>,
+    /// JWT 用户鉴权 (未配置密钥时整体禁用)。
+    pub auth: Arc<auth::Authenticator>,
 }
 
 /// 房间信息 (信令层)
 #[derive(Debug)]
 pub struct RoomInfo {
-    pub participants: Vec<String>,
+    pub participants: Vec<ParticipantInfo>,
 }
 
 impl SignalingState {
@@ -71,6 +75,7 @@ impl SignalingState {
         total_workers: u32,
         room_workers: HashMap<String, Vec<u32>>,
         default_worker: Option<u32>,
+        auth: Arc<auth::Authenticator>,
     ) -> Self {
         let total = total_workers.max(1);
         let room_workers = room_workers
@@ -93,6 +98,7 @@ impl SignalingState {
             rooms: Mutex::new(AHashMap::new()),
             senders: Mutex::new(AHashMap::new()),
             participant_worker: Mutex::new(AHashMap::new()),
+            auth,
         }
     }
 
@@ -149,17 +155,22 @@ impl SignalingState {
         self.participant_worker.lock().remove(participant_id);
     }
 
-    /// 加入房间
+    /// 加入房间 (发布者; 默认音频/视频均开启)。
     pub fn join_room(&self, room_id: &str, participant_id: &str) {
         let mut rooms = self.rooms.lock();
-        let room = rooms
-            .entry(room_id.to_string())
-            .or_insert_with(|| RoomInfo {
-                participants: Vec::new(),
+        let room = rooms.entry(room_id.to_string()).or_insert_with(|| RoomInfo {
+            participants: Vec::new(),
+        });
+        if !room
+            .participants
+            .iter()
+            .any(|p| p.participant_id == participant_id)
+        {
+            room.participants.push(ParticipantInfo {
+                participant_id: participant_id.to_string(),
+                audio_enabled: true,
+                video_enabled: true,
             });
-        let pid = participant_id.to_string();
-        if !room.participants.contains(&pid) {
-            room.participants.push(pid);
         }
     }
 
@@ -169,7 +180,8 @@ impl SignalingState {
             let mut rooms = self.rooms.lock();
             match rooms.get_mut(room_id) {
                 Some(room) => {
-                    room.participants.retain(|p| p != participant_id);
+                    room.participants
+                        .retain(|p| p.participant_id != participant_id);
                     if room.participants.is_empty() {
                         rooms.remove(room_id);
                         true
@@ -186,19 +198,46 @@ impl SignalingState {
         }
     }
 
-    /// 获取房间内其他参与者
+    /// 获取房间内其他参与者的 id (排除指定参与者)
+    #[allow(dead_code)]
     pub fn room_participants(&self, room_id: &str, exclude: &str) -> Vec<String> {
-        let rooms = self.rooms.lock();
-        rooms
+        self.room_roster(room_id)
+            .into_iter()
+            .filter(|p| p.participant_id != exclude)
+            .map(|p| p.participant_id)
+            .collect()
+    }
+
+    /// 获取房间成员快照 (含自己, 若在房间内)。
+    pub fn room_roster(&self, room_id: &str) -> Vec<ParticipantInfo> {
+        self.rooms
+            .lock()
             .get(room_id)
-            .map(|r| {
-                r.participants
-                    .iter()
-                    .filter(|p| p.as_str() != exclude)
-                    .cloned()
-                    .collect()
-            })
+            .map(|r| r.participants.clone())
             .unwrap_or_default()
+    }
+
+    /// 更新成员媒体状态, 返回更新后的快照 (不在房间内则返回 None)。
+    pub fn update_media(
+        &self,
+        room_id: &str,
+        participant_id: &str,
+        audio_enabled: Option<bool>,
+        video_enabled: Option<bool>,
+    ) -> Option<ParticipantInfo> {
+        let mut rooms = self.rooms.lock();
+        let participant = rooms
+            .get_mut(room_id)?
+            .participants
+            .iter_mut()
+            .find(|p| p.participant_id == participant_id)?;
+        if let Some(a) = audio_enabled {
+            participant.audio_enabled = a;
+        }
+        if let Some(v) = video_enabled {
+            participant.video_enabled = v;
+        }
+        Some(participant.clone())
     }
 
     /// 注册信令消息发送器 (WebSocket / QUIC 通用)
@@ -220,8 +259,8 @@ impl SignalingState {
                 .map(|r| {
                     r.participants
                         .iter()
-                        .filter(|p| p.as_str() != exclude)
-                        .cloned()
+                        .filter(|p| p.participant_id != exclude)
+                        .map(|p| p.participant_id.clone())
                         .collect()
                 })
                 .unwrap_or_default()

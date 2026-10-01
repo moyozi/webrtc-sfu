@@ -162,13 +162,53 @@ sudo firewall-cmd --reload
 | `SFU_SIGNALING` | `on` | 本进程是否跑信令；worker-only 进程设 `off`。 |
 | `SFU_TOTAL_WORKERS` | `=SFU_WORKERS` | 整集群 worker 总数（全局编号 `0..total`）。 |
 | `SFU_WORKER_OFFSET` | `0` | 本进程 worker 的全局编号起始。 |
-| `SFU_RELAY_LISTEN` | 未设 | 本进程 relay UDP 监听（跨主机媒体中继）。 |
-| `SFU_RELAY_PEERS` | 未设 | `idx=host:port,...`，远端全局 worker → 对端 relay 地址。 |
-| `SFU_CONTROL_LISTEN` | 未设 | 本进程控制面 TCP 监听。 |
-| `SFU_CONTROL_PEERS` | 未设 | `idx=host:port,...`，远端全局 worker → 对端控制地址。 |
+| `SFU_CONTROL_LISTEN` | 未设 | 本进程 `MediaControl` gRPC 监听（信令 → 远端 worker 命令）。 |
+| `SFU_CONTROL_PEERS` | 未设 | `idx=host:port,...`，远端全局 worker → 其 gRPC 地址。 |
+| `SFU_RELAY_LISTEN` | 未设 | 本机收发跨主机中继 RTP 的 UDP 端点。 |
+| `SFU_RELAY_PEERS` | 未设 | `idx=host:port,...`，远端全局 worker → 对端中继 UDP 地址。 |
+| `SFU_JWT_SECRET` | 未设 | JWT HMAC 对称密钥（HS256/384/512）。配置后默认强制鉴权。 |
+| `SFU_JWT_PUBLIC_KEY` / `SFU_JWT_PUBLIC_KEY_FILE` | 未设 | JWT 非对称公钥 PEM（RS/ES/EdDSA），与 `SFU_JWT_SECRET` 二选一。 |
+| `SFU_JWT_ALGORITHM` | 按密钥推断 | JWT 算法，如 `HS256` / `RS256`。 |
+| `SFU_JWT_ISSUER` / `SFU_JWT_AUDIENCE` | 未设 | 校验 `iss` / `aud`。 |
+| `SFU_JWT_REQUIRED` | 配置密钥后 `on` | 是否强制所有 join 携带有效 token；`off` = 有 token 才校验。 |
 | `RUST_LOG` | `info` | 日志级别，如 `info` / `sfu_server::worker::event_loop=debug`。 |
 
 > 说明：`batch_size`(64)、`send_batch_size`(128)、`busy_poll_us`(0) 目前为编译期默认，无对应环境变量。
+
+### 5.1 信令 → 媒体：控制面 gRPC
+
+信令进程与 worker 进程可分离（worker-only 进程设 `SFU_SIGNALING=off`）。
+信令对远端 worker 的命令通道由自研 TCP 改为 **gRPC**
+（`proto/sfu.proto` 的 `MediaControl`），媒体面仍走 UDP。
+
+`CreateParticipant` 为同步 RPC（返回 SDP answer），其余命令 fire-and-forget
+（`SendCommand`）。跨主机媒体中继 RTP 按 `SFU_RELAY_PEERS` 点对点 UDP 直连。
+
+> 构建需安装 `protoc`（编译 `proto/sfu.proto`）。
+
+### 5.2 JWT 用户鉴权
+
+默认不开启。一旦配置 `SFU_JWT_SECRET` 或 `SFU_JWT_PUBLIC_KEY`，服务默认强制
+校验，未携带 / 无效 token 的连接无法创建参与者。
+
+```bash
+SFU_JWT_SECRET='<强密钥>' ./target/release/sfu-server
+# 生成测试 token:
+SFU_JWT_SECRET='<强密钥>' ./scripts/gen-jwt.sh alice room-1 publisher 3600
+```
+
+token 传递位置：
+
+| 传输 | 携带方式 |
+|---|---|
+| WebSocket | 请求头 `Authorization: Bearer <jwt>` 或 `?token=<jwt>` |
+| QUIC | `join` 消息的 `token` 字段（QUIC 无 HTTP 头） |
+| WHIP | 请求头 `Authorization: Bearer <jwt>` 或 `?token=<jwt>` |
+
+claims 约定：`sub`（必填，用户 ID，发布者 `participant_id` 必须等于它，
+订阅者必须为 `<sub>-recv-<publisherId>`）、`exp`（必填，Unix 秒）、
+`room` / `role`（可选，限定房间 / 角色：`role=subscriber` 只能订阅，
+`publisher` 或省略则既可发布也可订阅）。鉴权失败返回 401；密钥不会写入日志。
 
 ---
 
@@ -390,22 +430,38 @@ WebSocket 与 QUIC 承载**完全相同**的 JSON 消息。一条连接可承载
 
 | `type` | 字段 | 说明 |
 |---|---|---|
-| `join` | `pc_id`, `room_id`, `participant_id`, `sdp`, `role?` | 建立发布/订阅连接。`role`=`publisher`(默认)/`subscriber` |
+| `hello` | `protocol_version?`, `client?` | 可选握手；服务端回 `welcome` |
+| `ping` | `t?` | 应用层心跳；服务端回 `pong` |
+| `join` | `pc_id`, `room_id`, `participant_id`, `sdp`, `role?`, `token?` | 建立发布/订阅连接。`role`=`publisher`(默认)/`subscriber` |
 | `ice_candidate` | `pc_id`, `candidate`, `sdp_mid?`, `sdp_mline_index?` | trickle ICE |
 | `subscribe` | `pc_id`, `publisher_id`, `track_mid`, `subscriber_mid?` | 订阅某发布者轨道 |
 | `unsubscribe` | `pc_id`, `publisher_id`, `track_mid` | 取消订阅 |
+| `update_media` | `pc_id`, `audio_enabled?`, `video_enabled?` | 静音/关摄像头，广播给房间内其他人 |
+| `get_room_state` | `room_id?` | 请求房间成员快照（重连/刷新） |
 | `leave` | `pc_id` | 离开 |
 
 ### 11.2 服务端 → 客户端
 
 | `type` | 字段 | 说明 |
 |---|---|---|
-| `sdp_answer` | `pc_id`, `sdp`, `ice_candidates[]` | SDP 应答 + SFU ICE 候选 |
-| `ice_candidate` | `pc_id`, `candidate`, `sdp_mid?` | 服务端候选（trickle） |
-| `participant_joined` | `participant_id` | 房间新人加入 |
+| `welcome` | `protocol_version`, `server`, `features[]` | 握手回复（协议版本/能力集） |
+| `pong` | `t?` | 心跳回复 |
+| `sdp_answer` | `pc_id`, `sdp`, `ice_candidates[]` | SDP 应答 + SFU ICE 候选（内联） |
+| `joined` | `pc_id`, `participant_id`, `room_id`, `role`, `participants[]` | `join` 确认 + 成员快照 |
+| `left` | `pc_id` | `leave` 确认 |
+| `participant_joined` | `participant_id` | 房间新人加入（对 `joined.participants` 去重） |
 | `participant_left` | `participant_id` | 有人离开 |
-| `subscribed` | `pc_id`, `publisher_id` | 订阅已受理 |
-| `error` | `pc_id?`, `error` | 错误 |
+| `participant_updated` | `participant_id`, `audio_enabled`, `video_enabled` | 成员媒体状态变化 |
+| `subscribed` | `pc_id`, `publisher_id`, `track_mid` | 订阅已受理 |
+| `unsubscribed` | `pc_id`, `publisher_id`, `track_mid` | 取消订阅确认 |
+| `room_state` | `room_id`, `participants[]` | 成员快照（响应 `get_room_state`） |
+| `error` | `pc_id?`, `code`, `error` | 错误（`code` 见下） |
+
+`code` 取值：`bad_request` / `unauthorized` / `not_joined` / `already_joined` /
+`unknown_session` / `worker_error` / `worker_unavailable` / `unsupported_protocol` / `internal`。
+
+> 说明：SFU 的 ICE 候选为**单端口 host 候选**，直接内联在 `sdp_answer.ice_candidates` 中，
+> 当前不发送服务端 trickle `ice_candidate`。
 
 ### 11.3 `pc_id` 约定
 

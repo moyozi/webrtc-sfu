@@ -137,7 +137,8 @@ async fn handle_connection(
     let session_state = state.clone();
     let peer_str = peer.to_string();
     let session_task = tokio::spawn(async move {
-        session::run_session(session_state, msg_tx, inbound_rx, peer_str, "quic").await;
+        // QUIC 无 HTTP 头, token 由 join 消息的 `token` 字段携带。
+        session::run_session(session_state, msg_tx, inbound_rx, peer_str, "quic", None).await;
     });
 
     // 接收循环

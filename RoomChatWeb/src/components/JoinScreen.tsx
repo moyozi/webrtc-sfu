@@ -1,7 +1,7 @@
 import { createSignal } from "solid-js";
 
 interface JoinScreenProps {
-  onJoin: (serverUrl: string, roomId: string, name: string) => void;
+  onJoin: (serverUrl: string, roomId: string, name: string, token: string) => void;
 }
 
 /** 随机生成一个昵称, 例如 user-7f3k2a */
@@ -16,6 +16,7 @@ export default function JoinScreen(props: JoinScreenProps) {
   const [serverUrl, setServerUrl] = createSignal("ws://192.168.31.112:5174");
   const [roomId, setRoomId] = createSignal("room-1");
   const [name, setName] = createSignal(randomName());
+  const [token, setToken] = createSignal("");
   const [error, setError] = createSignal("");
   const [joining, setJoining] = createSignal(false);
 
@@ -27,7 +28,7 @@ export default function JoinScreen(props: JoinScreenProps) {
     }
     setError("");
     setJoining(true);
-    props.onJoin(serverUrl(), roomId().trim(), n);
+    props.onJoin(serverUrl(), roomId().trim(), n, token().trim());
   };
 
   return (
@@ -69,6 +70,19 @@ export default function JoinScreen(props: JoinScreenProps) {
               class="input input-bordered input-sm w-full"
               value={roomId()}
               onInput={(e) => setRoomId(e.currentTarget.value)}
+            />
+          </label>
+
+          <label class="form-control w-full mb-3">
+            <div class="label py-1">
+              <span class="label-text text-xs">鉴权 Token（可选）</span>
+            </div>
+            <input
+              type="password"
+              class="input input-bordered input-sm w-full"
+              value={token()}
+              onInput={(e) => setToken(e.currentTarget.value)}
+              placeholder="服务端启用 JWT 鉴权时填写"
             />
           </label>
 

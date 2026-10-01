@@ -19,7 +19,10 @@
 //!
 //! 所有消息通过 `pc_id` 路由到对应的参与者/Rtc 实例。
 
-use crate::signaling::protocol::{SignalingMessage, SignalingResponse};
+use crate::signaling::auth::Claims;
+use crate::signaling::protocol::{
+    ErrorCode, ParticipantInfo, SignalingMessage, SignalingResponse, PROTOCOL_VERSION, SERVER_NAME,
+};
 use crate::signaling::SignalingState;
 use crate::worker::{WorkerCommand, WorkerReply};
 use ahash::AHashMap;
@@ -49,6 +52,9 @@ pub struct SignalingSession {
     peer: String,
     /// 传输类型: "websocket" / "quic" (日志用)
     transport: &'static str,
+    /// 已通过鉴权的 JWT claims (启用鉴权时非空)。
+    /// 连接级别: 握手阶段 (WS/WHIP) 预校验的 claims 在此建立。
+    claims: Option<Claims>,
     /// 发送队列是否已满 (客户端读取过慢) — 置位后由 `run_session` 结束连接。
     overflow: bool,
 }
@@ -59,6 +65,7 @@ impl SignalingSession {
         msg_tx: mpsc::Sender<String>,
         peer: String,
         transport: &'static str,
+        claims: Option<Claims>,
     ) -> Self {
         Self {
             state,
@@ -66,6 +73,7 @@ impl SignalingSession {
             sessions: AHashMap::new(),
             peer,
             transport,
+            claims,
             overflow: false,
         }
     }
@@ -85,6 +93,15 @@ impl SignalingSession {
         }
     }
 
+    /// 发送一个带错误码的 `error` 响应。
+    fn send_error(&mut self, pc_id: Option<String>, code: ErrorCode, error: impl Into<String>) {
+        self.send(SignalingResponse::Error {
+            pc_id,
+            code,
+            error: error.into(),
+        });
+    }
+
     /// 该会话是否因发送队列溢出而应关闭。
     pub fn overflowed(&self) -> bool {
         self.overflow
@@ -101,22 +118,47 @@ impl SignalingSession {
                     "JSON 解析失败: {}",
                     e
                 );
-                self.send(SignalingResponse::Error {
-                    pc_id: None,
-                    error: format!("JSON 解析失败: {}", e),
-                });
+                self.send_error(
+                    None,
+                    ErrorCode::BadRequest,
+                    format!("JSON 解析失败: {}", e),
+                );
                 return;
             }
         };
 
         match signal {
+            SignalingMessage::Hello {
+                protocol_version,
+                client,
+            } => self.on_hello(protocol_version, client),
+
+            SignalingMessage::Ping { t } => self.send(SignalingResponse::Pong { t }),
+
             SignalingMessage::Join {
                 pc_id,
                 room_id,
                 participant_id,
                 sdp,
                 role,
+                token,
             } => {
+                if self.sessions.contains_key(&pc_id) {
+                    self.send_error(Some(pc_id), ErrorCode::AlreadyJoined, "该 pc_id 已加入");
+                    return;
+                }
+                if let Err(error) =
+                    self.authenticate_join(token.as_deref(), &room_id, &participant_id, &role)
+                {
+                    warn!(
+                        transport = self.transport,
+                        peer = %self.peer,
+                        "鉴权失败: {}",
+                        error
+                    );
+                    self.send_error(Some(pc_id), ErrorCode::Unauthorized, error);
+                    return;
+                }
                 self.on_join(pc_id, room_id, participant_id, sdp, role)
                     .await
             }
@@ -127,15 +169,24 @@ impl SignalingSession {
                 sdp_mid,
                 ..
             } => {
-                if let Some(sess) = self.sessions.get(&pc_id) {
-                    self.state.send_worker(
-                        sess.worker_idx,
+                let target = self
+                    .sessions
+                    .get(&pc_id)
+                    .map(|s| (s.worker_idx, s.participant_id.clone()));
+                match target {
+                    Some((worker_idx, participant_id)) => self.state.send_worker(
+                        worker_idx,
                         WorkerCommand::AddRemoteCandidate {
-                            participant_id: sess.participant_id.clone(),
+                            participant_id,
                             candidate,
                             sdp_mid,
                         },
-                    );
+                    ),
+                    None => self.send_error(
+                        Some(pc_id),
+                        ErrorCode::UnknownSession,
+                        "未知 pc_id, 请先 join",
+                    ),
                 }
             }
 
@@ -145,24 +196,38 @@ impl SignalingSession {
                 track_mid,
                 subscriber_mid,
             } => {
-                if let Some(sess) = self.sessions.get(&pc_id) {
-                    let publisher_worker = self.state.worker_of(&publisher_id);
-                    self.state.send_worker(
-                        sess.worker_idx,
-                        WorkerCommand::Subscribe {
-                            room_id: sess.room_id.clone(),
-                            subscriber_id: sess.participant_id.clone(),
-                            publisher_id: publisher_id.clone(),
-                            publisher_mid: track_mid,
-                            subscriber_mid,
-                            publisher_worker,
-                        },
-                    );
-
-                    self.send(SignalingResponse::Subscribed {
-                        pc_id,
-                        publisher_id,
-                    });
+                let target = self.sessions.get(&pc_id).map(|s| {
+                    (
+                        s.worker_idx,
+                        s.room_id.clone(),
+                        s.participant_id.clone(),
+                    )
+                });
+                match target {
+                    Some((worker_idx, room_id, subscriber_id)) => {
+                        let publisher_worker = self.state.worker_of(&publisher_id);
+                        self.state.send_worker(
+                            worker_idx,
+                            WorkerCommand::Subscribe {
+                                room_id,
+                                subscriber_id,
+                                publisher_id: publisher_id.clone(),
+                                publisher_mid: track_mid.clone(),
+                                subscriber_mid,
+                                publisher_worker,
+                            },
+                        );
+                        self.send(SignalingResponse::Subscribed {
+                            pc_id,
+                            publisher_id,
+                            track_mid,
+                        });
+                    }
+                    None => self.send_error(
+                        Some(pc_id),
+                        ErrorCode::UnknownSession,
+                        "未知 pc_id, 请先 join",
+                    ),
                 }
             }
 
@@ -171,25 +236,170 @@ impl SignalingSession {
                 publisher_id,
                 track_mid,
             } => {
-                if let Some(sess) = self.sessions.get(&pc_id) {
-                    let publisher_worker = self.state.worker_of(&publisher_id);
-                    self.state.send_worker(
-                        sess.worker_idx,
-                        WorkerCommand::Unsubscribe {
-                            subscriber_id: sess.participant_id.clone(),
+                let target = self
+                    .sessions
+                    .get(&pc_id)
+                    .map(|s| (s.worker_idx, s.participant_id.clone()));
+                match target {
+                    Some((worker_idx, subscriber_id)) => {
+                        let publisher_worker = self.state.worker_of(&publisher_id);
+                        self.state.send_worker(
+                            worker_idx,
+                            WorkerCommand::Unsubscribe {
+                                subscriber_id,
+                                publisher_id: publisher_id.clone(),
+                                publisher_mid: track_mid.clone(),
+                                publisher_worker,
+                            },
+                        );
+                        self.send(SignalingResponse::Unsubscribed {
+                            pc_id,
                             publisher_id,
-                            publisher_mid: track_mid,
-                            publisher_worker,
-                        },
-                    );
+                            track_mid,
+                        });
+                    }
+                    None => self.send_error(
+                        Some(pc_id),
+                        ErrorCode::UnknownSession,
+                        "未知 pc_id, 请先 join",
+                    ),
                 }
             }
+
+            SignalingMessage::UpdateMedia {
+                pc_id,
+                audio_enabled,
+                video_enabled,
+            } => self.on_update_media(pc_id, audio_enabled, video_enabled),
+
+            SignalingMessage::GetRoomState { room_id } => self.on_get_room_state(room_id),
 
             SignalingMessage::Leave { pc_id } => {
                 if let Some(sess) = self.sessions.remove(&pc_id) {
                     cleanup_session(&self.state, &sess);
+                    self.send(SignalingResponse::Left { pc_id });
+                } else {
+                    self.send_error(Some(pc_id), ErrorCode::UnknownSession, "未知 pc_id");
                 }
             }
+        }
+    }
+
+    /// 处理 `hello`: 协商协议版本并返回服务端能力。
+    fn on_hello(&mut self, protocol_version: Option<u32>, _client: Option<String>) {
+        if let Some(v) = protocol_version {
+            if v > PROTOCOL_VERSION {
+                self.send_error(
+                    None,
+                    ErrorCode::UnsupportedProtocol,
+                    format!("不支持的协议版本 {} (服务端 {})", v, PROTOCOL_VERSION),
+                );
+                return;
+            }
+        }
+        let mut features: Vec<String> = ["heartbeat", "join_ack", "room_state", "media_state"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if self.state.auth.is_enabled() {
+            features.push("jwt".to_string());
+        }
+        self.send(SignalingResponse::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            server: SERVER_NAME.to_string(),
+            features,
+        });
+    }
+
+    /// 处理 `update_media`: 更新发布者媒体状态 (静音/关摄像头) 并广播给房间其他人。
+    fn on_update_media(
+        &mut self,
+        pc_id: String,
+        audio_enabled: Option<bool>,
+        video_enabled: Option<bool>,
+    ) {
+        if audio_enabled.is_none() && video_enabled.is_none() {
+            return;
+        }
+        let target = self.sessions.get(&pc_id).map(|s| {
+            (
+                s.room_id.clone(),
+                s.participant_id.clone(),
+                s.is_publisher,
+            )
+        });
+        let Some((room_id, participant_id, is_publisher)) = target else {
+            self.send_error(
+                Some(pc_id),
+                ErrorCode::UnknownSession,
+                "未知 pc_id, 请先 join",
+            );
+            return;
+        };
+        if !is_publisher {
+            return;
+        }
+        if let Some(info) =
+            self.state
+                .update_media(&room_id, &participant_id, audio_enabled, video_enabled)
+        {
+            let notify = serde_json::to_string(&SignalingResponse::ParticipantUpdated {
+                participant_id: info.participant_id,
+                audio_enabled: info.audio_enabled,
+                video_enabled: info.video_enabled,
+            })
+            .unwrap();
+            self.state.notify_room(&room_id, &participant_id, &notify);
+        }
+    }
+
+    /// 处理 `get_room_state`: 返回房间成员快照。
+    fn on_get_room_state(&mut self, room_id: Option<String>) {
+        let room_id = room_id.or_else(|| {
+            self.sessions
+                .values()
+                .find(|s| s.is_publisher)
+                .map(|s| s.room_id.clone())
+        });
+        match room_id {
+            Some(room_id) => {
+                let participants = self.state.room_roster(&room_id);
+                self.send(SignalingResponse::RoomState {
+                    room_id,
+                    participants,
+                });
+            }
+            None => self.send_error(None, ErrorCode::BadRequest, "缺少 room_id"),
+        }
+    }
+
+    /// 在 `join` 前完成 JWT 鉴权。
+    ///
+    /// - 连接级已预校验 (WS/WHIP 握手头) 或此前 join 已通过时复用;
+    /// - 否则使用本次 join 携带的 `token` 校验;
+    /// - 启用强制鉴权且无有效 token 时返回错误, 拒绝创建参与者。
+    fn authenticate_join(
+        &mut self,
+        token: Option<&str>,
+        room_id: &str,
+        participant_id: &str,
+        role: &str,
+    ) -> Result<(), String> {
+        let auth = self.state.auth.clone();
+        if !auth.is_enabled() {
+            return Ok(());
+        }
+
+        if self.claims.is_none() {
+            if let Some(token) = token {
+                self.claims = Some(auth.verify(token)?);
+            }
+        }
+
+        match &self.claims {
+            Some(claims) => auth.authorize_join(claims, room_id, participant_id, role),
+            None if auth.is_required() => Err("缺少鉴权 token (JWT)".to_string()),
+            None => Ok(()),
         }
     }
 
@@ -256,10 +466,27 @@ impl SignalingSession {
                     self.state
                         .register_sender(&participant_id, self.msg_tx.clone());
 
-                    // 告诉新加入者房间内已有的参与者 (使其能够订阅对方)
-                    for existing in self.state.room_participants(&room_id, &participant_id) {
+                    // 既有成员快照 (不含自己)
+                    let roster: Vec<ParticipantInfo> = self
+                        .state
+                        .room_roster(&room_id)
+                        .into_iter()
+                        .filter(|p| p.participant_id != participant_id)
+                        .collect();
+
+                    // 明确入会确认 + 成员快照 (新客户端据此初始化列表)
+                    self.send(SignalingResponse::Joined {
+                        pc_id: pc_id.clone(),
+                        participant_id: participant_id.clone(),
+                        room_id: room_id.clone(),
+                        role: role.clone(),
+                        participants: roster.clone(),
+                    });
+
+                    // 兼容旧客户端: 逐个推送既有成员
+                    for p in &roster {
                         self.send(SignalingResponse::ParticipantJoined {
-                            participant_id: existing,
+                            participant_id: p.participant_id.clone(),
                         });
                     }
 
@@ -274,19 +501,26 @@ impl SignalingSession {
                         "已通知房间 {} 内的其他参与者: {} 加入",
                         room_id, participant_id
                     );
+                } else {
+                    // 订阅连接: 仅回 joined 确认 (空成员表), 不加入房间
+                    self.send(SignalingResponse::Joined {
+                        pc_id: pc_id.clone(),
+                        participant_id: participant_id.clone(),
+                        room_id: room_id.clone(),
+                        role: role.clone(),
+                        participants: Vec::new(),
+                    });
                 }
             }
             Some(WorkerReply::Error { error, .. }) => {
-                self.send(SignalingResponse::Error {
-                    pc_id: Some(pc_id),
-                    error,
-                });
+                self.send_error(Some(pc_id), ErrorCode::WorkerError, error);
             }
             None => {
-                self.send(SignalingResponse::Error {
-                    pc_id: Some(pc_id),
-                    error: "Worker 无响应".to_string(),
-                });
+                self.send_error(
+                    Some(pc_id),
+                    ErrorCode::WorkerUnavailable,
+                    "Worker 无响应",
+                );
             }
         }
     }
@@ -332,8 +566,9 @@ pub async fn run_session(
     mut inbound: mpsc::Receiver<String>,
     peer: String,
     transport: &'static str,
+    claims: Option<Claims>,
 ) {
-    let mut session = SignalingSession::new(state, msg_tx, peer, transport);
+    let mut session = SignalingSession::new(state, msg_tx, peer, transport, claims);
     while let Some(raw) = inbound.recv().await {
         session.handle(&raw).await;
         if session.overflowed() {

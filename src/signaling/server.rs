@@ -6,12 +6,16 @@
 //!
 //! 协议解析与房间/订阅/Worker 交互全部在 `session` 模块完成, 与 QUIC 共用。
 
+use crate::signaling::auth::{extract_token, Claims};
 use crate::signaling::{session, SignalingState};
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -37,13 +41,54 @@ pub async fn run_server(addr: SocketAddr, state: Arc<SignalingState>) -> std::io
     }
 }
 
+/// 构造一个 401 响应, 用于在 WebSocket 握手段拒绝未通过鉴权的连接。
+fn unauthorized(msg: &str) -> ErrorResponse {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .body(Some(msg.to_string()))
+        .expect("build 401 response")
+}
+
 /// 处理单个 WebSocket 连接
+///
+/// 握手阶段从 `Authorization: Bearer` 头或 `?token=` 查询参数提取 JWT 并校验;
+/// 强制鉴权模式下校验失败直接返回 401, 不升级为 WebSocket。
+// `ErrorResponse` 由 tungstenite `Callback` trait 强制要求, 无法收窄。
+#[allow(clippy::result_large_err)]
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     state: Arc<SignalingState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+    let auth = state.auth.clone();
+    let captured: Arc<Mutex<Option<Result<Claims, String>>>> = Arc::new(Mutex::new(None));
+    let cap = captured.clone();
+
+    let callback = move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
+        let header = req
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        let result = match extract_token(header, req.uri().query()) {
+            Some(token) => auth.verify(&token),
+            None => Err("缺少鉴权 token (JWT)".to_string()),
+        };
+        if auth.is_required() {
+            if let Err(e) = &result {
+                warn!("WebSocket 鉴权失败 ({}): {}", peer_addr, e);
+                return Err(unauthorized(e));
+            }
+        }
+        *cap.lock().expect("auth capture lock") = Some(result);
+        Ok(response)
+    };
+
+    let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+    let claims = captured
+        .lock()
+        .expect("auth capture lock")
+        .take()
+        .and_then(|r| r.ok());
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     info!("WebSocket 连接: {}", peer_addr);
@@ -66,7 +111,7 @@ async fn handle_connection(
     let session_state = state.clone();
     let peer = peer_addr.to_string();
     let session_task = tokio::spawn(async move {
-        session::run_session(session_state, msg_tx, inbound_rx, peer, "websocket").await;
+        session::run_session(session_state, msg_tx, inbound_rx, peer, "websocket", claims).await;
     });
 
     // 接收循环

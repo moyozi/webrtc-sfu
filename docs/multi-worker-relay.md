@@ -12,8 +12,8 @@
 >   - 每进程一个 relay 监听线程，解码后按 `target_worker` 重新注入本地中继/命令通道，
 >     **完全复用** `forward_relayed_rtp` 与命令处理；
 >   - 已单测: RTP/控制回环、UDP 真实收发、跨主机路由、控制注入。
-> - 剩余（集群控制面）: ⏳ 见 §8 末尾 —— 需要把**信令对 worker 的命令**
->   (`CreateParticipant` 等) 也跨主机路由，并在一个房间跨主机时分配全局 worker。
+> - 集群控制面: ✅ 已实现 —— 信令 → 远端 worker 命令通道 gRPC
+>   (`proto/sfu.proto`), 媒体面 UDP。
 
 ## 1. 现状与问题
 
@@ -129,31 +129,32 @@ trait RelayTransport: Send + Sync {
   SFU_RELAY_PEERS=1=10.0.0.2:5390,2=10.0.0.2:5390   # 远端全局 worker -> relay 地址
   ```
 
-### 8.2 已实现：集群控制面（信令 → 远端 worker）
+### 8.2 已实现：集群控制面（信令 → 远端 worker，gRPC）
 
-采用「**集中信令 + worker-only 主机**」部署模型：一个进程跑信令，其余进程只跑
-worker（`SFU_SIGNALING=off`）。信令通过 `src/cluster` 把命令路由到任意全局 worker：
+采用「**信令进程 + worker-only 进程**」部署模型（早期全部同进程）：信令进程经
+**gRPC** 把命令路由到任意全局 worker；跨主机中继 RTP 仍由各媒体进程**点对点
+UDP 直连**。
 
 - **全局 worker 分配**：`assign_worker` **默认按房间 id 哈希固定到一个全局
   worker**（可用 `SFU_DEFAULT_WORKER` 强制全落同一 worker）；只有
   `SFU_ROOM_WORKERS` 显式配置的房间才会跨 worker —— 单个 worker 钉定, 多个
   worker 则在房间内轮转（全局编号, 可跨主机）。
-- **远端 worker 命令通道**：`cluster::ClusterControl` + TCP 控制监听；`WorkerRouter`
-  对本地走 channel、对远端走 TCP。`CreateParticipant` 用 `req_id` 请求/响应关联
-  （SDP answer 经同一连接回传），其余命令 fire-and-forget。
-- **媒体面**: 跨主机 RTP/控制经 UDP relay（§8.1）。
+- **远端 worker 命令通道（gRPC）**：`WorkerRouter` 对本地走 channel，对远端走
+  `grpc::GrpcControl` → `MediaControl`。`CreateParticipant` 为同步 RPC（返回
+  SDP answer），其余命令 fire-and-forget（`SendCommand`）。
+- **媒体面**: 跨主机 RTP 经 UDP 中继点对点直连对端（`SFU_RELAY_PEERS`）。
 - **配置**:
   ```bash
   SFU_TOTAL_WORKERS=4
-  SFU_WORKER_OFFSET=2             # 进程 B 的全局起始
-  SFU_SIGNALING=off               # 进程 B 只跑 worker
-  SFU_CONTROL_LISTEN=0.0.0.0:5401
-  SFU_CONTROL_PEERS=0=10.0.0.1:5400,1=10.0.0.1:5400
-  # 信令进程(A) 上配置房间跨主机:
-  # SFU_ROOM_WORKERS="load=0,1,2,3"
+  SFU_SIGNALING=off SFU_WORKER_OFFSET=2    # 进程 B 只跑 worker
+  SFU_CONTROL_LISTEN=0.0.0.0:5601          # 本进程 MediaControl gRPC
+  # 信令进程(A):
+  SFU_SIGNALING=on
+  SFU_CONTROL_PEERS=2=10.0.0.2:5601,3=10.0.0.2:5601
+  SFU_ROOM_WORKERS="load=0,1,2,3"          # 房间跨主机
   ```
-- **验证**: 同机两进程（模拟两主机，信令+worker0,1 / worker-only+worker2,3），
-  16 订阅者满速 17.3 Mbps；B 进程经控制面创建 16 个参与者并跨主机收流。
+- **验证**: 单测 + 端到端（signaling 进程 + worker-only 进程）已验证经 gRPC
+  控制面创建参与者并跨主机收流。
 
 ### 8.3 剩余优化
 

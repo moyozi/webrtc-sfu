@@ -1,5 +1,5 @@
 import { SignalingClient } from "./signaling";
-import type { ServerMessage, LogEntry, RemoteParticipant } from "./types";
+import type { ServerMessage, LogEntry, RemoteParticipant, ParticipantInfo } from "./types";
 
 /**
  * SFU 客户端 — 单 WebSocket + 多 RTCPeerConnection (信令复用)
@@ -18,6 +18,27 @@ import type { ServerMessage, LogEntry, RemoteParticipant } from "./types";
 
 const PUB_PC_ID = "pub";
 
+/** 与 Rust 端 `PROTOCOL_VERSION` 保持一致 */
+const PROTOCOL_VERSION = 1;
+
+/** 应用层心跳间隔 (毫秒) */
+const HEARTBEAT_MS = 20_000;
+
+/** 从 JWT 载荷中解析 `sub` (仅用于取用户 ID, 不做签名校验)。 */
+function jwtSubject(token: string): string | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const bytes = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+    const json = JSON.parse(new TextDecoder().decode(bytes));
+    return typeof json.sub === "string" ? json.sub : null;
+  } catch {
+    return null;
+  }
+}
+
 interface PcEntry {
   pc: RTCPeerConnection;
   role: "publisher" | "subscriber";
@@ -32,12 +53,18 @@ export interface SfuCallbacks {
   onParticipantLeft: (id: string) => void;
   onSubscriptionUpdate: (publisherId: string, participant: Partial<RemoteParticipant>) => void;
   onConnectionStateChange: (state: string) => void;
+  /** 远端成员媒体状态变化 (静音/关摄像头) */
+  onParticipantUpdated?: (id: string, media: { audioEnabled: boolean; videoEnabled: boolean }) => void;
+  /** 服务端握手完成 (welcome), 可用于展示协议版本/能力 */
+  onWelcome?: (info: { protocol_version: number; server: string; features: string[] }) => void;
 }
 
 export class SfuClient {
   // 身份
   private participantId = "";
   private roomId = "";
+  /** 用户鉴权 JWT (可选; 服务端启用鉴权时必填) */
+  private token = "";
 
   // 单条信令连接 (所有 PC 复用)
   private sig: SignalingClient | null = null;
@@ -46,6 +73,10 @@ export class SfuClient {
   private pcs = new Map<string, PcEntry>();
   // 远端 publisherId → 订阅它的 pc_id
   private subPcByPublisher = new Map<string, string>();
+  // 已入房的远端成员 (用于 joined 快照与 participant_joined 去重)
+  private knownParticipants = new Set<string>();
+  // 应用层心跳定时器
+  private heartbeat: ReturnType<typeof setInterval> | null = null;
 
   private localStream: MediaStream | null = null;
 
@@ -57,9 +88,14 @@ export class SfuClient {
 
   // ── 发布: 加入房间 ─────────────────────────────────────────
 
-  async join(serverUrl: string, roomId: string, participantId: string): Promise<void> {
-    this.participantId = participantId;
+  async join(serverUrl: string, roomId: string, participantId: string, token = ""): Promise<void> {
     this.roomId = roomId;
+    // 启用 JWT 鉴权时, participant_id 必须等于 token 的 sub。
+    // 若提供了 token, 则以其 sub 为准, 避免与昵称不一致而被拒。
+    this.token = token.trim();
+    this.participantId = this.token
+      ? jwtSubject(this.token) ?? participantId
+      : participantId;
 
     // 1. 获取本地媒体
     this.cb.onLog("正在获取摄像头和麦克风...");
@@ -70,13 +106,18 @@ export class SfuClient {
     this.cb.onLog("本地媒体流已就绪", "success");
 
     // 2. 连接信令服务器 (整个会话只此一条 WebSocket)
-    this.sig = new SignalingClient(serverUrl);
+    this.sig = new SignalingClient(serverUrl, this.token || undefined);
     await this.sig.connect();
     this.sig.onMessage = (msg) => this.onMessage(msg);
     this.sig.onClose = () => {
       this.cb.onLog("信令连接断开", "warn");
       this.cb.onConnectionStateChange("disconnected");
     };
+
+    // 握手: 协商协议版本 (拿到 welcome 中的能力集)
+    this.sig.send({ type: "hello", protocol_version: PROTOCOL_VERSION, client: "roomchat-web" });
+    // 应用层心跳: 移动端切网 / NAT 空闲超时后保持信令通道活跃
+    this.startHeartbeat();
 
     // 3. 创建发布 PC (sendonly)
     const pc = new RTCPeerConnection({ iceServers: [] });
@@ -103,9 +144,10 @@ export class SfuClient {
       type: "join",
       pc_id: PUB_PC_ID,
       room_id: roomId,
-      participant_id: participantId,
+      participant_id: this.participantId,
       sdp: pc.localDescription!.sdp,
       role: "publisher",
+      ...(this.token ? { token: this.token } : {}),
     });
     this.cb.onLog(`正在加入房间 ${roomId}...`);
   }
@@ -171,6 +213,7 @@ export class SfuClient {
       participant_id: `${this.participantId}-recv-${publisherId}`,
       sdp: pc.localDescription!.sdp,
       role: "subscriber",
+      ...(this.token ? { token: this.token } : {}),
     });
   }
 
@@ -195,6 +238,7 @@ export class SfuClient {
   // ── 离开 ──────────────────────────────────────────────────
 
   leave(): void {
+    this.stopHeartbeat();
     // 通知服务器关闭所有 PC 会话
     if (this.sig?.isConnected) {
       for (const [pcId] of this.pcs) {
@@ -208,6 +252,7 @@ export class SfuClient {
     }
     this.pcs.clear();
     this.subPcByPublisher.clear();
+    this.knownParticipants.clear();
 
     // 停止本地轨道
     if (this.localStream) {
@@ -224,16 +269,89 @@ export class SfuClient {
 
   toggleAudio(enabled: boolean): void {
     this.localStream?.getAudioTracks().forEach((t) => (t.enabled = enabled));
+    this.updateMedia({ audioEnabled: enabled });
   }
 
   toggleVideo(enabled: boolean): void {
     this.localStream?.getVideoTracks().forEach((t) => (t.enabled = enabled));
+    this.updateMedia({ videoEnabled: enabled });
+  }
+
+  /** 通知服务端本发布者的媒体状态 (服务端会广播给房间内其他人)。 */
+  updateMedia(media: { audioEnabled?: boolean; videoEnabled?: boolean }): void {
+    if (media.audioEnabled === undefined && media.videoEnabled === undefined) return;
+    this.sig?.send({
+      type: "update_media",
+      pc_id: PUB_PC_ID,
+      ...(media.audioEnabled !== undefined ? { audio_enabled: media.audioEnabled } : {}),
+      ...(media.videoEnabled !== undefined ? { video_enabled: media.videoEnabled } : {}),
+    });
+  }
+
+  /** 手动请求房间成员快照 (可用于重连 / UI 刷新)。 */
+  requestRoomState(): void {
+    this.sig?.send({ type: "get_room_state", room_id: this.roomId });
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeat = setInterval(() => {
+      this.sig?.send({ type: "ping", t: Date.now() });
+    }, HEARTBEAT_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeat !== null) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = null;
+    }
   }
 
   // ── 信令消息处理 (统一入口, 按 pc_id 分发) ─────────────────
 
   private onMessage(msg: ServerMessage): void {
     switch (msg.type) {
+      case "welcome": {
+        this.cb.onLog(`协议握手: ${msg.server} (v${msg.protocol_version})`, "info");
+        this.cb.onWelcome?.(msg);
+        break;
+      }
+
+      case "pong":
+        // 心跳回包, 仅用于保活, 无需处理
+        break;
+
+      case "joined": {
+        this.ingestRoster(msg.participants, true);
+        this.cb.onLog(
+          `已加入房间 ${msg.room_id} (${msg.participants.length} 位已有成员)`,
+          "success"
+        );
+        break;
+      }
+
+      case "room_state": {
+        this.ingestRoster(msg.participants, false);
+        this.cb.onLog(`房间 ${msg.room_id} 共 ${msg.participants.length} 人`, "info");
+        break;
+      }
+
+      case "left":
+        this.cb.onLog(`已离开会话 ${msg.pc_id}`, "info");
+        break;
+
+      case "participant_updated":
+        this.cb.onParticipantUpdated?.(msg.participant_id, {
+          audioEnabled: msg.audio_enabled,
+          videoEnabled: msg.video_enabled,
+        });
+        break;
+
+      case "unsubscribed":
+        // 已在 unsubscribe() 本地更新, 这里仅记录确认
+        this.cb.onLog(`已取消订阅 ${msg.publisher_id}`, "info");
+        break;
+
       case "sdp_answer": {
         const entry = this.pcs.get(msg.pc_id);
         if (!entry) {
@@ -285,19 +403,20 @@ export class SfuClient {
         break;
       }
 
-      case "participant_joined":
+      case "participant_joined": {
+        const id = msg.participant_id;
         // 防御性过滤: 忽略自己, 以及自己的订阅连接 (participantId-recv-*).
-        if (
-          msg.participant_id === this.participantId ||
-          msg.participant_id.startsWith(`${this.participantId}-recv-`)
-        ) {
-          return;
-        }
-        this.cb.onLog(`参与者加入: ${msg.participant_id}`, "info");
-        this.cb.onParticipantJoined(msg.participant_id);
+        if (id === this.participantId || id.startsWith(`${this.participantId}-recv-`)) return;
+        // joined 快照可能已包含该成员, 去重避免重复订阅。
+        if (this.knownParticipants.has(id)) return;
+        this.knownParticipants.add(id);
+        this.cb.onLog(`参与者加入: ${id}`, "info");
+        this.cb.onParticipantJoined(id);
         break;
+      }
 
       case "participant_left":
+        this.knownParticipants.delete(msg.participant_id);
         this.cb.onLog(`参与者离开: ${msg.participant_id}`, "warn");
         this.unsubscribe(msg.participant_id);
         this.cb.onParticipantLeft(msg.participant_id);
@@ -305,10 +424,28 @@ export class SfuClient {
 
       case "error":
         this.cb.onLog(
-          msg.pc_id ? `服务器错误 [${msg.pc_id}]: ${msg.error}` : `服务器错误: ${msg.error}`,
+          (msg.pc_id ? `服务器错误 [${msg.pc_id}]` : "服务器错误") +
+            (msg.code ? ` (${msg.code})` : "") +
+            `: ${msg.error}`,
           "error"
         );
         break;
+    }
+  }
+
+  /** 将服务端成员快照写入本地已知集合并触发回调 (joined / room_state 共用)。 */
+  private ingestRoster(participants: ParticipantInfo[], reset: boolean): void {
+    if (reset) this.knownParticipants.clear();
+    for (const p of participants) {
+      const id = p.participant_id;
+      if (id === this.participantId || id.startsWith(`${this.participantId}-recv-`)) continue;
+      const isNew = !this.knownParticipants.has(id);
+      this.knownParticipants.add(id);
+      if (isNew) this.cb.onParticipantJoined(id);
+      this.cb.onParticipantUpdated?.(id, {
+        audioEnabled: p.audio_enabled,
+        videoEnabled: p.video_enabled,
+      });
     }
   }
 

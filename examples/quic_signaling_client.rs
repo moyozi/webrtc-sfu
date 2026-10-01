@@ -11,9 +11,13 @@
 //!
 //! 交互命令:
 //!   <任意一行 JSON>   作为信令消息发送
-//!   /migrate [ip]     把底层 UDP socket 重新绑定到新地址 (默认 0.0.0.0:0),
+//!   /migrate [ip]     把底层 UDP  socket 重新绑定到新地址 (默认 0.0.0.0:0),
 //!                     演示移动端 WiFi/蜂窝切换后 QUIC 连接不中断
 //!   /quit             退出
+//!
+//! 鉴权: 服务端启用 JWT 后, `join` 消息需携带 `"token": "<jwt>"` 字段
+//! (QUIC 无 HTTP 头, 只能写在消息里), 且 `participant_id` 必须等于 token 的 `sub`。
+//! 可用 `SFU_JWT_SECRET=... ./scripts/gen-jwt.sh <sub> [room] [role]` 生成测试 token。
 //!
 //! 说明: 这里只演示 QUIC 信令的传输层。真实的 join 需要先由 str0m/浏览器生成
 //! SDP offer, 本示例聚焦于「换网后信令连接仍在」这一能力。

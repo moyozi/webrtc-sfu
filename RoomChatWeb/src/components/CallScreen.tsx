@@ -120,6 +120,8 @@ export default function CallScreen(props: CallScreenProps) {
               label="我"
               isLocal={true}
               placeholder="摄像头未开启"
+              audioEnabled={audioOn()}
+              videoEnabled={videoOn()}
             />
 
             {/* 远端视频 */}
@@ -128,6 +130,8 @@ export default function CallScreen(props: CallScreenProps) {
                 <VideoTile
                   stream={p.stream}
                   label={p.id}
+                  audioEnabled={p.audioEnabled}
+                  videoEnabled={p.videoEnabled}
                   placeholder={
                     p.status === "connecting" ? "连接中..." :
                     p.status === "error" ? "连接失败" :

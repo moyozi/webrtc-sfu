@@ -18,7 +18,7 @@ function App() {
     setLogs((prev) => [...prev, { time, msg, level }].slice(-200));
   };
 
-  const handleJoin = async (serverUrl: string, rid: string, name: string) => {
+  const handleJoin = async (serverUrl: string, rid: string, name: string, token: string) => {
     try {
       sfu = new SfuClient({
         onLog: addLog,
@@ -42,12 +42,20 @@ function App() {
             )
           );
         },
+        onParticipantUpdated: (id, media) => {
+          setParticipants((prev) =>
+            prev.map((p) => (p.id === id ? { ...p, ...media } : p))
+          );
+        },
+        onWelcome: (info) => {
+          addLog(`信令协议 v${info.protocol_version} (${info.features.join(", ")})`);
+        },
         onConnectionStateChange: (state) => {
           if (state === "connected") addLog("WebRTC 连接已建立", "success");
         },
       });
 
-      await sfu.join(serverUrl, rid, name);
+      await sfu.join(serverUrl, rid, name, token);
       setRoomId(rid);
       setLocalStream(sfu.getLocalStream());
       setScreen("call");

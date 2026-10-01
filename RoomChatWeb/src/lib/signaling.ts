@@ -1,5 +1,11 @@
 import type { ClientMessage, ServerMessage } from "./types";
 
+/** 在 WebSocket URL 上追加 `token` 查询参数 (保留已有查询串)。 */
+function withToken(url: string, token: string): string {
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}token=${encodeURIComponent(token)}`;
+}
+
 /**
  * 信令客户端 — WebSocket 封装
  *
@@ -12,8 +18,9 @@ export class SignalingClient {
   public onMessage: ((msg: ServerMessage) => void) | null = null;
   public onClose: (() => void) | null = null;
 
-  constructor(url: string) {
-    this.url = url;
+  constructor(url: string, token?: string) {
+    // 浏览器 WebSocket 无法自定义请求头, 故通过 `?token=` 传递给服务端鉴权。
+    this.url = token ? withToken(url, token) : url;
   }
 
   connect(): Promise<void> {

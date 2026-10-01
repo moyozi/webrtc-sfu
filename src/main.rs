@@ -4,6 +4,7 @@
 
 mod cluster;
 mod config;
+mod grpc;
 mod net;
 mod sfu;
 mod signaling;
@@ -25,6 +26,27 @@ fn main() {
     // 解析配置
     let config = SfuConfig::from_args();
     info!(?config, "启动 WebRTC SFU 服务");
+
+    // JWT 鉴权: 在启动 worker 之前校验配置 (如需要强制鉴权但未配密钥则拒绝启动,
+    // 避免启动到一半才失败或裸奔)。worker-only 进程不跑信令, 无需鉴权配置。
+    let authenticator = if config.signaling {
+        match signaling::auth::Authenticator::from_settings(&config.jwt) {
+            Ok(a) => Arc::new(a),
+            Err(e) => {
+                error!("JWT 鉴权配置错误: {}", e);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        Arc::new(signaling::auth::Authenticator::disabled())
+    };
+    if config.signaling {
+        if authenticator.is_enabled() {
+            info!("JWT 鉴权已启用 (required={})", authenticator.is_required());
+        } else {
+            warn!("JWT 鉴权未启用 (未配置 SFU_JWT_SECRET / SFU_JWT_PUBLIC_KEY)");
+        }
+    }
 
     let num_workers = config.num_workers;
     let listen_addr = config.listen_addr;
@@ -179,49 +201,58 @@ fn main() {
         announce_ip
     );
 
-    // ── 集群控制面: 信令 → 本地/远端 worker 的统一路由 ──
-    let cluster_control = if config.control_peers.is_empty() {
+    // ── 控制面: 信令 → 本地/远端 worker (远端经 gRPC MediaControl) ──
+    let grpc_control = if config.control_peers.is_empty() {
         None
     } else {
-        let cc = Arc::new(cluster::ClusterControl::new(config.control_peers.clone()));
-        // 启动远端控制命令的专用发送线程 (避免在信令 async 任务里阻塞建连)。
-        cc.spawn_sender();
-        Some(cc)
+        Some(grpc::GrpcControl::new(config.control_peers.clone()))
     };
     let router = Arc::new(cluster::WorkerRouter::new(
         worker_cmd_txs.clone(),
         config.worker_offset,
         num_workers as u32,
-        cluster_control,
+        grpc_control,
     ));
-    if let Some(addr) = config.control_listen {
-        if let Err(e) = cluster::start_listener(
-            addr,
-            worker_cmd_txs.clone(),
-            config.worker_offset,
-            num_workers as u32,
-        ) {
-            warn!("启动集群控制面监听 {} 失败: {}", addr, e);
+
+    // ── 2. 启动 gRPC / 信令服务 (Tokio Runtime) ──
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .thread_name("sfu-rt")
+        .build()
+        .expect("failed to create tokio runtime");
+
+    let mut servers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // 媒体控制 gRPC 服务: 本进程有 worker 且配置了监听地址时提供。
+    if !worker_cmd_txs.is_empty() {
+        if let Some(addr) = config.control_listen {
+            let txs = Arc::new(worker_cmd_txs.clone());
+            let offset = config.worker_offset;
+            let count = num_workers as u32;
+            servers.push(rt.spawn(async move {
+                if let Err(e) = grpc::server::serve_media_control(addr, txs, offset, count).await {
+                    error!("媒体控制 gRPC 服务错误: {}", e);
+                }
+            }));
         }
     }
-
-    // ── 2. 启动信令服务器 (Tokio Runtime) ──
-    let signaling_state = Arc::new(signaling::SignalingState::new(
-        router,
-        config.total_workers,
-        config.room_workers.clone(),
-        config.default_worker,
-    ));
 
     if !config.signaling {
         info!("本进程为 worker-only (SFU_SIGNALING=off), 不启动信令服务器");
         // 等待 SIGINT/SIGTERM，再优雅停止各 worker。
-        let shutdown_rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create shutdown runtime");
-        shutdown_rt.block_on(wait_for_shutdown());
-        info!("收到关闭信号, 停止 worker");
+        rt.block_on(async move {
+            if servers.is_empty() {
+                wait_for_shutdown().await;
+            } else {
+                tokio::select! {
+                    _ = futures_util::future::join_all(servers) => {
+                        error!("媒体控制服务意外结束");
+                    }
+                    _ = wait_for_shutdown() => info!("收到关闭信号"),
+                }
+            }
+        });
         for tx in &worker_cmd_txs {
             let _ = tx.try_send(worker::WorkerCommand::Shutdown);
         }
@@ -230,6 +261,14 @@ fn main() {
         }
         return;
     }
+
+    let signaling_state = Arc::new(signaling::SignalingState::new(
+        router,
+        config.total_workers,
+        config.room_workers.clone(),
+        config.default_worker,
+        authenticator,
+    ));
 
     // QUIC 信令: 生成本地自签名证书 (生产环境应替换为受信证书)
     let quic_tls = match config.quic_listen_addr {
@@ -246,62 +285,42 @@ fn main() {
         None => None,
     };
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .thread_name("sfu-signaling")
-        .build()
-        .expect("failed to create tokio runtime");
+    let ws_state = signaling_state.clone();
+    servers.push(rt.spawn(async move {
+        if let Err(e) = signaling::server::run_server(ws_addr, ws_state).await {
+            error!("WebSocket 信令服务器错误: {}", e);
+        }
+    }));
+
+    // QUIC 优先作为移动终端的信令通道; WebSocket 作为兼容回退, 两者并存。
+    if let (Some(addr), Some(tls)) = (config.quic_listen_addr, quic_tls) {
+        let quic_state = signaling_state.clone();
+        servers.push(rt.spawn(async move {
+            if let Err(e) = signaling::quic::run_server(addr, quic_state, tls).await {
+                error!("QUIC 信令服务器错误: {}", e);
+            }
+        }));
+    } else {
+        warn!("QUIC 信令未启用, 仅提供 WebSocket 信令");
+    }
+
+    // WHIP 推流接入 (FFmpeg/GStreamer/OBS)
+    if let Some(addr) = config.whip_listen {
+        let state = signaling_state.clone();
+        servers.push(rt.spawn(async move {
+            if let Err(e) = signaling::whip::run_server(addr, state).await {
+                error!("WHIP 信令服务器错误: {}", e);
+            }
+        }));
+    }
 
     rt.block_on(async move {
-        let ws_state = signaling_state.clone();
-        let ws_task = tokio::spawn(async move {
-            if let Err(e) = signaling::server::run_server(ws_addr, ws_state).await {
-                error!("WebSocket 信令服务器错误: {}", e);
-            }
-        });
-
-        // QUIC 优先作为移动终端的信令通道; WebSocket 作为兼容回退, 两者并存。
-        let quic_task = match (config.quic_listen_addr, quic_tls) {
-            (Some(addr), Some(tls)) => {
-                let quic_state = signaling_state.clone();
-                Some(tokio::spawn(async move {
-                    if let Err(e) = signaling::quic::run_server(addr, quic_state, tls).await {
-                        error!("QUIC 信令服务器错误: {}", e);
-                    }
-                }))
-            }
-            _ => {
-                warn!("QUIC 信令未启用, 仅提供 WebSocket 信令");
-                None
-            }
-        };
-
-        // WHIP 推流接入 (FFmpeg/GStreamer/OBS)
-        let whip_task = config.whip_listen.map(|addr| {
-            let state = signaling_state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = signaling::whip::run_server(addr, state).await {
-                    error!("WHIP 信令服务器错误: {}", e);
-                }
-            })
-        });
-
-        // 所有信令服务器任务。任一意外退出或收到关闭信号都会结束 select。
-        let mut servers: Vec<tokio::task::JoinHandle<()>> = vec![ws_task];
-        if let Some(t) = quic_task {
-            servers.push(t);
-        }
-        if let Some(t) = whip_task {
-            servers.push(t);
-        }
-
         tokio::select! {
             _ = futures_util::future::join_all(servers) => {
-                error!("信令服务器任务意外结束");
+                error!("服务任务意外结束");
             }
             _ = wait_for_shutdown() => {
-                info!("收到关闭信号, 停止信令服务器");
+                info!("收到关闭信号, 停止服务");
             }
         }
     });

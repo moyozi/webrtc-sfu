@@ -1,5 +1,6 @@
 //! SFU 配置定义
 
+use crate::signaling::auth::JwtSettings;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use tracing::warn;
@@ -50,6 +51,8 @@ pub struct SfuConfig {
     pub signaling: bool,
     /// WHIP 推流接入 HTTP 监听地址 (None = 禁用)
     pub whip_listen: Option<SocketAddr>,
+    /// JWT 用户鉴权配置 (未配置密钥时禁用)
+    pub jwt: JwtSettings,
 }
 
 impl SfuConfig {
@@ -217,6 +220,8 @@ impl SfuConfig {
             Err(_) => true,
         };
 
+        let jwt = JwtSettings::from_env();
+
         Self {
             listen_addr,
             ws_listen_addr,
@@ -238,6 +243,7 @@ impl SfuConfig {
             control_peers,
             signaling,
             whip_listen,
+            jwt,
         }
     }
 }

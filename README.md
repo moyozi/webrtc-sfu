@@ -603,7 +603,45 @@ Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉�
 创建一个独立的 str0m `Rtc` 实例，但共用同一条信令通道。如发布者媒体变更，
 订阅端仍复用同一连接。
 
+**客户端 → 服务器**
+
+| type | 字段 | 说明 |
+|------|------|------|
+| `hello` | `protocol_version?`, `client?` | 可选握手，协商版本 → `welcome` |
+| `ping` | `t?` | 应用层心跳 → `pong`（带 `t`） |
+| `join` | `pc_id`, `room_id`, `participant_id`, `sdp`, `role?`, `token?` | 创建发布/订阅 PC |
+| `ice_candidate` | `pc_id`, `candidate`, `sdp_mid?`, `sdp_mline_index?` | Trickle ICE |
+| `subscribe` | `pc_id`, `publisher_id`, `track_mid`, `subscriber_mid?` | 订阅轨道 |
+| `unsubscribe` | `pc_id`, `publisher_id`, `track_mid` | 取消订阅 |
+| `update_media` | `pc_id`, `audio_enabled?`, `video_enabled?` | 静音/关摄像头，广播给房间 |
+| `get_room_state` | `room_id?` | 请求成员快照（重连/刷新） |
+| `leave` | `pc_id` | 关闭 PC 会话 → `left` |
+
+**服务器 → 客户端**
+
+| type | 说明 |
+|------|------|
+| `welcome` | 协议版本与服务端能力集 (`features`) |
+| `pong` | 心跳回复 |
+| `sdp_answer` | SDP answer + 内联 ICE 候选 |
+| `joined` | `join` 成功确认，携带成员快照 `participants` |
+| `left` | `leave` 成功确认 |
+| `participant_joined` / `participant_left` | 成员进出广播（兼容旧客户端，新客户端对 `joined.participants` 去重） |
+| `participant_updated` | 成员媒体状态变化（静音/关摄像头） |
+| `subscribed` / `unsubscribed` | 订阅/取消订阅确认（含 `track_mid`） |
+| `room_state` | 成员快照（响应 `get_room_state`） |
+| `error` | `code` + `error`：`bad_request` / `unauthorized` / `already_joined` / `unknown_session` / `worker_error` / `worker_unavailable` / `unsupported_protocol` / `internal` |
+
 ```json
+// 客户端 → 服务器: 握手 (可选) / 心跳
+{ "type": "hello", "protocol_version": 1, "client": "roomchat-web" }
+{ "type": "ping", "t": 1735689600000 }
+
+// 服务器 → 客户端: 握手回复 / 心跳回复
+{ "type": "welcome", "protocol_version": 1, "server": "webrtc-sfu/0.1.0",
+  "features": ["heartbeat", "join_ack", "room_state", "media_state"] }
+{ "type": "pong", "t": 1735689600000 }
+
 // 客户端 → 服务器: SDP Offer (发布连接)
 {
   "type": "join",
@@ -611,7 +649,8 @@ Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉�
   "room_id": "room-123",
   "participant_id": "alice-uuid",
   "sdp": "v=0\r\no=- 123456 2 IN IP4 127.0.0.1\r\n...",
-  "role": "publisher"
+  "role": "publisher",
+  "token": "<JWT>"
 }
 
 // 客户端 → 服务器: SDP Offer (订阅连接, 复用同一条 WebSocket)
@@ -625,6 +664,7 @@ Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉�
 }
 // role: "publisher" (默认, 发布并加入房间) 或 "subscriber" (recvonly 订阅连接)
 // subscriber 连接不会加入房间, 也不会触发 participant_joined 广播
+// token: 用户鉴权 JWT; WebSocket/WHIP 也可在握手头/查询参数中携带 (见 8.4)
 
 // 服务器 → 客户端: SDP Answer (带 pc_id, 客户端据此路由到对应 PC)
 {
@@ -632,6 +672,18 @@ Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉�
   "pc_id": "sub-bob-uuid",
   "sdp": "v=0\r\no=- 789012 2 IN IP4 127.0.0.1\r\n...",
   "ice_candidates": ["candidate:1 1 udp 2122252543 1.2.3.4 5175 typ host"]
+}
+
+// 服务器 → 客户端: join 确认 + 房间成员快照 (不含自己)
+{
+  "type": "joined",
+  "pc_id": "pub",
+  "participant_id": "alice-uuid",
+  "room_id": "room-123",
+  "role": "publisher",
+  "participants": [
+    { "participant_id": "bob-uuid", "audio_enabled": true, "video_enabled": false }
+  ]
 }
 
 // 客户端 → 服务器: Trickle ICE Candidate
@@ -643,16 +695,33 @@ Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉�
   "sdp_mline_index": 0
 }
 
-// 客户端 → 服务器: 订阅轨道
+// 客户端 → 服务器: 订阅轨道 / 取消订阅
 {
   "type": "subscribe",
   "pc_id": "sub-bob-uuid",
   "publisher_id": "bob-uuid",
   "track_mid": "1"
 }
+{ "type": "unsubscribe", "pc_id": "sub-bob-uuid", "publisher_id": "bob-uuid", "track_mid": "1" }
 
-// 客户端 → 服务器: 关闭某个 PC 会话
+// 服务器 → 客户端: 订阅确认
+{ "type": "subscribed", "pc_id": "sub-bob-uuid", "publisher_id": "bob-uuid", "track_mid": "1" }
+
+// 客户端 → 服务器: 静音/关摄像头 → 广播给房间内其他人
+{ "type": "update_media", "pc_id": "pub", "audio_enabled": false }
+{ "type": "participant_updated", "participant_id": "alice-uuid", "audio_enabled": false, "video_enabled": true }
+
+// 客户端 → 服务器: 请求房间成员快照
+{ "type": "get_room_state", "room_id": "room-123" }
+{ "type": "room_state", "room_id": "room-123",
+  "participants": [{ "participant_id": "alice-uuid", "audio_enabled": false, "video_enabled": true }] }
+
+// 服务器 → 客户端: 错误 (带错误码)
+{ "type": "error", "pc_id": "pub", "code": "unknown_session", "error": "未知 pc_id, 请先 join" }
+
+// 客户端 → 服务器: 关闭某个 PC 会话 / 服务器确认
 { "type": "leave", "pc_id": "sub-bob-uuid" }
+{ "type": "left", "pc_id": "sub-bob-uuid" }
 ```
 
 ### 8.2 QUIC 传输与连接迁移
@@ -699,6 +768,8 @@ cargo run --example quic_signaling_client -- 192.168.31.112:5173 <指纹hex>
   Browser                  Signaling Server              Worker Thread
      │                            │                            │
      │── QUIC / WebSocket Connect ─►│                            │
+     │── hello / ping ───────────►│                            │
+     │◄── welcome / pong ─────────│                            │
      │                            │                            │
      │── join (SDP Offer) ───────►│                            │
      │                            │── WorkerCommand::Create ──►│
@@ -712,6 +783,8 @@ cargo run --example quic_signaling_client -- 192.168.31.112:5173 <指纹hex>
      │                            │                     └──────┤
      │                            │◄── SdpAnswer ──────────────│
      │◄── sdp_answer ─────────────│                            │
+     │◄── joined (成员快照) ──────│                            │
+     │◄── participant_joined ✱ ───│ (既有成员; 与快照去重)       │
      │                            │                            │
      │── ice_candidate ─────────►│── AddRemoteCandidate ─────►│
      │                            │                            │
@@ -723,6 +796,70 @@ cargo run --example quic_signaling_client -- 192.168.31.112:5173 <指纹hex>
      │                            │                            │
      │   (RTP media flows directly via UDP, not through signaling) │
 ```
+
+### 8.4 JWT 用户鉴权
+
+信令服务支持可选的 JWT 鉴权。未配置密钥时功能完全关闭 (兼容既有 Demo)；
+一旦配置 `SFU_JWT_SECRET` (HMAC) 或 `SFU_JWT_PUBLIC_KEY` (RS/ES/EdDSA)，
+默认强制所有 `join` 携带有效 token。
+
+| 环境变量 | 说明 |
+|----------|------|
+| `SFU_JWT_SECRET` | HMAC 对称密钥 (HS256/384/512) |
+| `SFU_JWT_PUBLIC_KEY` / `SFU_JWT_PUBLIC_KEY_FILE` | 非对称公钥 PEM (RS/ES/EdDSA) |
+| `SFU_JWT_ALGORITHM` | 可选，缺省按密钥类型推断 (`HS256` / `RS256`) |
+| `SFU_JWT_ISSUER` / `SFU_JWT_AUDIENCE` | 可选，校验 `iss` / `aud` |
+| `SFU_JWT_REQUIRED` | 配置密钥后默认 `on`；设 `off` 则“有 token 就校验”而不是强制 |
+
+**token 传递方式**：
+
+- **WebSocket**: 握手请求头 `Authorization: Bearer <jwt>`，或 `ws://host:5174/?token=<jwt>`；
+- **QUIC**: 无 HTTP 头，放在 `join` 消息的 `token` 字段；
+- **WHIP**: `Authorization: Bearer <jwt>` 头，或 `POST /whip?room=x&token=<jwt>`。
+
+**claims 约束**（防止冒充）：
+
+```json
+{ "sub": "alice", "exp": 1735689600, "room": "room-1", "role": "publisher" }
+```
+
+- `sub`（必填）：用户唯一标识。发布者 `participant_id` 必须等于 `sub`；
+  订阅者必须为 `<sub>-recv-<publisherId>`。
+- `exp`（必填）：过期时间（Unix 秒）。
+- `room` / `role`（可选）：限定可加入的房间 / 角色（`role=subscriber` 只能订阅，
+  `publisher` 或省略则既可发布也可订阅）。
+
+启动时会打印 `JWT 鉴权已启用 (required=true)`；强制模式下校验失败返回 401
+(WebSocket 在握手段拒绝，WHIP 在 HTTP 响应中返回 401)。密钥不会写入日志。
+
+本地联调可生成测试 token：
+
+```bash
+SFU_JWT_SECRET=dev-secret ./scripts/gen-jwt.sh alice room-1 publisher 3600
+# 输出 eyJhbGciOi... 即为 JWT
+```
+
+### 8.5 信令 → 媒体：控制面 gRPC
+
+信令进程与 worker 进程可分离（worker-only 进程设 `SFU_SIGNALING=off`）。
+信令对**远端 worker** 的命令通道由早期的自研 TCP 控制面改为 **gRPC**
+（`proto/sfu.proto` 的 `MediaControl`），媒体面仍走 UDP。
+
+```
+  signaling ──gRPC MediaControl(CreateParticipant/SendCommand)──► 远端 worker 进程
+  本地 worker: 进程内 channel          跨主机中继 RTP: UDP (net::relay, 点对点)
+```
+
+| 环境变量 | 说明 |
+|----------|------|
+| `SFU_CONTROL_LISTEN` | 本进程 `MediaControl` gRPC 监听（worker 进程） |
+| `SFU_CONTROL_PEERS` | `全局worker=host:port,...`，远端 worker → 其 gRPC 地址 |
+| `SFU_SIGNALING` | `on`（默认）/ `off`（worker-only） |
+
+`CreateParticipant` 为同步 RPC（返回 SDP answer），其余命令 fire-and-forget
+（`SendCommand`）。跨主机媒体中继 RTP 仍按 `SFU_RELAY_PEERS` 点对点 UDP 直连。
+
+> 构建需安装 `protoc`（编译 `proto/sfu.proto`）。
 
 ---
 
@@ -743,10 +880,17 @@ cargo run --example quic_signaling_client -- 192.168.31.112:5173 <指纹hex>
 ```
 webrtc-sfu/
 ├── Cargo.toml
+├── build.rs                   ← 编译 gRPC proto (tonic-build)
+├── proto/sfu.proto            ← 信令 → 媒体 gRPC 控制面定义 (MediaControl)
 ├── README.md                    ← 本文件
 └── src/
-    ├── main.rs                  ← 入口: 启动 workers + signaling
-    ├── config.rs                ← 配置定义
+    ├── main.rs                  ← 入口: 启动 workers + signaling + gRPC 控制面
+    ├── config.rs                ← 配置定义 (含 gRPC 控制地址)
+    ├── grpc/                    ← 信令 → 媒体 gRPC 控制面
+    │   ├── mod.rs               ← proto 类型与模块接线
+    │   ├── convert.rs           ← WorkerCommand ↔ gRPC Command 转换
+    │   ├── client.rs            ← GrpcControl 同步门面
+    │   └── server.rs            ← MediaControlSvc
     ├── net/                     ← 网络原语
     │   ├── mod.rs
     │   ├── udp.rs               ← recvmmsg/sendmmsg UDP socket (nix)
@@ -767,13 +911,14 @@ webrtc-sfu/
     │   └── layer.rs             ← simulcast/SVC 选层与码率估计
     ├── signaling/               ← 信令层 (WebSocket / QUIC / WHIP)
     │   ├── mod.rs               ← SignalingState (房间表 / sender 表 / worker 选择)
+    │   ├── auth.rs              ← JWT 用户鉴权
     │   ├── protocol.rs          ← 信令 JSON 协议 (与传输无关)
     │   ├── session.rs           ← 传输无关会话状态机 (WS/QUIC 共用)
     │   ├── server.rs            ← WebSocket 传输层
     │   ├── quic.rs              ← QUIC 传输层 (quinn) + 自签名证书
     │   └── whip.rs              ← WHIP 推流接入 (HTTP)
-    └── cluster/                 ← 多进程集群控制面
-        └── mod.rs               ← 远端 worker 命令路由 (TCP)
+    └── cluster/                 ← 控制面路由
+        └── mod.rs               ← WorkerRouter: 本地 channel / 远端 gRPC
 ```
 
 ---
@@ -783,6 +928,8 @@ webrtc-sfu/
 ```bash
 # 需要 Linux (recvmmsg/epoll/SO_REUSEPORT 是 Linux 特有 API)
 # Rust 1.75+
+# 构建依赖: protoc (编译 proto/sfu.proto 生成 gRPC 代码)
+#   apt install protobuf-compiler   /   dnf install protobuf-compiler
 
 # 构建 (release 模式, LTO + 单 codegen-unit 优化)
 cargo build --release
@@ -806,10 +953,25 @@ SFU_MEDIA_ADDR=0.0.0.0:5175   # 媒体 UDP 绑定地址 (默认 0.0.0.0:5175)
 SFU_BWE_INITIAL_BPS=1000000   # BWE 初始带宽估计 (bit/s, 默认 1 Mbps)
 SFU_SOCK_BUF_MB=16            # UDP socket 收发缓冲区目标 (MB); 实际值受内核 rmem_max/wmem_max 限制
 
+# JWT 用户鉴权 (可选; 未配置密钥则关闭)
+SFU_JWT_SECRET=change-me      # HMAC 对称密钥 (HS256/384/512)
+# SFU_JWT_PUBLIC_KEY_FILE=/etc/sfu/jwt-pub.pem  # 或非对称公钥 (RS/ES/EdDSA)
+# SFU_JWT_ALGORITHM=RS256     # 可选, 缺省按密钥类型推断
+# SFU_JWT_ISSUER=https://idp  # 可选, 校验 iss
+# SFU_JWT_AUDIENCE=webrtc-sfu # 可选, 校验 aud
+# SFU_JWT_REQUIRED=on         # 配置密钥后默认 on; off=有 token 才校验
+
 # 跨主机中继 (单房间跨机扩展)
 SFU_WORKER_OFFSET=0           # 本进程 worker 全局编号起始
 SFU_RELAY_LISTEN=0.0.0.0:5390 # 本进程 relay UDP 监听地址 (启用跨主机中继)
-SFU_RELAY_PEERS=1=10.0.0.2:5390,2=10.0.0.2:5390  # 远端全局 worker -> 对端 relay 地址\n\n# 集群控制面 (集中信令 + worker-only 主机)\nSFU_TOTAL_WORKERS=4           # 整集群 worker 总数 (全局编号 0..total)\nSFU_WORKER_OFFSET=0           # 本进程 worker 全局编号起始\nSFU_SIGNALING=on              # worker-only 进程设 off\nSFU_CONTROL_LISTEN=0.0.0.0:5400                  # 本进程控制面 TCP 监听\nSFU_CONTROL_PEERS=2=10.0.0.2:5400,3=10.0.0.2:5400  # 远端 worker -> 对端控制地址
+SFU_RELAY_PEERS=1=10.0.0.2:5390,2=10.0.0.2:5390  # (旧) 远端全局 worker -> 对端 relay 地址
+
+# 信令 / worker 进程分离 (控制面 gRPC, 媒体面 UDP)
+SFU_TOTAL_WORKERS=4           # 整集群 worker 总数 (全局编号 0..total)
+SFU_WORKER_OFFSET=0           # 本进程 worker 全局编号起始
+SFU_SIGNALING=on              # worker-only 进程设 off
+SFU_CONTROL_LISTEN=0.0.0.0:5600               # worker 进程: MediaControl gRPC 监听
+SFU_CONTROL_PEERS=2=10.0.0.2:5600,3=10.0.0.2:5600  # 远端全局 worker -> 其 gRPC 地址
 
 # WHIP 推流接入 (FFmpeg/GStreamer/OBS 直推 WebRTC)
 SFU_WHIP_ADDR=0.0.0.0:5180    # WHIP HTTP 监听; 不设则不启用

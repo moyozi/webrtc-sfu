@@ -1,0 +1,99 @@
+// SFU 信令 → 媒体服务 gRPC 控制面
+//
+// 信令服务把 worker 命令经 gRPC 下发给媒体服务; 媒体 RTP 仍走 UDP。
+// 每个请求带 `target_worker` (全局编号), 由媒体服务映射到本地 worker。
+
+syntax = "proto3";
+
+package sfu.control.v1;
+
+service MediaControl {
+  // 创建参与者, 同步返回 SDP answer。
+  rpc CreateParticipant(CreateParticipantRequest) returns (CreateParticipantResponse);
+  // 无应答 worker 命令 (ICE 候选 / 订阅 / 中继登记 / 关键帧请求 ...)。
+  rpc SendCommand(SendCommandRequest) returns (SendCommandResponse);
+}
+
+message CreateParticipantRequest {
+  // 目标全局 worker 编号
+  uint32 target_worker = 1;
+  string room_id = 2;
+  string participant_id = 3;
+  string sdp_offer = 4;
+}
+
+message CreateParticipantResponse {
+  bool ok = 1;
+  string participant_id = 2;
+  string sdp_answer = 3;
+  repeated string local_candidates = 4;
+  string error = 5;
+}
+
+message SendCommandRequest {
+  uint32 target_worker = 1;
+  Command command = 2;
+}
+
+message SendCommandResponse {
+  bool accepted = 1;
+}
+
+// 与进程内 `WorkerCommand` 一一对应 (CreateParticipant/Shutdown 除外)。
+message Command {
+  oneof kind {
+    AddRemoteCandidate add_remote_candidate = 1;
+    RemoveParticipant remove_participant = 2;
+    Subscribe subscribe = 3;
+    Unsubscribe unsubscribe = 4;
+    RegisterRelaySubscriber register_relay_subscriber = 5;
+    UnregisterRelaySubscriber unregister_relay_subscriber = 6;
+    RequestKeyframe request_keyframe = 7;
+  }
+}
+
+message AddRemoteCandidate {
+  string participant_id = 1;
+  string candidate = 2;
+  optional string sdp_mid = 3;
+}
+
+message RemoveParticipant {
+  string participant_id = 1;
+}
+
+message Subscribe {
+  string room_id = 1;
+  string subscriber_id = 2;
+  string publisher_id = 3;
+  string publisher_mid = 4;
+  optional string subscriber_mid = 5;
+  uint32 publisher_worker = 6;
+}
+
+message Unsubscribe {
+  string subscriber_id = 1;
+  string publisher_id = 2;
+  string publisher_mid = 3;
+  uint32 publisher_worker = 4;
+}
+
+message RegisterRelaySubscriber {
+  string publisher_id = 1;
+  string publisher_mid = 2;
+  uint32 subscriber_worker = 3;
+  string subscriber_id = 4;
+  optional string subscriber_mid = 5;
+}
+
+message UnregisterRelaySubscriber {
+  string publisher_id = 1;
+  string publisher_mid = 2;
+  string subscriber_id = 3;
+}
+
+message RequestKeyframe {
+  string publisher_id = 1;
+  string publisher_mid = 2;
+  optional string rid = 3;
+}
