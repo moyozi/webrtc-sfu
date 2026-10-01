@@ -7,6 +7,7 @@
 > 📖 **部署与各功能使用请看 [`docs/manual.md`](docs/manual.md)**（安装、配置、浏览器、
 > FFmpeg/GStreamer/OBS 推流、单机/多 worker/跨主机集群、压测、排障）。
 > 跨线程/跨主机中继设计见 [`docs/multi-worker-relay.md`](docs/multi-worker-relay.md)。
+> 信令多机部署（客户端按 `room_id` 分配信令机）见 [`docs/signaling-dispatcher.md`](docs/signaling-dispatcher.md)。
 
 ---
 
@@ -861,6 +862,26 @@ SFU_JWT_SECRET=dev-secret ./scripts/gen-jwt.sh alice room-1 publisher 3600
 
 > 构建需安装 `protoc`（编译 `proto/sfu.proto`）。
 
+### 8.6 信令多机部署：分配器
+
+信令也能多机部署。由于房间成员表是信令进程的**内存状态**，同一 `room_id` 的
+连接必须落到同一台信令机；为此提供**信令分配器**：客户端先向它请求信令地址，
+再连接。它与 SFU 是同一个二进制，设 `SFU_DISPATCHER_ADDR` 即只跑分配器：
+
+```bash
+SFU_DISPATCHER_ADDR=0.0.0.0:5190 \
+SFU_SIGNALING_NODES="cell-a@10.0.0.1:5174:5173:5180:5181;cell-b@10.0.0.2:5174:5173:5180:5181:2" \
+./target/release/sfu-server
+```
+
+```
+POST /allocate {"room_id":"demo"}
+  → {"node_id":"cell-a","ws_url":"ws://10.0.0.1:5174","quic_url":"quic://...", ...}
+```
+
+按带虚拟节点的一致性哈希把房间稳定映射到健康信令机，节点宕机自动顺延。
+详见 [`docs/signaling-dispatcher.md`](docs/signaling-dispatcher.md)。
+
 ---
 
 ## 9. 性能指标预期
@@ -886,6 +907,8 @@ webrtc-sfu/
 └── src/
     ├── main.rs                  ← 入口: 启动 workers + signaling + gRPC 控制面
     ├── config.rs                ← 配置定义 (含 gRPC 控制地址)
+    ├── dispatcher/              ← 信令分配器 (多信令机时按 room_id 分配信令地址)
+    │   └── mod.rs               ← 一致性哈希 + 健康检查 + /allocate HTTP
     ├── grpc/                    ← 信令 → 媒体 gRPC 控制面
     │   ├── mod.rs               ← proto 类型与模块接线
     │   ├── convert.rs           ← WorkerCommand ↔ gRPC Command 转换

@@ -165,6 +165,10 @@ sudo firewall-cmd --reload
 | `SFU_SIGNALING` | `on` | 本进程是否跑信令；worker-only 进程设 `off`。 |
 | `SFU_TOTAL_WORKERS` | `=SFU_WORKERS` | 整集群 worker 总数（全局编号 `0..total`）。 |
 | `SFU_WORKER_OFFSET` | `0` | 本进程 worker 的全局编号起始。 |
+| `SFU_DISPATCHER_ADDR` | 未设 | 设了则本进程**只运行信令分配器**（不启动 worker/信令）。 |
+| `SFU_SIGNALING_NODES` | 未设 | 分配器的信令机清单 `id@host:ws:quic:whip:whep[:weight];...`。 |
+| `SFU_DISPATCHER_HEALTH_INTERVAL_SECS` | `5` | 分配器健康检查周期（秒）。 |
+| `SFU_DISPATCHER_HEALTH_TIMEOUT_MS` | `1000` | 分配器单次健康探测超时（毫秒）。 |
 | `SFU_CONTROL_LISTEN` | 未设 | 本进程 `MediaControl` gRPC 监听（信令 → 远端 worker 命令）。 |
 | `SFU_CONTROL_PEERS` | 未设 | `idx=host:port,...`，远端全局 worker → 其 gRPC 地址。 |
 | `SFU_RELAY_LISTEN` | 未设 | 本机收发跨主机中继 RTP 的 UDP 端点。 |
@@ -348,6 +352,27 @@ SFU_RELAY_PEERS=0=10.0.0.1:5390,1=10.0.0.1:5390
 
 > 注意：**发布者当前会把所有 simulcast 层中继给订阅者主机**（由订阅端选层）。
 > 跨主机带宽会偏大；后续可按订阅者 BWE 在中继端裁剪。
+
+### 8.5 信令多机部署：信令分配器
+
+上面 8.3 是「集中信令」，客户端硬编码连接唯一信令机。若信令也要多机部署，
+需要一个**信令分配器**把 `room_id` 稳定映射到一台健康信令机 —— 因为房间成员表
+是信令进程的**内存状态**，同一房间必须连到同一台信令机。
+
+分配器与 SFU 是同一个二进制，设了 `SFU_DISPATCHER_ADDR` 即只跑分配器：
+
+```bash
+# 分配器（可多实例 + VIP，无状态）
+SFU_DISPATCHER_ADDR=0.0.0.0:5190 \
+SFU_SIGNALING_NODES="cell-a@10.0.0.1:5174:5173:5180:5181;cell-b@10.0.0.2:5174:5173:5180:5181:2" \
+./target/release/sfu-server
+```
+
+客户端先 `POST /allocate {"room_id":"demo"}` 拿回该房间的 `ws_url` / `quic_url` /
+`whip_url` / `whep_url`，再连接即可；协议本身不变。每台信令机的
+`SFU_TOTAL_WORKERS` / `SFU_ROOM_WORKERS` / `SFU_CONTROL_PEERS` 必须一致。
+
+完整设计、接口与部署拓扑见 [`docs/signaling-dispatcher.md`](signaling-dispatcher.md)。
 
 ---
 

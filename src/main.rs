@@ -4,6 +4,7 @@
 
 mod cluster;
 mod config;
+mod dispatcher;
 mod grpc;
 mod net;
 mod sfu;
@@ -22,6 +23,14 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // 信令分配器角色: 设置 SFU_DISPATCHER_ADDR 时本进程只做信令地址分配,
+    // 不启动 worker / 信令服务器。它通常独立部署为一组无状态实例 (前置 VIP/LB)。
+    if let Some(dcfg) = dispatcher::DispatcherConfig::from_env() {
+        info!(?dcfg, "启动信令分配器");
+        dispatcher::run_blocking(dcfg);
+        return;
+    }
 
     // 解析配置
     let config = SfuConfig::from_args();
