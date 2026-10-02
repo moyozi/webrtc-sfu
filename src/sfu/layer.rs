@@ -8,12 +8,14 @@
 //! - `select_layer`：在预算内选择码率不超限的最高层；
 //! - `is_keyframe`：复用 str0m 的编解码器关键帧探测，用于层切换时确认
 //!   目标层已有关键帧；
-//! - `vp8_temporal_id`：解析 VP8 RTP payload descriptor 的时间层索引，
-//!   用于 SVC 时间层降级。
+//! - `vp8_temporal_id`：解析 VP8 RTP payload descriptor 的时间层索引；
+//! - `vp9_sid_tid`：解析 VP9 RTP payload descriptor 的 (空间层, 时间层)；
+//! - `select_svc`：在预算内选择质量最高的 SVC 目标层 (sid, tid)。
 //!
-//! > 说明: str0m 的公开 API 不暴露 VP9/AV1 的空间层索引 (仅在 frame-level
-//! > 的 `MediaData.codec_extra` 中)，因此本 SFU 目前只能对 **VP8 时间层**
-//! > 做 SVC 降级；VP9/AV1 空间层选择需要自行解析 payload descriptor。
+//! > 说明: str0m 的公开 API 不暴露 VP9/AV1 的层索引，这里自行解析 payload
+//! > descriptor。目前已支持 **VP8 时间层** 与 **VP9 空间层 + 时间层**
+//! > (non-flexible 模式)；AV1 与 VP9 flexible 模式暂不解析, 遇到时按非 SVC
+//! > 处理 (不过滤, 全转发), 保证兼容性。
 
 use std::time::{Duration, Instant};
 
@@ -90,6 +92,31 @@ pub fn select_layer(layers: &[(Rid, u64)], budget_bps: u64, headroom: f64) -> Op
         .map(|(rid, _)| *rid)
 }
 
+/// SVC 候选目标层: `(spatial_id, temporal_id)` → 解码该目标所需的**累计**码率。
+///
+/// 累计 = 所有 `sid <= S` 且 `tid <= T` 的层码率之和。
+pub type SvcTarget = ((u8, u8), u64);
+
+/// 在预算内选择质量最高的 SVC 目标层。
+///
+/// * `candidates` 需按**质量升序**排列 (先 `sid` 后 `tid`)；
+/// * `budget_bps` 为可用带宽估计；`headroom` 为冗余系数 (如 0.95)。
+///
+/// 返回 `None` 表示连最低候选都超出预算 (调用方可回退到最低层)。
+/// 策略为**空间优先**: 在预算内优先升空间层, 再升时间层。
+pub fn select_svc(
+    candidates: &[SvcTarget],
+    budget_bps: u64,
+    headroom: f64,
+) -> Option<(u8, u8)> {
+    let effective = (budget_bps as f64 * headroom.max(0.0)) as u64;
+    candidates
+        .iter()
+        .rev()
+        .find(|(_, bps)| *bps <= effective)
+        .map(|(st, _)| *st)
+}
+
 /// 判断一个 RTP payload 是否以关键帧开始 (用于层切换确认)。
 pub fn is_keyframe(codec: Codec, payload: &[u8]) -> bool {
     use str0m::format::{
@@ -146,6 +173,40 @@ pub fn vp8_temporal_id(payload: &[u8]) -> Option<u8> {
     }
 
     Some(0)
+}
+
+/// 解析 VP9 RTP payload descriptor，返回 `(spatial_id, temporal_id)`。
+///
+/// 依据 RFC 9628。仅解析 **non-flexible 模式** (F=0，每个包承载单个空间层):
+/// 该模式覆盖浏览器 K-SVC 的常见用法。遇到 flexible 模式 (F=1)、缺少层信息
+/// 或解析失败时返回 `None`，调用方据此视为非 SVC、不做层过滤。
+pub fn vp9_sid_tid(payload: &[u8]) -> Option<(u8, u8)> {
+    let b0 = *payload.first()?;
+    let has_picture_id = b0 & 0x80 != 0; // I
+    let has_layer_indices = b0 & 0x20 != 0; // L
+    let flexible = b0 & 0x10 != 0; // F
+    if flexible {
+        return None;
+    }
+
+    let mut off = 1usize;
+    if has_picture_id {
+        let p = *payload.get(off)?;
+        // 15-bit PictureID 占 2 字节，7-bit 占 1 字节。
+        off += if p & 0x80 != 0 { 2 } else { 1 };
+    }
+    if !has_layer_indices {
+        // 无层信息 → 单层。
+        return Some((0, 0));
+    }
+    // TL0PICIDX (存在但 SFU 不需要)
+    let _ = *payload.get(off)?;
+    off += 1;
+    // TID(3) | U(1) | SID(3) | D(1)
+    let b = *payload.get(off)?;
+    let tid = (b >> 5) & 0x07;
+    let sid = (b >> 1) & 0x07;
+    Some((sid, tid))
 }
 
 #[cfg(test)]
@@ -217,5 +278,48 @@ mod tests {
         // 截断 → None
         assert_eq!(vp8_temporal_id(&[]), None);
         assert_eq!(vp8_temporal_id(&[0x80]), None);
+    }
+
+    #[test]
+    fn vp9_sid_tid_parsing() {
+        // 无扩展 (L=0) → 单层 (0,0)
+        assert_eq!(vp9_sid_tid(&[0x00]), Some((0, 0)));
+
+        // L=1: TL0PICIDX + TID/SID 字节。0x42 = TID=2, SID=1
+        assert_eq!(vp9_sid_tid(&[0x20, 0xAA, 0x42]), Some((1, 2)));
+
+        // I=1 (7-bit PictureID) + L=1: [flags, pid, tl0, tid/sid]
+        // 0xA0 = I|L; pid=0x12 (7-bit); tl0=0xAA; byte=0b00_111_0_1_0 → tid=0, sid=3
+        assert_eq!(vp9_sid_tid(&[0xA0, 0x12, 0xAA, 0x06]), Some((3, 0)));
+
+        // I=1 (15-bit PictureID, pid 首字节最高位=1) + L=1
+        assert_eq!(vp9_sid_tid(&[0xA0, 0x80, 0x01, 0xAA, 0x63]), Some((1, 3)));
+
+        // flexible 模式 (F=1) → None
+        assert_eq!(vp9_sid_tid(&[0x10, 0x00]), None);
+
+        // 截断 → None
+        assert_eq!(vp9_sid_tid(&[]), None);
+        assert_eq!(vp9_sid_tid(&[0x20]), None);
+        assert_eq!(vp9_sid_tid(&[0x20, 0xAA]), None);
+    }
+
+    #[test]
+    fn select_svc_spatial_first() {
+        // 候选按 (sid,tid) 升序, 码率为累计值
+        let c: Vec<SvcTarget> = vec![
+            ((0, 0), 100_000),
+            ((0, 1), 400_000),
+            ((1, 0), 300_000),
+            ((1, 1), 600_000),
+        ];
+        // 充足 → 最高 (1,1)
+        assert_eq!(select_svc(&c, 2_000_000, 0.95), Some((1, 1)));
+        // 350k: (1,1)600 超, (1,0)300 满足 → 空间优先选 (1,0)
+        assert_eq!(select_svc(&c, 350_000, 0.95), Some((1, 0)));
+        // 200k: (1,0)300 超, (0,1)400 超, (0,0)100 满足
+        assert_eq!(select_svc(&c, 200_000, 0.95), Some((0, 0)));
+        // 过低 → None
+        assert_eq!(select_svc(&c, 50_000, 0.95), None);
     }
 }

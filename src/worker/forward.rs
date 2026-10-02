@@ -11,8 +11,12 @@ use super::output::drain_and_schedule;
 use super::relay::{RelayControl, RelayHub, RelayedRtp};
 use super::timer::TimerWheel;
 use crate::net::udp::SendBatch;
-use crate::sfu::layer::{is_keyframe, select_layer, vp8_temporal_id, RateWindow};
-use crate::sfu::participant::{Participant, ParticipantTable, TxTrack};
+use crate::sfu::layer::{
+    is_keyframe, select_layer, select_svc, vp8_temporal_id, vp9_sid_tid, RateWindow, SvcTarget,
+};
+use crate::sfu::participant::{
+    Participant, ParticipantTable, TxTrack, LAYER_EVAL_INTERVAL, SWITCH_KEYFRAME_TIMEOUT,
+};
 use crate::sfu::router::Router;
 use ahash::AHashMap;
 use arrayvec::ArrayVec;
@@ -60,14 +64,28 @@ pub(super) fn bwe_kind_bps(kind: &str0m::bwe::BweKind) -> u64 {
     }
 }
 
+/// 从编码 + payload 解析 SVC 层索引 `(sid, tid)`。
+/// 无法解析时返回 `(None, None)`，调用方据此按非 SVC 处理 (不过滤)。
+fn parse_layer_ids(codec: str0m::format::Codec, payload: &[u8]) -> (Option<u8>, Option<u8>) {
+    match codec {
+        str0m::format::Codec::Vp8 => (Some(0), vp8_temporal_id(payload)),
+        str0m::format::Codec::Vp9 => match vp9_sid_tid(payload) {
+            Some((s, t)) => (Some(s), Some(t)),
+            None => (None, None),
+        },
+        _ => (None, None),
+    }
+}
+
 /// 转发源上下文: 统一「本地入站包」与「跨 worker 中继包」。
 pub(super) struct SourceCtx<'a> {
     publisher_id: &'a str,
     mid: Mid,
     params: PayloadParams,
     layers: &'a [(Rid, u64)],
-    temporal: &'a [(u8, u64)],
+    svc: &'a [SvcTarget],
     incoming_rid: Option<Rid>,
+    incoming_sid: Option<u8>,
     incoming_tid: Option<u8>,
     packet_keyframe: bool,
     seq_no: SeqNo,
@@ -89,15 +107,18 @@ pub(super) struct RemoteLayer {
     mid: Mid,
     rid: Option<Rid>,
     rate: RateWindow,
-    tid_rates: [RateWindow; 4],
+    /// SVC: [spatial_id][temporal_id] → 码率
+    svc: Box<[[RateWindow; 4]; 8]>,
 }
 
 impl RemotePublisherStats {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn observe(
         &mut self,
         ssrc: Ssrc,
         mid: Mid,
         rid: Option<Rid>,
+        sid: Option<u8>,
         tid: Option<u8>,
         bytes: usize,
         now: Instant,
@@ -106,14 +127,16 @@ impl RemotePublisherStats {
             mid,
             rid,
             rate: RateWindow::new(now),
-            tid_rates: std::array::from_fn(|_| RateWindow::new(now)),
+            svc: Box::new(std::array::from_fn(|_| {
+                std::array::from_fn(|_| RateWindow::new(now))
+            })),
         });
         if e.rid.is_none() {
             e.rid = rid;
         }
         e.rate.add(bytes, now);
-        if let Some(t) = tid {
-            e.tid_rates[(t & 3) as usize].add(bytes, now);
+        if let (Some(sid), Some(tid)) = (sid, tid) {
+            e.svc[(sid & 0x07) as usize][(tid & 0x03) as usize].add(bytes, now);
         }
     }
 
@@ -130,26 +153,42 @@ impl RemotePublisherStats {
         v
     }
 
-    pub(super) fn temporal_rates(&self, mid: Mid) -> ArrayVec<(u8, u64), 4> {
-        let mut own = [0u64; 4];
+    /// 该 mid 的 SVC 候选目标层 `(sid, tid) → 累计 bps`，按质量升序。
+    /// 与 `Participant::svc_candidates` 语义一致 (跨 worker 中继包共用逻辑)。
+    pub(super) fn svc_candidates(&self, mid: Mid) -> ArrayVec<SvcTarget, 32> {
+        let mut own = [[0u64; 4]; 8];
+        let mut max_sid = 0u8;
+        let mut max_tid = 0u8;
+        let mut layered = false;
         for l in self.layers.values().filter(|l| l.mid == mid) {
-            for (t, o) in own.iter_mut().enumerate() {
-                *o += l.tid_rates[t].bps();
+            for (s, row) in l.svc.iter().enumerate() {
+                for (t, w) in row.iter().enumerate() {
+                    let b = w.bps();
+                    if b == 0 {
+                        continue;
+                    }
+                    own[s][t] += b;
+                    max_sid = max_sid.max(s as u8);
+                    max_tid = max_tid.max(t as u8);
+                    if s > 0 || t > 0 {
+                        layered = true;
+                    }
+                }
             }
         }
-        if own[1..].iter().all(|&b| b == 0) {
-            return ArrayVec::new();
+        let mut v: ArrayVec<SvcTarget, 32> = ArrayVec::new();
+        if !layered {
+            return v;
         }
-        let mut cum = [0u64; 4];
-        let mut acc = 0u64;
-        for t in 0..4usize {
-            acc += own[t];
-            cum[t] = acc;
-        }
-        let mut v: ArrayVec<(u8, u64), 4> = ArrayVec::new();
-        for t in 0..4usize {
-            if t == 0 || own[t] > 0 {
-                let _ = v.try_push((t as u8, cum[t]));
+        for s in 0..=max_sid as usize {
+            for t in 0..=max_tid as usize {
+                let cum: u64 = own[..=s]
+                    .iter()
+                    .flat_map(|row| row[..=t].iter())
+                    .sum();
+                if cum > 0 {
+                    let _ = v.try_push(((s as u8, t as u8), cum));
+                }
             }
         }
         v
@@ -183,10 +222,7 @@ pub(super) fn request_publisher_keyframe(
     table: &mut ParticipantTable,
 ) {
     if let Some(p) = table.get_mut(publisher_id) {
-        let mid = Mid::from(publisher_mid);
-        if let Some(stream) = p.rtc.direct_api().stream_rx_by_mid(mid, rid) {
-            stream.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
-        }
+        p.request_keyframe_at(Mid::from(publisher_mid), rid, Instant::now());
     }
 }
 
@@ -198,11 +234,10 @@ fn request_keyframe(
     table: &mut ParticipantTable,
     remote_publishers: &AHashMap<String, usize>,
     relay: &RelayHub,
+    now: Instant,
 ) -> bool {
     if let Some(p) = table.get_mut(publisher_id) {
-        if let Some(stream) = p.rtc.direct_api().stream_rx_by_mid(mid, rid) {
-            stream.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
-        }
+        p.request_keyframe_at(mid, rid, now);
         true
     } else if let Some(&w) = remote_publishers.get(publisher_id) {
         relay.send_control(
@@ -241,8 +276,7 @@ fn deliver_to_subscribers(
     }
 
     let simulcast = src.incoming_rid.is_some();
-    let svc = !simulcast && src.temporal.len() > 1;
-    let total_layer_bps: u64 = src.layers.iter().map(|(_, b)| *b).sum();
+    let svc = !simulcast && !src.svc.is_empty();
 
     let mut keyframe_requests: Vec<(String, str0m::media::KeyframeRequest)> = Vec::new();
     let mut switch_requests: Vec<Option<Rid>> = Vec::new();
@@ -264,10 +298,12 @@ fn deliver_to_subscribers(
         };
         let subscriber_mid = sub.subscriber_mid;
 
-        let desired = if total_layer_bps > 0 {
-            total_layer_bps
+        // 目标码率 = 最高可选层的实际码率 (同一时刻只会发一层, 不能用各层之和,
+        // 否则 BWE 会过度探测)。SVC 取最高候选的累计码率。
+        let desired = if let Some((_, b)) = src.layers.last() {
+            *b
         } else {
-            src.temporal.last().map(|(_, b)| *b).unwrap_or(0)
+            src.svc.last().map(|(_, b)| *b).unwrap_or(0)
         };
         subscriber.maybe_set_desired_bitrate(desired, now);
         let budget = subscriber.egress_bitrate().unwrap_or(0);
@@ -329,6 +365,22 @@ fn deliver_to_subscribers(
             let state = &mut track.layer;
 
             if simulcast {
+                // 切换超时: 目标层迟迟没有关键帧时回退, 避免永久黑屏。
+                if let Some(ps) = state.pending_since {
+                    if now.saturating_duration_since(ps) >= SWITCH_KEYFRAME_TIMEOUT {
+                        if state.current.is_none() {
+                            // 从未有过画面: 强制接受目标层, 先出画再说。
+                            if let Some(t) = state.pending {
+                                state.current = Some(t);
+                                switch_requests.push(Some(t));
+                            }
+                        }
+                        state.pending = None;
+                        state.pending_since = None;
+                        // 立即重新评估, 重试关键帧请求。
+                        state.last_eval = now.checked_sub(LAYER_EVAL_INTERVAL).unwrap_or(now);
+                    }
+                }
                 if Participant::should_eval_layer(state, now) {
                     let target = if budget == 0 {
                         src.layers.last().map(|(r, _)| *r)
@@ -338,6 +390,7 @@ fn deliver_to_subscribers(
                     };
                     if target != state.current && target != state.pending {
                         state.pending = target;
+                        state.pending_since = target.map(|_| now);
                         if target.is_some() {
                             switch_requests.push(target);
                         }
@@ -351,6 +404,7 @@ fn deliver_to_subscribers(
                             && src.packet_keyframe
                         {
                             state.current = state.pending.take();
+                            state.pending_since = None;
                         } else if state.current.is_none()
                             && state.pending.is_none()
                             && src.packet_keyframe
@@ -363,23 +417,25 @@ fn deliver_to_subscribers(
                 }
             } else if svc {
                 if Participant::should_eval_layer(state, now) {
-                    let effective = (budget as f64 * 0.95) as u64;
                     let target = if budget == 0 {
-                        src.temporal.last().map(|(t, _)| *t)
+                        src.svc.last().map(|(st, _)| *st)
                     } else {
-                        src.temporal
-                            .iter()
-                            .rev()
-                            .find(|(_, bps)| *bps <= effective)
-                            .map(|(t, _)| *t)
-                            .or_else(|| src.temporal.first().map(|(t, _)| *t))
+                        select_svc(src.svc, budget, 0.95)
+                            .or_else(|| src.svc.first().map(|(st, _)| *st))
                     };
-                    if target != state.max_tid {
-                        state.max_tid = target;
+                    if let Some((s, t)) = target {
+                        state.max_sid = Some(s);
+                        state.max_tid = Some(t);
                     }
                 }
-                if let (Some(tid), Some(max)) = (src.incoming_tid, state.max_tid) {
-                    if tid > max {
+                // 丢弃高于目标 (sid, tid) 的包 (SVC 分层解码所需子集)。
+                if let (Some(sid), Some(tid), Some(max_sid), Some(max_tid)) = (
+                    src.incoming_sid,
+                    src.incoming_tid,
+                    state.max_sid,
+                    state.max_tid,
+                ) {
+                    if sid > max_sid || tid > max_tid {
                         forward = false;
                     }
                 }
@@ -488,6 +544,7 @@ fn deliver_to_subscribers(
             table,
             remote_publishers,
             relay,
+            now,
         ) {
             local_drain.push(src.publisher_id.to_string());
         }
@@ -495,7 +552,7 @@ fn deliver_to_subscribers(
     for (subscriber_id, req) in keyframe_requests {
         let targets = router.publisher_for_subscriber_mid(&subscriber_id, req.mid);
         for (pub_id, pub_mid) in targets {
-            if request_keyframe(&pub_id, pub_mid, req.rid, table, remote_publishers, relay) {
+            if request_keyframe(&pub_id, pub_mid, req.rid, table, remote_publishers, relay, now) {
                 local_drain.push(pub_id);
             }
         }
@@ -521,7 +578,7 @@ pub(super) fn forward_rtp_to_subscribers(
     relay_tx: &mut RelayTxState,
     remote_publishers: &AHashMap<String, usize>,
 ) {
-    let (params, layers, temporal) = {
+    let (params, layers, svc_layers, incoming_sid, incoming_tid) = {
         let publisher = match table.get_mut(publisher_id) {
             Some(p) => p,
             None => return,
@@ -530,41 +587,38 @@ pub(super) fn forward_rtp_to_subscribers(
             Some(p) => p,
             None => return,
         };
-        let tid = if params.spec().codec == str0m::format::Codec::Vp8 {
-            vp8_temporal_id(&pkt.payload)
-        } else {
-            None
-        };
+        let (sid, tid) = parse_layer_ids(params.spec().codec, &pkt.payload);
         publisher.observe_rx_packet(
             pkt.header.ssrc,
             publisher_mid,
             pkt.header.ext_vals.rid,
+            sid,
             tid,
             pkt.payload.len() + pkt.header.header_len,
             now,
         );
         let layers = publisher.layer_rates(publisher_mid);
-        let temporal = publisher.temporal_rates(publisher_mid);
-        (params, layers, temporal)
+        // 仅无 RID 的 VP8/VP9 流才可能是 SVC; 其余跳过候选计算 (热路径)。
+        let svc_layers = if pkt.header.ext_vals.rid.is_none() && sid.is_some() && tid.is_some() {
+            publisher.svc_candidates(publisher_mid)
+        } else {
+            ArrayVec::new()
+        };
+        (params, layers, svc_layers, sid, tid)
     };
 
     let codec = params.spec().codec;
     let incoming_rid = pkt.header.ext_vals.rid;
-    let svc = incoming_rid.is_none() && temporal.len() > 1;
     let packet_keyframe = codec.is_video() && is_keyframe(codec, &pkt.payload);
-    let incoming_tid = if svc {
-        vp8_temporal_id(&pkt.payload)
-    } else {
-        None
-    };
 
     let src = SourceCtx {
         publisher_id,
         mid: publisher_mid,
         params,
         layers: &layers,
-        temporal: &temporal,
+        svc: &svc_layers,
         incoming_rid,
+        incoming_sid,
         incoming_tid,
         packet_keyframe,
         seq_no: pkt.seq_no,
@@ -605,6 +659,7 @@ pub(super) fn forward_relayed_rtp(
     remote_stats: &mut AHashMap<String, RemotePublisherStats>,
     remote_publishers: &AHashMap<String, usize>,
 ) {
+    let (sid, tid) = parse_layer_ids(relayed.params.spec().codec, &relayed.payload);
     {
         if !remote_stats.contains_key(&*relayed.publisher_id) {
             remote_stats.insert(
@@ -613,15 +668,11 @@ pub(super) fn forward_relayed_rtp(
             );
         }
         let stats = remote_stats.get_mut(&*relayed.publisher_id).unwrap();
-        let tid = if relayed.params.spec().codec == str0m::format::Codec::Vp8 {
-            vp8_temporal_id(&relayed.payload)
-        } else {
-            None
-        };
         stats.observe(
             relayed.ssrc,
             relayed.publisher_mid,
             relayed.rid,
+            sid,
             tid,
             relayed.payload.len(),
             now,
@@ -630,16 +681,14 @@ pub(super) fn forward_relayed_rtp(
 
     let stats = remote_stats.get(&*relayed.publisher_id).unwrap();
     let layers = stats.layer_rates(relayed.publisher_mid);
-    let temporal = stats.temporal_rates(relayed.publisher_mid);
+    let svc_layers = if relayed.rid.is_none() && sid.is_some() && tid.is_some() {
+        stats.svc_candidates(relayed.publisher_mid)
+    } else {
+        ArrayVec::new()
+    };
 
     let codec = relayed.params.spec().codec;
     let incoming_rid = relayed.rid;
-    let svc = incoming_rid.is_none() && temporal.len() > 1;
-    let incoming_tid = if svc {
-        vp8_temporal_id(&relayed.payload)
-    } else {
-        None
-    };
     let packet_keyframe = codec.is_video() && is_keyframe(codec, &relayed.payload);
 
     let src = SourceCtx {
@@ -647,9 +696,10 @@ pub(super) fn forward_relayed_rtp(
         mid: relayed.publisher_mid,
         params: relayed.params,
         layers: &layers,
-        temporal: &temporal,
+        svc: &svc_layers,
         incoming_rid,
-        incoming_tid,
+        incoming_sid: sid,
+        incoming_tid: tid,
         packet_keyframe,
         seq_no: relayed.seq_no,
         timestamp: relayed.timestamp,

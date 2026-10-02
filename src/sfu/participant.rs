@@ -7,7 +7,7 @@
 //! - SDP 协商
 //! - 媒体收发
 
-use crate::sfu::layer::RateWindow;
+use crate::sfu::layer::{RateWindow, SvcTarget};
 use ahash::AHashMap;
 use arrayvec::ArrayVec;
 use std::net::SocketAddr;
@@ -25,10 +25,11 @@ pub struct LayerRx {
     pub mid: Mid,
     /// simulcast RID (非 simulcast 为 None)
     pub rid: Option<Rid>,
-    /// 该层的码率估计
+    /// 该层的整体码率估计 (simulcast 选层用)
     pub rate: RateWindow,
-    /// SVC: 按时间层 (TID 0..3) 分别估计的码率
-    pub tid_rates: [RateWindow; 4],
+    /// SVC: 按 (空间层 SID, 时间层 TID) 分别估计的码率。
+    /// 单层流也会记录 `[0][0]`，便于统一做累计选择。
+    pub svc: Box<[[RateWindow; 4]; 8]>,
 }
 
 /// 订阅者对某条发布轨道的层选择状态。
@@ -37,6 +38,10 @@ pub struct LayerState {
     pub current: Option<Rid>,
     /// 正在等待关键帧的目标 simulcast 层
     pub pending: Option<Rid>,
+    /// `pending` 开始等待的时刻 (用于切换超时回退, None = 无等待)
+    pub pending_since: Option<Instant>,
+    /// SVC: 当前允许的最大空间层 (None = 不过滤)
+    pub max_sid: Option<u8>,
     /// SVC: 当前允许的最大时间层 (None = 不过滤)
     pub max_tid: Option<u8>,
     /// 上次重新评估目标的时刻
@@ -44,7 +49,13 @@ pub struct LayerState {
 }
 
 /// 重新评估层选择的最小间隔
-const LAYER_EVAL_INTERVAL: Duration = Duration::from_millis(500);
+pub const LAYER_EVAL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// simulcast 目标层等待关键帧的超时: 超时后回退/重试, 避免永久黑屏。
+pub const SWITCH_KEYFRAME_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// 关键帧请求 (PLI) 的最小间隔, 抑制多订阅者同时触发的 PLI 风暴。
+pub const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 订阅者向某个 mid 转发时需要的全部可变状态。
 ///
@@ -70,8 +81,10 @@ impl TxTrack {
             layer: LayerState {
                 current: None,
                 pending: None,
+                pending_since: None,
+                max_sid: None,
                 max_tid: None,
-                last_eval: now - LAYER_EVAL_INTERVAL,
+                last_eval: now.checked_sub(LAYER_EVAL_INTERVAL).unwrap_or(now),
             },
             declared: false,
             cached_params: None,
@@ -124,6 +137,9 @@ pub struct Participant {
     /// 上次更新 BWE desired bitrate 的时刻 (节流)。
     last_desired_update: Instant,
 
+    /// 关键帧请求 (PLI) 节流: (mid, rid) → 上次请求时刻。
+    keyframe_requests: AHashMap<(Mid, Option<Rid>), Instant>,
+
     /// 本地绑定地址
     local_addr: SocketAddr,
 }
@@ -171,17 +187,20 @@ impl Participant {
             published: AHashMap::new(),
             egress_bitrate: None,
             // 置为「久远以前」，使首个包即可应用 desired bitrate。
-            last_desired_update: now - DESIRED_BITRATE_INTERVAL,
+            last_desired_update: now.checked_sub(DESIRED_BITRATE_INTERVAL).unwrap_or(now),
+            keyframe_requests: AHashMap::new(),
             local_addr,
         })
     }
 
     /// 记录一个入站 RTP 包的层速率。
+    #[allow(clippy::too_many_arguments)]
     pub fn observe_rx_packet(
         &mut self,
         ssrc: Ssrc,
         mid: Mid,
         rid: Option<Rid>,
+        sid: Option<u8>,
         tid: Option<u8>,
         bytes: usize,
         now: Instant,
@@ -190,48 +209,78 @@ impl Participant {
             mid,
             rid,
             rate: RateWindow::new(now),
-            tid_rates: std::array::from_fn(|_| RateWindow::new(now)),
+            svc: Box::new(std::array::from_fn(|_| {
+                std::array::from_fn(|_| RateWindow::new(now))
+            })),
         });
         // rid 可能首包缺失 (无 RID 扩展) 后续才出现，补齐。
         if entry.rid.is_none() {
             entry.rid = rid;
         }
         entry.rate.add(bytes, now);
-        if let Some(tid) = tid {
-            entry.tid_rates[(tid & 0x03) as usize].add(bytes, now);
+        if let (Some(sid), Some(tid)) = (sid, tid) {
+            entry.svc[(sid & 0x07) as usize][(tid & 0x03) as usize].add(bytes, now);
         }
     }
 
-    /// 该 mid 的 SVC 时间层累计码率 (tid, 累计 bps)，按 tid 升序。
+    /// 该 mid 的 SVC 候选目标层 `(sid, tid) → 累计 bps`，按质量升序。
     ///
-    /// `cum[t]` = 所有 `tid <= t` 的时间层码率之和，即「目标时间层为 t 时」
-    /// 的发送码率。若只有一个时间层 (tid 0) 则返回空。
-    /// 使用栈上 `ArrayVec`，热路径零堆分配。
-    pub fn temporal_rates(&self, mid: Mid) -> ArrayVec<(u8, u64), 4> {
-        // 先统计每个时间层自身的码率，再求前缀和得到累计码率。
-        let mut own = [0u64; 4];
+    /// 累计 = 所有 `sid <= S` 且 `tid <= T` 的层码率之和 (解码目标层所需数据)。
+    /// 若不含任何高空间/时间层 (SID>0 或 TID>0) 则返回空, 表示非 SVC。
+    /// 使用栈上 `ArrayVec` (最多 8×4)，热路径零堆分配。
+    pub fn svc_candidates(&self, mid: Mid) -> ArrayVec<SvcTarget, 32> {
+        let mut own = [[0u64; 4]; 8];
+        let mut max_sid = 0u8;
+        let mut max_tid = 0u8;
+        let mut layered = false;
         for l in self.rx_layers.values().filter(|l| l.mid == mid) {
-            for (t, o) in own.iter_mut().enumerate() {
-                *o += l.tid_rates[t].bps();
+            for (s, row) in l.svc.iter().enumerate() {
+                for (t, w) in row.iter().enumerate() {
+                    let b = w.bps();
+                    if b == 0 {
+                        continue;
+                    }
+                    own[s][t] += b;
+                    max_sid = max_sid.max(s as u8);
+                    max_tid = max_tid.max(t as u8);
+                    if s > 0 || t > 0 {
+                        layered = true;
+                    }
+                }
             }
         }
-        // 只有存在 >0 的高时间层才认为是 SVC 时间分层。
-        if own[1..].iter().all(|&b| b == 0) {
-            return ArrayVec::new();
+        let mut v: ArrayVec<SvcTarget, 32> = ArrayVec::new();
+        if !layered {
+            return v;
         }
-        let mut cum = [0u64; 4];
-        let mut acc = 0u64;
-        for t in 0..4usize {
-            acc += own[t];
-            cum[t] = acc;
-        }
-        let mut v: ArrayVec<(u8, u64), 4> = ArrayVec::new();
-        for t in 0..4usize {
-            if t == 0 || own[t] > 0 {
-                let _ = v.try_push((t as u8, cum[t]));
+        for s in 0..=max_sid as usize {
+            for t in 0..=max_tid as usize {
+                let cum: u64 = own[..=s]
+                    .iter()
+                    .flat_map(|row| row[..=t].iter())
+                    .sum();
+                if cum > 0 {
+                    let _ = v.try_push(((s as u8, t as u8), cum));
+                }
             }
         }
         v
+    }
+
+    /// 请求发布者关键帧 (PLI)，带节流。返回是否真正发出请求。
+    pub fn request_keyframe_at(&mut self, mid: Mid, rid: Option<Rid>, now: Instant) -> bool {
+        let last = self
+            .keyframe_requests
+            .entry((mid, rid))
+            .or_insert_with(|| now.checked_sub(KEYFRAME_REQUEST_INTERVAL).unwrap_or(now));
+        if now.saturating_duration_since(*last) < KEYFRAME_REQUEST_INTERVAL {
+            return false;
+        }
+        *last = now;
+        if let Some(stream) = self.rtc.direct_api().stream_rx_by_mid(mid, rid) {
+            stream.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
+        }
+        true
     }
 
     /// 该 mid 上所有 simulcast 层及其码率，按码率升序。
@@ -556,8 +605,8 @@ mod tests {
         let high: Ssrc = 20.into();
         for i in 1..=6u64 {
             let t = now + Duration::from_millis(100 * i);
-            p.observe_rx_packet(low, mid, Some(Rid::from("l")), None, 1000, t);
-            p.observe_rx_packet(high, mid, Some(Rid::from("h")), None, 2000, t);
+            p.observe_rx_packet(low, mid, Some(Rid::from("l")), Some(0), Some(0), 1000, t);
+            p.observe_rx_packet(high, mid, Some(Rid::from("h")), Some(0), Some(0), 2000, t);
         }
 
         let rates = p.layer_rates(mid);
@@ -570,9 +619,9 @@ mod tests {
         assert!(p.layer_rates(Mid::from("0")).is_empty());
     }
 
-    /// SVC 时间层累计码率随 tid 递增。
+    /// SVC 时间层累计码率随 tid 递增 (sid 恒为 0)。
     #[test]
-    fn temporal_rates_are_cumulative() {
+    fn svc_temporal_candidates_are_cumulative() {
         let now = Instant::now();
         let mut p = Participant::new(
             "p1".into(),
@@ -587,16 +636,55 @@ mod tests {
         for i in 1..=6u64 {
             let t = now + Duration::from_millis(100 * i);
             // tid0 每个时间点 2 个包, tid1 1 个包。
-            p.observe_rx_packet(ssrc, mid, None, Some(0), 1000, t);
-            p.observe_rx_packet(ssrc, mid, None, Some(0), 1000, t);
-            p.observe_rx_packet(ssrc, mid, None, Some(1), 1000, t);
+            p.observe_rx_packet(ssrc, mid, None, Some(0), Some(0), 1000, t);
+            p.observe_rx_packet(ssrc, mid, None, Some(0), Some(0), 1000, t);
+            p.observe_rx_packet(ssrc, mid, None, Some(0), Some(1), 1000, t);
         }
 
-        let tr = p.temporal_rates(mid);
-        assert_eq!(tr.len(), 2);
-        assert_eq!(tr[0].0, 0);
-        assert_eq!(tr[1].0, 1);
-        // 累计: tid1 包含 tid0。
-        assert!(tr[1].1 > tr[0].1);
+        let c = p.svc_candidates(mid);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].0, (0, 0));
+        assert_eq!(c[1].0, (0, 1));
+        // 累计: (0,1) 包含 (0,0)。
+        assert!(c[1].1 > c[0].1);
+    }
+
+    /// SVC 空间层候选 (sid>0) 参与累计。
+    #[test]
+    fn svc_spatial_candidates() {
+        let now = Instant::now();
+        let mut p = Participant::new(
+            "p1".into(),
+            "room".into(),
+            "127.0.0.1:5000".parse().unwrap(),
+            1_000_000,
+        )
+        .unwrap();
+        let mid = Mid::from("1");
+        let ssrc: Ssrc = 9.into();
+
+        for i in 1..=6u64 {
+            let t = now + Duration::from_millis(100 * i);
+            p.observe_rx_packet(ssrc, mid, None, Some(0), Some(0), 1000, t);
+            p.observe_rx_packet(ssrc, mid, None, Some(1), Some(0), 2000, t);
+        }
+
+        let c = p.svc_candidates(mid);
+        assert!(!c.is_empty());
+        // 最高候选为空间层 1。
+        assert_eq!(c.last().unwrap().0, (1, 0));
+        // 单层 (仅 sid0/tid0) 不视为 SVC。
+        let mut p2 = Participant::new(
+            "p2".into(),
+            "room".into(),
+            "127.0.0.1:5001".parse().unwrap(),
+            1_000_000,
+        )
+        .unwrap();
+        for i in 1..=6u64 {
+            let t = now + Duration::from_millis(100 * i);
+            p2.observe_rx_packet(ssrc, mid, None, Some(0), Some(0), 1000, t);
+        }
+        assert!(p2.svc_candidates(mid).is_empty());
     }
 }

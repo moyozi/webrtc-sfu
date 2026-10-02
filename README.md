@@ -446,16 +446,31 @@ str0m 产生 `Event::EgressBitrateEstimate`（下行可用带宽），SFU 据此
 2. SFU 用 500ms 滑动窗口 + EWMA 测量每层实际码率（`RateWindow`）；
 3. 每 500ms 按订阅者 BWE（留 10% 余量）选出码率不超限的**最高层**；
 4. 切层时向发布者该 RID 发 PLI，**等到目标层关键帧到达**才真正切换，
-   避免花屏；
+   避免花屏；若目标层 1s 内始终无关键帧则回退/重试，避免永久黑屏；
 5. 逐订阅者**重写 RTP 序号**，使切层/丢层后订阅者看到的序号始终连续
    （也是 NACK 重传正确性的前提）。
 
-**SVC (时间层)**
+**SVC (空间层 + 时间层)**
 
-单条 VP8 流内的时间层用自研的 payload-descriptor 解析（`vp8_temporal_id`）
-识别 TID。SFU 按累计时间层码率选择满足 BWE 的最大 TID，丢弃高于它的包；
-同样依赖逐订阅者序号重写。由于 str0m 公开 API 不暴露 VP9/AV1 的空间层索引，
-目前仅支持 **VP8 时间层**降级。
+对单条 SVC 流（无 RID），自行解析 payload descriptor 取层索引：
+
+| 编码 | 解析 | 支持层 |
+|---|---|---|
+| VP8 | `vp8_temporal_id` | 时间层 TID |
+| VP9 | `vp9_sid_tid` (RFC 9628, non-flexible) | 空间层 SID + 时间层 TID |
+| AV1 / VP9 flexible | — | 暂不解析, 视为非 SVC 全转发 |
+
+SFU 按 `[sid][tid]` 分别测量码率，再按「解码目标层所需的全部数据」计算累计
+码率，在 BWE 预算内选**质量最高的候选**（策略为空间优先，再升时间层），
+并丢弃高于目标 `(sid, tid)` 的包；同样依赖逐订阅者序号重写。
+
+> `svc_candidates` 同时用于本地发布者与跨主机中继发布者，两条路径选层逻辑一致。
+
+**通用**
+
+- 订阅者目标码率 (`desired_bitrate`) 取**最高可选层的实际码率**（而非各层之和），
+  避免 BWE 过度探测；
+- 关键帧请求 (PLI) 带 500ms 节流，抑制多订阅者同时触发导致的 PLI 风暴。
 
 ```
   Publisher (3-layer simulcast)

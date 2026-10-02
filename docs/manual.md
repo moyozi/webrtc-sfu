@@ -539,16 +539,24 @@ WebSocket 与 QUIC 承载**完全相同**的 JSON 消息。一条连接可承载
 ### 12.2 Simulcast（RID 选层）
 - 发布者发送多路 simulcast（每路带 RID）；SFU 用 500ms 窗口实测各层码率。
 - 每 500ms 按**订阅者 BWE**（留 10% 余量）选码率不超限的最高层。
-- 切层时向目标 RID 发 PLI，**等目标层关键帧到达**才切换，避免花屏。
+- 切层时向目标 RID 发 PLI，**等目标层关键帧到达**才切换，避免花屏；
+  若目标层 1s 内始终无关键帧则回退/重试，避免永久黑屏。
 - 逐订阅者**重写 RTP 序号**，切层/丢层后序号连续（NACK 正确性前提）。
 
-### 12.3 SVC（时间层）
-- 单条 **VP8** 流的时间层按 TID 降级（自研 VP8 payload-descriptor 解析）。
-- **不支持** VP9/AV1 空间层选择（str0m 公开 API 不暴露空间层索引），已在代码中标注。
+### 12.3 SVC（空间层 + 时间层）
+- 单条 SVC 流按 payload descriptor 解析层索引：
+  - VP8 → 时间层 TID（`vp8_temporal_id`）；
+  - VP9 → 空间层 SID + 时间层 TID（`vp9_sid_tid`, RFC 9628 non-flexible）；
+  - AV1 / VP9 flexible 暂不解析，视为非 SVC 全转发。
+- 按 `[sid][tid]` 测量码率，按累计码率在 BWE 预算内选质量最高的候选
+  （空间优先），丢弃高于目标 `(sid, tid)` 的包。
+- 跨主机中继包同样按 payload 重新解析，选层逻辑与本地一致。
+- PLI 请求带 500ms 节流，抑制多订阅者同时触发的 PLI 风暴。
 
 ### 12.4 BWE
 - 订阅者侧启用带宽估计（TWCC/REMB），`Event::EgressBitrateEstimate` 驱动选层。
-- `SFU_BWE_INITIAL_BPS` 设初始值；desired bitrate 自动设为各层码率之和以探测上探。
+- `SFU_BWE_INITIAL_BPS` 设初始值；desired bitrate 取**最高可选层的实际码率**
+  （同一时刻只发一层，用各层之和会导致 BWE 过度探测）。
 
 ### 12.5 跨 worker / 跨主机中继
 - 同进程跨 worker：`RelayHub`（channel + 唤醒管道）。

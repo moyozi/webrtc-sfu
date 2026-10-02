@@ -77,7 +77,8 @@ Router.add_subscription(subscriber_id, mid, subscriber_mid, worker_idx=subscribe
 
 ## 5. 层选择（Simulcast/SVC）
 
-订阅者 worker 从**中继包**中自行测量各层速率（`rid`/`tid` 随包携带），
+订阅者 worker 从**中继包**中自行测量各层速率：`rid` 随包携带，SVC 的 `(sid, tid)`
+由接收端按编码重新解析 payload descriptor (`vp8_temporal_id` / `vp9_sid_tid`)，
 再结合本地订阅者的 BWE 选层 —— 与本地发布者路径共用同一套逻辑。
 因此**发布者 worker 中继所有层**，不做 per-subscriber 过滤（进程内几乎零成本）。
 跨主机时可按需增加 BWE 回传以在中继端裁剪（见 §8）。

@@ -20,11 +20,11 @@ fn remote_stats_layers_and_temporal() {
     // 跨过 500ms 窗口 (首包 +100ms, 到 +600ms 触发)
     for i in 1..=6u64 {
         let t = now + Duration::from_millis(100 * i);
-        s.observe(Ssrc::from(10), mid, Some(Rid::from("l")), None, 1000, t);
-        s.observe(Ssrc::from(20), mid, Some(Rid::from("h")), None, 2000, t);
-        // SVC 时间层 (单 SSRC)
-        s.observe(Ssrc::from(30), mid, None, Some(0), 1000, t);
-        s.observe(Ssrc::from(30), mid, None, Some(1), 1000, t);
+        s.observe(Ssrc::from(10), mid, Some(Rid::from("l")), Some(0), Some(0), 1000, t);
+        s.observe(Ssrc::from(20), mid, Some(Rid::from("h")), Some(0), Some(0), 2000, t);
+        // SVC 时间层 (单 SSRC, sid=0)
+        s.observe(Ssrc::from(30), mid, None, Some(0), Some(0), 1000, t);
+        s.observe(Ssrc::from(30), mid, None, Some(0), Some(1), 1000, t);
     }
 
     let layers = s.layer_rates(mid);
@@ -33,15 +33,15 @@ fn remote_stats_layers_and_temporal() {
     assert_eq!(layers[1].0, Rid::from("h"));
     assert!(layers[0].1 <= layers[1].1);
 
-    let tr = s.temporal_rates(mid);
+    let tr = s.svc_candidates(mid);
     assert_eq!(tr.len(), 2);
-    assert_eq!(tr[0].0, 0);
-    assert_eq!(tr[1].0, 1);
+    assert_eq!(tr[0].0, (0, 0));
+    assert_eq!(tr[1].0, (0, 1));
     assert!(tr[1].1 > tr[0].1);
 
     // 其它 mid 无数据
     assert!(s.layer_rates(Mid::from("9")).is_empty());
-    assert!(s.temporal_rates(Mid::from("9")).is_empty());
+    assert!(s.svc_candidates(Mid::from("9")).is_empty());
 }
 
 /// RelayHub: 向目标 worker 投递中继包并唤醒。
