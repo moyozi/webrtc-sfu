@@ -24,7 +24,7 @@ pub mod whep;
 pub mod whip;
 
 use crate::cluster::WorkerRouter;
-use crate::signaling::protocol::ParticipantInfo;
+use crate::signaling::protocol::{ParticipantInfo, TrackInfo};
 use crate::worker::{WorkerCommand, WorkerReply};
 use ahash::AHashMap;
 use parking_lot::Mutex;
@@ -174,8 +174,8 @@ impl SignalingState {
         self.participant_worker.lock().remove(participant_id);
     }
 
-    /// 加入房间 (发布者; 默认音频/视频均开启)。
-    pub fn join_room(&self, room_id: &str, participant_id: &str) {
+    /// 加入房间 (发布者; 默认音频/视频均开启), 并登记其发布的轨道列表。
+    pub fn join_room(&self, room_id: &str, participant_id: &str, tracks: Vec<TrackInfo>) {
         let mut rooms = self.rooms.lock();
         let room = rooms.entry(room_id.to_string()).or_insert_with(|| RoomInfo {
             participants: Vec::new(),
@@ -189,8 +189,30 @@ impl SignalingState {
                 participant_id: participant_id.to_string(),
                 audio_enabled: true,
                 video_enabled: true,
+                tracks,
             });
         }
+    }
+
+    /// 更新某成员发布的轨道列表 (重协商后)。返回轨道列表是否真的变化。
+    pub fn set_participant_tracks(
+        &self,
+        room_id: &str,
+        participant_id: &str,
+        tracks: Vec<TrackInfo>,
+    ) -> bool {
+        let mut rooms = self.rooms.lock();
+        let Some(p) = rooms
+            .get_mut(room_id)
+            .and_then(|r| r.participants.iter_mut().find(|p| p.participant_id == participant_id))
+        else {
+            return false;
+        };
+        if p.tracks == tracks {
+            return false;
+        }
+        p.tracks = tracks;
+        true
     }
 
     /// 离开房间

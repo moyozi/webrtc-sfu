@@ -67,6 +67,8 @@ struct PublisherTracks {
     id: String,
     audio_mid: String,
     video_mid: String,
+    /// 可选的第 2 路视频 (屏幕共享) mid。
+    screen_mid: Option<String>,
 }
 
 struct Config {
@@ -130,9 +132,9 @@ impl Config {
                 "--publisher" => {
                     let spec = val();
                     let parts: Vec<&str> = spec.split(':').collect();
-                    if parts.len() != 3 {
+                    if parts.len() != 3 && parts.len() != 4 {
                         return Err(format!(
-                            "--publisher 需要 <id>:<audio_mid>:<video_mid> 格式, 收到: {}",
+                            "--publisher 需要 <id>:<audio_mid>:<video_mid>[:<screen_mid>] 格式, 收到: {}",
                             spec
                         ));
                     }
@@ -140,6 +142,7 @@ impl Config {
                         id: parts[0].to_string(),
                         audio_mid: parts[1].to_string(),
                         video_mid: parts[2].to_string(),
+                        screen_mid: parts.get(3).map(|s| s.to_string()),
                     });
                 }
                 "--help" | "-h" => {
@@ -251,13 +254,18 @@ async fn subscriber(
     rtc.add_local_candidate(local_candidate.clone());
 
     // ── 3. 为每个发布者添加 recvonly audio/video，并记录自身 mid ──
-    let mut own_mids: Vec<(Mid, Mid)> = Vec::with_capacity(cfg.publishers.len());
+    let mut own_mids: Vec<(Mid, Mid, Option<Mid>)> = Vec::with_capacity(cfg.publishers.len());
     let (offer, pending) = {
         let mut api = rtc.sdp_api();
-        for _ in &cfg.publishers {
+        for pubr in &cfg.publishers {
             let a = api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
             let v = api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
-            own_mids.push((a, v));
+            // 发布者有屏幕共享时, 追加一条 recvonly video。
+            let s = pubr
+                .screen_mid
+                .is_some()
+                .then(|| api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None));
+            own_mids.push((a, v, s));
         }
         api.apply().ok_or("生成 SDP offer 失败")?
     };
@@ -354,7 +362,7 @@ async fn subscriber(
                     // SDP 完成后按选择为每个发布者 track 发送 subscribe (携带自身 mid)
                     let mut n_sub = 0usize;
                     for (i, pubr) in cfg.publishers.iter().enumerate() {
-                        let (own_a, own_v) = own_mids[i];
+                        let (own_a, own_v, own_s) = own_mids[i];
                         if cfg.sub_audio {
                             subscribe(&mut ws_tx, &pubr.id, &pubr.audio_mid, &own_a.to_string())
                                 .await?;
@@ -363,6 +371,10 @@ async fn subscriber(
                         if cfg.sub_video {
                             subscribe(&mut ws_tx, &pubr.id, &pubr.video_mid, &own_v.to_string())
                                 .await?;
+                            n_sub += 1;
+                        }
+                        if let (Some(smid), Some(own_s)) = (&pubr.screen_mid, own_s) {
+                            subscribe(&mut ws_tx, &pubr.id, smid, &own_s.to_string()).await?;
                             n_sub += 1;
                         }
                     }

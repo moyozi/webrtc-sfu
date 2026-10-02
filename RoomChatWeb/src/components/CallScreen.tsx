@@ -15,6 +15,9 @@ interface CallScreenProps {
   onLeave: () => void;
   onToggleAudio: (enabled: boolean) => void;
   onToggleVideo: (enabled: boolean) => void;
+  isScreenSharing?: boolean;
+  onStartScreen?: () => void;
+  onStopScreen?: () => void;
 }
 
 export default function CallScreen(props: CallScreenProps) {
@@ -106,6 +109,20 @@ export default function CallScreen(props: CallScreenProps) {
             </Show>
           </button>
 
+          {/* 屏幕共享 */}
+          <button
+            class="btn btn-circle btn-sm"
+            classList={{ "btn-primary": props.isScreenSharing }}
+            onClick={props.isScreenSharing ? props.onStopScreen : props.onStartScreen}
+            title={props.isScreenSharing ? "停止屏幕共享" : "开始屏幕共享"}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+              <line x1="8" y1="21" x2="16" y2="21" />
+              <line x1="12" y1="17" x2="12" y2="21" />
+            </svg>
+          </button>
+
           {/* 挂断 */}
           <button class="btn btn-error btn-sm gap-1" onClick={props.onLeave}>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -134,7 +151,7 @@ export default function CallScreen(props: CallScreenProps) {
               videoEnabled={videoOn()}
             />
 
-            {/* 远端视频 */}
+            {/* 远端视频 (每参与者的摄像头画面) */}
             <For each={props.participants}>
               {(p) => (
                 <VideoTile
@@ -148,6 +165,15 @@ export default function CallScreen(props: CallScreenProps) {
                     "未订阅"
                   }
                 />
+              )}
+            </For>
+
+            {/* 远端屏幕共享画面 (第二路视频) */}
+            <For each={props.participants}>
+              {(p) => (
+                <Show when={p.screenStream}>
+                  <VideoTile stream={p.screenStream!} label={`${p.id} · 屏幕共享`} />
+                </Show>
               )}
             </For>
           </div>

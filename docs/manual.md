@@ -427,6 +427,13 @@ npm run dev        # 打开 http://localhost:5173
 跳过分配器），然后：
 1. **发布**：点「加入」→ 授摄像头/麦克风 → 发布。
 2. **订阅**：房间内其他人加入后，在侧栏点订阅。
+3. **屏幕共享**：顶栏显示器图标 → 选择屏幕；其他参与者会自动重新订阅并多出一个
+   “屏幕共享”画面。
+
+> **一个参与者支持多路流**：发布方可同时发 音频 + 摄像头视频 + 屏幕共享视频。
+> 服务端在 `joined` / `participant_joined` 中广播每人的 `tracks`（mid + kind），
+> 屏幕共享开始时再广播 `participant_tracks`；订阅者据此逐 track 订阅
+> （协议已支持每条 `subscribe` 携带 `subscriber_mid`）。
 
 客户端会先按房间号向分配器请求本房间的信令地址，再连接；单机部署可让分配器与
 SFU 同进程启动（`SFU_DISPATCHER_COHOST=on`，见 [`deployment.md`](deployment.md)）。
@@ -539,10 +546,11 @@ WebSocket 与 QUIC 承载**完全相同**的 JSON 消息。一条连接可承载
 | `welcome` | `protocol_version`, `server`, `features[]` | 握手回复（协议版本/能力集） |
 | `pong` | `t?` | 心跳回复 |
 | `sdp_answer` | `pc_id`, `sdp`, `ice_candidates[]` | SDP 应答 + SFU ICE 候选（内联） |
-| `joined` | `pc_id`, `participant_id`, `room_id`, `role`, `participants[]` | `join` 确认 + 成员快照 |
+| `joined` | `pc_id`, `participant_id`, `room_id`, `role`, `participants[]` | `join` 确认 + 成员快照；每项含 `tracks: [{mid,kind}]` |
 | `left` | `pc_id` | `leave` 确认 |
-| `participant_joined` | `participant_id` | 房间新人加入（对 `joined.participants` 去重） |
+| `participant_joined` | `participant_id`, `tracks[]` | 房间新人加入（含其发布的轨道列表） |
 | `participant_left` | `participant_id` | 有人离开 |
+| `participant_tracks` | `participant_id`, `tracks[]` | 某成员轨道列表变化（开始/停止屏幕共享等） |
 | `participant_updated` | `participant_id`, `audio_enabled`, `video_enabled` | 成员媒体状态变化 |
 | `subscribed` | `pc_id`, `publisher_id`, `track_mid` | 订阅已受理 |
 | `unsubscribed` | `pc_id`, `publisher_id`, `track_mid` | 取消订阅确认 |

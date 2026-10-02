@@ -2,7 +2,7 @@ import { createSignal, onCleanup } from "solid-js";
 import JoinScreen from "./components/JoinScreen";
 import CallScreen from "./components/CallScreen";
 import { SfuClient } from "./lib/sfu";
-import type { LogEntry, RemoteParticipant } from "./lib/types";
+import type { LogEntry, RemoteParticipant, TrackInfo } from "./lib/types";
 
 function App() {
   const [screen, setScreen] = createSignal<"join" | "call">("join");
@@ -12,6 +12,7 @@ function App() {
   const [logs, setLogs] = createSignal<LogEntry[]>([]);
   // 分配器为本房间分配的"信令节点 · 地址"，用于界面展示
   const [signalingNode, setSignalingNode] = createSignal("");
+  const [screenSharing, setScreenSharing] = createSignal(false);
 
   let sfu: SfuClient | null = null;
 
@@ -24,18 +25,22 @@ function App() {
     try {
       sfu = new SfuClient({
         onLog: addLog,
-        onParticipantJoined: (id) => {
-          // 自动订阅新参与者
+        onParticipantJoined: (id, tracks) => {
+          // 自动订阅新参与者 (按其发布的全部轨道: 音频 + 摄像头 + 屏幕共享)
           setParticipants((prev) =>
             prev.find((p) => p.id === id)
-              ? prev
-              : [...prev, { id, status: "idle", stream: null }]
+              ? prev.map((p) => (p.id === id ? { ...p, tracks } : p))
+              : [...prev, { id, status: "idle", stream: null, tracks }]
           );
-          // 自动发起订阅
-          setTimeout(() => sfu?.subscribe(id), 500);
+          setTimeout(() => sfu?.subscribe(id, tracks), 500);
         },
         onParticipantLeft: (id) => {
           setParticipants((prev) => prev.filter((p) => p.id !== id));
+        },
+        onParticipantTracks: (id, tracks) => {
+          setParticipants((prev) =>
+            prev.map((p) => (p.id === id ? { ...p, tracks } : p))
+          );
         },
         onSubscriptionUpdate: (publisherId, update) => {
           setParticipants((prev) =>
@@ -81,16 +86,35 @@ function App() {
     setParticipants([]);
     setLocalStream(null);
     setSignalingNode("");
+    setScreenSharing(false);
   };
 
   const handleSubscribe = (publisherId: string) => {
     // 如果参与者不在列表中, 先添加
-    setParticipants((prev) =>
-      prev.find((p) => p.id === publisherId)
-        ? prev
-        : [...prev, { id: publisherId, status: "idle", stream: null }]
-    );
-    sfu?.subscribe(publisherId);
+    let tracks: TrackInfo[] = [];
+    setParticipants((prev) => {
+      const found = prev.find((p) => p.id === publisherId);
+      if (found) {
+        tracks = found.tracks ?? [];
+        return prev;
+      }
+      return [...prev, { id: publisherId, status: "idle", stream: null }];
+    });
+    sfu?.subscribe(publisherId, tracks);
+  };
+
+  const handleStartScreen = async () => {
+    try {
+      await sfu?.startScreenShare();
+      setScreenSharing(true);
+    } catch (e: any) {
+      addLog(`屏幕共享失败: ${e?.message || e}`, "error");
+    }
+  };
+
+  const handleStopScreen = async () => {
+    await sfu?.stopScreenShare();
+    setScreenSharing(false);
   };
 
   const handleUnsubscribe = (publisherId: string) => {
@@ -124,6 +148,9 @@ function App() {
           onLeave={handleLeave}
           onToggleAudio={handleToggleAudio}
           onToggleVideo={handleToggleVideo}
+          isScreenSharing={screenSharing()}
+          onStartScreen={handleStartScreen}
+          onStopScreen={handleStopScreen}
         />
       )}
     </>

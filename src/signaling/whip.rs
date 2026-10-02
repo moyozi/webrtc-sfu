@@ -137,6 +137,12 @@ async fn handle(
 
             let id = new_id(seq.fetch_add(1, Ordering::Relaxed));
             let worker_idx = state.assign_worker(&room, &id);
+            // 提取推流轨道列表 (供订阅者逐 track 订阅)。
+            let tracks: Vec<crate::signaling::protocol::TrackInfo> =
+                crate::signaling::http::offer_mids(&sdp_offer)
+                    .into_iter()
+                    .map(|(kind, mid)| crate::signaling::protocol::TrackInfo { mid, kind })
+                    .collect();
             // create_participant 可能阻塞等待 worker 回复 (最长 10s)，放到 blocking 线程池。
             let state_for_task = state.clone();
             let room_for_task = room.clone();
@@ -154,13 +160,14 @@ async fn handle(
                     ..
                 }) => {
                     // 作为发布者加入房间 (使 WS 订阅者可发现)
-                    state.join_room(&room, &id);
+                    state.join_room(&room, &id, tracks.clone());
                     state.notify_room(
                         &room,
                         &id,
                         &serde_json::to_string(
                             &crate::signaling::protocol::SignalingResponse::ParticipantJoined {
                                 participant_id: id.clone(),
+                                tracks: tracks.clone(),
                             },
                         )
                         .unwrap(),

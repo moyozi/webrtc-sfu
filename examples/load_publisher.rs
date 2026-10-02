@@ -63,6 +63,8 @@ struct Config {
     advertise_ip: IpAddr,
     video_kbps: u64,
     fps: u64,
+    /// 额外发布一路屏幕共享视频 (验证一个参与者多 track)。
+    screen: bool,
 }
 
 impl Config {
@@ -75,6 +77,7 @@ impl Config {
             advertise_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             video_kbps: 1500,
             fps: 30,
+            screen: false,
         };
 
         let mut args = std::env::args().skip(1);
@@ -94,6 +97,7 @@ impl Config {
                 }
                 "--video-kbps" => cfg.video_kbps = val().parse().unwrap_or(cfg.video_kbps),
                 "--fps" => cfg.fps = val().parse().unwrap_or(cfg.fps).max(1),
+                "--screen" => cfg.screen = true,
                 "--help" | "-h" => {
                     println!("{}", include_str!("load_publisher.rs"));
                     std::process::exit(0);
@@ -199,11 +203,18 @@ async fn publisher(
     let mut api = rtc.sdp_api();
     let audio_mid = api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
     let video_mid = api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+    // 可选: 第 3 路 (屏幕共享视频)。
+    let screen_mid = cfg
+        .screen
+        .then(|| api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None));
     let (offer, pending) = api.apply().ok_or("生成 SDP offer 失败")?;
     let mut pending: Option<SdpPendingOffer> = Some(pending);
 
     // 打印本发布者的 track mid，供 load_subscriber 订阅使用。
-    println!("[mids] {} {} {}", participant_id, audio_mid, video_mid);
+    match screen_mid {
+        Some(s) => println!("[mids] {} {} {} {}", participant_id, audio_mid, video_mid, s),
+        None => println!("[mids] {} {} {}", participant_id, audio_mid, video_mid),
+    }
 
     // 本地编解码协商出的 PT (write 必须使用本地 PT)
     let audio_pt = local_pt(&rtc, Codec::Opus);
@@ -258,14 +269,20 @@ async fn publisher(
 
     let mut audio_tick = tokio::time::interval(Duration::from_millis(20));
     let mut video_tick = tokio::time::interval(Duration::from_millis(1000 / fps));
+    // 屏幕共享: 低帧率 (5fps), 仅 --screen 时真正发送。
+    let mut screen_tick = tokio::time::interval(Duration::from_millis(200));
     audio_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     video_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    screen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     audio_tick.tick().await; // 立即开始
     video_tick.tick().await;
+    screen_tick.tick().await;
 
     let mut audio_us = 0u64;
     let mut video_us = 0u64;
     let mut frame_no = 0u64;
+    let mut screen_us = 0u64;
+    let mut screen_frame_no = 0u64;
     let mut next_deadline = Instant::now();
     let mut connected = false;
 
@@ -295,6 +312,7 @@ async fn publisher(
             Timeout,
             Audio,
             Video,
+            Screen,
         }
 
         let act = tokio::select! {
@@ -311,6 +329,7 @@ async fn publisher(
             }
             _ = audio_tick.tick() => Act::Audio,
             _ = video_tick.tick() => Act::Video,
+            _ = screen_tick.tick() => Act::Screen,
         };
 
         match act {
@@ -361,6 +380,26 @@ async fn publisher(
                     );
                     video_us += 1_000_000 / fps;
                     frame_no += 1;
+                }
+            }
+            Act::Screen => {
+                if connected {
+                    if let Some(smid) = screen_mid {
+                        let payload = if screen_frame_no.is_multiple_of(25) {
+                            &keyframe
+                        } else {
+                            &interframe
+                        };
+                        write_media(
+                            &mut rtc,
+                            smid,
+                            video_pt,
+                            MediaTime::from_micros(screen_us),
+                            payload,
+                        );
+                        screen_us += 200_000;
+                        screen_frame_no += 1;
+                    }
                 }
             }
         }

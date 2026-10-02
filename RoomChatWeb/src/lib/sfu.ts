@@ -1,6 +1,6 @@
 import { SignalingClient } from "./signaling";
 import { allocateSignaling, type AllocateResult } from "./dispatcher";
-import type { ServerMessage, LogEntry, RemoteParticipant, ParticipantInfo } from "./types";
+import type { ServerMessage, LogEntry, RemoteParticipant, ParticipantInfo, TrackInfo } from "./types";
 
 /**
  * SFU 客户端 — 单 WebSocket + 多 RTCPeerConnection (信令复用)
@@ -51,13 +51,17 @@ interface PcEntry {
   role: "publisher" | "subscriber";
   /** subscriber: 正在订阅的远端参与者 id */
   publisherId?: string;
+  /** subscriber: (发布者 mid, 自身 mid) 订阅映射, 每条轨道一项 */
+  trackSubs?: { publisherMid: string; ownMid: string }[];
 }
 
 // 回调类型
 export interface SfuCallbacks {
   onLog: (msg: string, level?: LogEntry["level"]) => void;
-  onParticipantJoined: (id: string) => void;
+  onParticipantJoined: (id: string, tracks: TrackInfo[]) => void;
   onParticipantLeft: (id: string) => void;
+  /** 某成员发布的轨道列表变化 (开始/停止屏幕共享等) */
+  onParticipantTracks?: (id: string, tracks: TrackInfo[]) => void;
   onSubscriptionUpdate: (publisherId: string, participant: Partial<RemoteParticipant>) => void;
   onConnectionStateChange: (state: string) => void;
   /** 远端成员媒体状态变化 (静音/关摄像头) */
@@ -90,6 +94,10 @@ export class SfuClient {
   private subPcByPublisher = new Map<string, string>();
   // 已入房的远端成员 (用于 joined 快照与 participant_joined 去重)
   private knownParticipants = new Set<string>();
+  // publisherId → 其发布的轨道列表 (来自服务端广播), 订阅时据此逐 track 订阅
+  private tracksById = new Map<string, TrackInfo[]>();
+  // 本端屏幕共享流 (getDisplayMedia)
+  private screenStream: MediaStream | null = null;
   // 已向服务器 join 成功的 pc_id (收到 joined 后置位)。
   // 用于避免在服务器登记会话前发送 ice_candidate (会被判为"未知 pc_id")。
   private joinedPcs = new Set<string>();
@@ -198,7 +206,7 @@ export class SfuClient {
 
   // ── 订阅: 接收远端参与者媒体 (复用同一条 WebSocket) ──────────
 
-  async subscribe(publisherId: string): Promise<void> {
+  async subscribe(publisherId: string, tracks?: TrackInfo[]): Promise<void> {
     if (this.subPcByPublisher.has(publisherId)) {
       this.cb.onLog(`已订阅 ${publisherId}`, "warn");
       return;
@@ -211,22 +219,46 @@ export class SfuClient {
       return;
     }
 
-    this.cb.onLog(`正在订阅 ${publisherId}...`);
+    // 该发布者发布的轨道列表 (来自服务端广播); 缺省回退到旧的 音频+视频 约定。
+    let list = tracks ?? this.tracksById.get(publisherId) ?? [];
+    if (list.length === 0) {
+      list = [
+        { mid: "0", kind: "audio" },
+        { mid: "1", kind: "video" },
+      ];
+    }
+
+    this.cb.onLog(
+      `正在订阅 ${publisherId} (${list.length} 路: ${list.map((t) => t.kind).join("/")})...`
+    );
     this.cb.onSubscriptionUpdate(publisherId, { status: "connecting" });
 
     const pcId = `sub-${publisherId}`;
 
-    // 1. 创建订阅 PC (recvonly)
+    // 1. 每条发布轨道一个 recvonly transceiver (顺序与 list 对齐)
     const pc = new RTCPeerConnection({ iceServers: [] });
-    // recvonly 音频 (mid=0) + recvonly 视频 (mid=1)
-    pc.addTransceiver("audio", { direction: "recvonly" });
-    pc.addTransceiver("video", { direction: "recvonly" });
+    const transceivers = list.map((t) =>
+      pc.addTransceiver(t.kind === "audio" ? "audio" : "video", { direction: "recvonly" })
+    );
 
-    // 接收远端轨道
+    // 主画面 = 音频 + 第一路视频 (摄像头); 第二路视频 → 屏幕共享。
     const stream = new MediaStream();
+    const screenStream = new MediaStream();
+    let videoCount = 0;
     pc.ontrack = (e) => {
-      stream.addTrack(e.track);
-      this.cb.onSubscriptionUpdate(publisherId, { stream });
+      if (e.track.kind === "video") {
+        videoCount += 1;
+        if (videoCount === 1) {
+          stream.addTrack(e.track);
+          this.cb.onSubscriptionUpdate(publisherId, { stream });
+        } else {
+          screenStream.addTrack(e.track);
+          this.cb.onSubscriptionUpdate(publisherId, { screenStream });
+        }
+      } else {
+        stream.addTrack(e.track);
+        this.cb.onSubscriptionUpdate(publisherId, { stream });
+      }
       this.cb.onLog(`收到 ${publisherId} 的 ${e.track.kind} 轨道`, "success");
     };
 
@@ -235,13 +267,18 @@ export class SfuClient {
     };
     pc.onconnectionstatechange = () => this.watchConnection(pcId, pc, `订阅 ${publisherId}`);
 
-    this.registerPc(pcId, pc, "subscriber", publisherId);
-    this.subPcByPublisher.set(publisherId, pcId);
-
     // 2. 创建 offer, 通过同一条 WebSocket 发送 join (role=subscriber)
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     await this.waitIceComplete(pc);
+
+    // setLocalDescription 后 transceiver.mid 才可用 → 建立 (发布者 mid, 自身 mid) 映射。
+    const trackSubs = list.map((t, i) => ({
+      publisherMid: t.mid,
+      ownMid: transceivers[i]?.mid ?? "",
+    }));
+    this.registerPc(pcId, pc, "subscriber", publisherId, trackSubs);
+    this.subPcByPublisher.set(publisherId, pcId);
 
     this.sig.send({
       type: "join",
@@ -260,9 +297,16 @@ export class SfuClient {
     if (!pcId) return;
     const entry = this.pcs.get(pcId);
 
-    // 通知服务器取消订阅 (音频 mid=0 + 视频 mid=1)
-    this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: "0" });
-    this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: "1" });
+    // 通知服务器取消订阅 (按实际订阅的 track)
+    const subs = entry?.trackSubs ?? [];
+    if (subs.length > 0) {
+      for (const ts of subs) {
+        this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: ts.publisherMid });
+      }
+    } else {
+      this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: "0" });
+      this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: "1" });
+    }
     this.sig?.send({ type: "leave", pc_id: pcId });
 
     entry?.pc.close();
@@ -274,7 +318,7 @@ export class SfuClient {
     this.awaitingRenegotiation.delete(pcId);
     this.restartAttempts.delete(pcId);
     this.cb.onLog(`已取消订阅 ${publisherId}`);
-    this.cb.onSubscriptionUpdate(publisherId, { status: "idle", stream: null });
+    this.cb.onSubscriptionUpdate(publisherId, { status: "idle", stream: null, screenStream: null });
   }
 
   // ── 离开 ──────────────────────────────────────────────────
@@ -296,6 +340,7 @@ export class SfuClient {
     this.pcs.clear();
     this.subPcByPublisher.clear();
     this.knownParticipants.clear();
+    this.tracksById.clear();
     this.joinedPcs.clear();
     this.pendingIce.clear();
     for (const t of this.restartTimers.values()) clearTimeout(t);
@@ -304,10 +349,14 @@ export class SfuClient {
     this.awaitingRenegotiation.clear();
     this.restartAttempts.clear();
 
-    // 停止本地轨道
+    // 停止本地轨道 (摄像头/麦克风 + 屏幕共享)
     if (this.localStream) {
       this.localStream.getTracks().forEach((t) => t.stop());
       this.localStream = null;
+    }
+    if (this.screenStream) {
+      this.screenStream.getTracks().forEach((t) => t.stop());
+      this.screenStream = null;
     }
 
     // 关闭信令
@@ -325,6 +374,71 @@ export class SfuClient {
   toggleVideo(enabled: boolean): void {
     this.localStream?.getVideoTracks().forEach((t) => (t.enabled = enabled));
     this.updateMedia({ videoEnabled: enabled });
+  }
+
+  // ── 屏幕共享 (发布额外一路视频, 通过 renegotiate 新增 m-line) ──
+
+  /** 是否正在屏幕共享。 */
+  get isScreenSharing(): boolean {
+    return this.screenStream !== null;
+  }
+
+  /**
+   * 开始屏幕共享: `getDisplayMedia` 取屏幕视频轨 → 加到发布 PC → renegotiate。
+   * 服务端接受新 offer 后会广播 `participant_tracks`, 其他订阅者据此重新订阅。
+   */
+  async startScreenShare(): Promise<void> {
+    if (!this.sig || !this.pcs.has(PUB_PC_ID)) throw new Error("尚未加入房间");
+    if (this.screenStream) {
+      this.cb.onLog("屏幕共享已在进行", "warn");
+      return;
+    }
+    const display = await navigator.mediaDevices.getDisplayMedia({ video: true });
+    const track = display.getVideoTracks()[0];
+    if (!track) throw new Error("未获取到屏幕视频轨");
+    this.screenStream = display;
+    track.onended = () => void this.stopScreenShare();
+
+    const entry = this.pcs.get(PUB_PC_ID)!;
+    entry.pc.addTrack(track, display);
+    await this.renegotiatePc(PUB_PC_ID);
+    this.cb.onLog("屏幕共享已开始", "success");
+  }
+
+  /** 停止屏幕共享 (移除轨道并 renegotiate)。 */
+  async stopScreenShare(): Promise<void> {
+    if (!this.screenStream) return;
+    const entry = this.pcs.get(PUB_PC_ID);
+    const stream = this.screenStream;
+    this.screenStream = null;
+    if (entry) {
+      for (const track of stream.getTracks()) {
+        for (const sender of entry.pc.getSenders()) {
+          if (sender.track === track) entry.pc.removeTrack(sender);
+        }
+        track.stop();
+      }
+      await this.renegotiatePc(PUB_PC_ID);
+    } else {
+      stream.getTracks().forEach((t) => t.stop());
+    }
+    this.cb.onLog("屏幕共享已停止", "info");
+  }
+
+  /** 用当前 PC 生成新 offer 并发 `renegotiate` (ICE restart / 新增/删除轨道)。 */
+  private async renegotiatePc(pcId: string): Promise<void> {
+    const entry = this.pcs.get(pcId);
+    if (!entry || !this.sig) return;
+    const offer = await entry.pc.createOffer();
+    await entry.pc.setLocalDescription(offer);
+    await this.waitIceComplete(entry.pc);
+    this.awaitingRenegotiation.add(pcId);
+    this.sig.send({
+      type: "renegotiate",
+      pc_id: pcId,
+      sdp: entry.pc.localDescription!.sdp,
+      ...(this.token ? { token: this.token } : {}),
+    });
   }
 
   /** 通知服务端本发布者的媒体状态 (服务端会广播给房间内其他人)。 */
@@ -410,8 +524,8 @@ export class SfuClient {
           this.cb.onLog(`收到未知 pc_id 的 sdp_answer: ${msg.pc_id}`, "warn");
           return;
         }
-        const { pc, role, publisherId } = entry;
-        // 本次 sdp_answer 是否为 ICE restart 的应答 (由客户端主动发起)。
+        const { pc, role, publisherId, trackSubs } = entry;
+        // 本次 sdp_answer 是否为重新协商 (ICE restart / 新增轨道) 的应答。
         const isRenegotiation = this.awaitingRenegotiation.has(msg.pc_id);
 
         pc.setRemoteDescription({ type: "answer", sdp: msg.sdp })
@@ -433,12 +547,24 @@ export class SfuClient {
               this.awaitingRenegotiation.delete(msg.pc_id);
               this.restarting.delete(msg.pc_id);
               this.clearRestartTimer(msg.pc_id);
-              this.cb.onLog(`ICE 重启完成 (${msg.pc_id})`, "success");
+              this.cb.onLog(`重新协商完成 (${msg.pc_id})`, "success");
               return;
             }
 
-            if (role === "subscriber" && publisherId) {
-              // SDP 完成后发送 subscribe (音频 mid=0 + 视频 mid=1), 复用同一 WebSocket
+            if (role === "subscriber" && publisherId && trackSubs && trackSubs.length > 0) {
+              // 按实际轨道发送 subscribe (携带各自 (发布者 mid, 自身 mid))。
+              for (const ts of trackSubs) {
+                this.sig?.send({
+                  type: "subscribe",
+                  pc_id: msg.pc_id,
+                  publisher_id: publisherId,
+                  track_mid: ts.publisherMid,
+                  subscriber_mid: ts.ownMid,
+                });
+              }
+              this.cb.onLog(`订阅 ${publisherId} SDP 完成, 已发送 ${trackSubs.length} 条 subscribe`, "success");
+            } else if (role === "subscriber" && publisherId) {
+              // 回退: 旧的 0/1 约定
               this.sig?.send({ type: "subscribe", pc_id: msg.pc_id, publisher_id: publisherId, track_mid: "0" });
               this.sig?.send({ type: "subscribe", pc_id: msg.pc_id, publisher_id: publisherId, track_mid: "1" });
               this.cb.onLog(`订阅 ${publisherId} SDP 完成, 已发送 subscribe`, "success");
@@ -477,11 +603,25 @@ export class SfuClient {
         const id = msg.participant_id;
         // 防御性过滤: 忽略自己, 以及自己的订阅连接 (participantId-recv-*).
         if (id === this.participantId || id.startsWith(`${this.participantId}-recv-`)) return;
+        const tracks = msg.tracks ?? [];
+        this.tracksById.set(id, tracks);
         // joined 快照可能已包含该成员, 去重避免重复订阅。
         if (this.knownParticipants.has(id)) return;
         this.knownParticipants.add(id);
-        this.cb.onLog(`参与者加入: ${id}`, "info");
-        this.cb.onParticipantJoined(id);
+        this.cb.onLog(`参与者加入: ${id} (${tracks.length} 路)`, "info");
+        this.cb.onParticipantJoined(id, tracks);
+        break;
+      }
+
+      case "participant_tracks": {
+        const id = msg.participant_id;
+        this.tracksById.set(id, msg.tracks);
+        this.cb.onLog(`${id} 轨道变化: ${msg.tracks.map((t) => t.kind).join("/") || "无"}`, "info");
+        this.cb.onParticipantTracks?.(id, msg.tracks);
+        // 已订阅则该发布者 → 重新订阅以纳入新增轨道 (如屏幕共享)。
+        if (this.subPcByPublisher.has(id)) {
+          this.resubscribe(id, msg.tracks);
+        }
         break;
       }
 
@@ -509,14 +649,23 @@ export class SfuClient {
     for (const p of participants) {
       const id = p.participant_id;
       if (id === this.participantId || id.startsWith(`${this.participantId}-recv-`)) continue;
+      const tracks = p.tracks ?? [];
+      this.tracksById.set(id, tracks);
       const isNew = !this.knownParticipants.has(id);
       this.knownParticipants.add(id);
-      if (isNew) this.cb.onParticipantJoined(id);
+      if (isNew) this.cb.onParticipantJoined(id, tracks);
       this.cb.onParticipantUpdated?.(id, {
         audioEnabled: p.audio_enabled,
         videoEnabled: p.video_enabled,
       });
     }
+  }
+
+  /** 轨道列表变化时重新订阅 (unsubscribe + subscribe, 会短暂中断该发布者订阅)。 */
+  private resubscribe(publisherId: string, tracks: TrackInfo[]): void {
+    this.cb.onLog(`${publisherId} 轨道变化, 重新订阅...`, "info");
+    this.unsubscribe(publisherId);
+    setTimeout(() => void this.subscribe(publisherId, tracks), 150);
   }
 
   // ── 工具 ──────────────────────────────────────────────────
@@ -525,9 +674,10 @@ export class SfuClient {
     pcId: string,
     pc: RTCPeerConnection,
     role: "publisher" | "subscriber",
-    publisherId?: string
+    publisherId?: string,
+    trackSubs?: { publisherMid: string; ownMid: string }[]
   ): void {
-    this.pcs.set(pcId, { pc, role, publisherId });
+    this.pcs.set(pcId, { pc, role, publisherId, trackSubs });
   }
 
   // ── ICE restart (连接恢复) ────────────────────────

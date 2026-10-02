@@ -21,7 +21,8 @@
 
 use crate::signaling::auth::Claims;
 use crate::signaling::protocol::{
-    ErrorCode, ParticipantInfo, SignalingMessage, SignalingResponse, PROTOCOL_VERSION, SERVER_NAME,
+    ErrorCode, ParticipantInfo, SignalingMessage, SignalingResponse, TrackInfo, PROTOCOL_VERSION,
+    SERVER_NAME,
 };
 use crate::signaling::SignalingState;
 use crate::worker::{WorkerCommand, WorkerReply};
@@ -420,6 +421,17 @@ impl SignalingSession {
         // 不应触发 participant_joined 广播 (否则会形成无限订阅循环)
         let is_publisher = role != "subscriber";
 
+        // 发布者发布的轨道列表 (从 offer 的 m-section 提取)。一个参与者可有
+        // 多条轨道 (音频 + 摄像头视频 + 屏幕共享视频 ...), 订阅者据此逐 track 订阅。
+        let tracks: Vec<TrackInfo> = if is_publisher {
+            crate::signaling::http::offer_mids(&sdp)
+                .into_iter()
+                .map(|(kind, mid)| TrackInfo { mid, kind })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         info!(
             transport = self.transport,
             peer = %self.peer,
@@ -465,8 +477,9 @@ impl SignalingSession {
                 });
 
                 if is_publisher {
-                    // 加入房间
-                    self.state.join_room(&room_id, &participant_id);
+                    // 加入房间 (登记发布轨道列表)
+                    self.state
+                        .join_room(&room_id, &participant_id, tracks.clone());
                     // 注册发送器, 供其他参与者的通知推送到本连接
                     self.state
                         .register_sender(&participant_id, self.msg_tx.clone());
@@ -488,16 +501,18 @@ impl SignalingSession {
                         participants: roster.clone(),
                     });
 
-                    // 兼容旧客户端: 逐个推送既有成员
+                    // 兼容旧客户端: 逐个推送既有成员 (含各自轨道列表)
                     for p in &roster {
                         self.send(SignalingResponse::ParticipantJoined {
                             participant_id: p.participant_id.clone(),
+                            tracks: p.tracks.clone(),
                         });
                     }
 
-                    // 通知房间内其他参与者有新人加入
+                    // 通知房间内其他参与者有新人加入 (含其轨道列表)
                     let notify = serde_json::to_string(&SignalingResponse::ParticipantJoined {
                         participant_id: participant_id.clone(),
+                        tracks: tracks.clone(),
                     })
                     .unwrap();
                     self.state.notify_room(&room_id, &participant_id, &notify);
@@ -566,9 +581,20 @@ impl SignalingSession {
             return;
         }
 
+        // 重协商可能新增/删除轨道 (如开始/停止屏幕共享): 重新提取轨道列表。
+        let tracks: Vec<TrackInfo> = if is_publisher {
+            crate::signaling::http::offer_mids(&sdp)
+                .into_iter()
+                .map(|(kind, mid)| TrackInfo { mid, kind })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let state = self.state.clone();
+        let pid_for_task = participant_id.clone();
         let reply = tokio::task::spawn_blocking(move || {
-            state.renegotiate(worker_idx, participant_id, sdp)
+            state.renegotiate(worker_idx, pid_for_task, sdp)
         })
         .await
         .unwrap_or(None);
@@ -579,6 +605,21 @@ impl SignalingSession {
                 local_candidates,
                 ..
             }) => {
+                // 发布轨道列表变化 -> 更新房间态并广播给订阅者。
+                if is_publisher
+                    && self.state.set_participant_tracks(
+                        &room_id,
+                        &participant_id,
+                        tracks.clone(),
+                    )
+                {
+                    let notify = serde_json::to_string(&SignalingResponse::ParticipantTracks {
+                        participant_id: participant_id.clone(),
+                        tracks: tracks.clone(),
+                    })
+                    .unwrap();
+                    self.state.notify_room(&room_id, &participant_id, &notify);
+                }
                 info!(
                     transport = self.transport,
                     peer = %self.peer,

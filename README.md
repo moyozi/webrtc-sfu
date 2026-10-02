@@ -654,9 +654,11 @@ Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉�
 | `welcome` | 协议版本与服务端能力集 (`features`) |
 | `pong` | 心跳回复 |
 | `sdp_answer` | SDP answer + 内联 ICE 候选 |
-| `joined` | `join` 成功确认，携带成员快照 `participants` |
+| `joined` | `join` 成功确认，携带成员快照 `participants`（每项含 `tracks: [{mid,kind}]` 轨道列表） |
 | `left` | `leave` 成功确认 |
-| `participant_joined` / `participant_left` | 成员进出广播（兼容旧客户端，新客户端对 `joined.participants` 去重） |
+| `participant_joined` | 成员加入广播，含其 `tracks`（兼容旧客户端，新客户端对 `joined.participants` 去重） |
+| `participant_left` | 成员离开广播 |
+| `participant_tracks` | 某成员发布的轨道列表变化（如开始/停止屏幕共享），订阅者据此调整订阅 |
 | `participant_updated` | 成员媒体状态变化（静音/关摄像头） |
 | `subscribed` / `unsubscribed` | 订阅/取消订阅确认（含 `track_mid`） |
 | `room_state` | 成员快照（响应 `get_room_state`） |

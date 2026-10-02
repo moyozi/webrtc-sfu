@@ -41,6 +41,17 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 服务端标识 (写入 `welcome`)。
 pub const SERVER_NAME: &str = concat!("webrtc-sfu/", env!("CARGO_PKG_VERSION"));
 
+/// 发布者的一条媒体轨道。
+///
+/// 一个参与者可发布多条轨道 (如 音频 + 摄像头视频 + 屏幕共享视频)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackInfo {
+    /// 该轨道在发布者 SDP 中的 mid (订阅者按此 mid 订阅)。
+    pub mid: String,
+    /// "audio" / "video"
+    pub kind: String,
+}
+
 /// 房间成员信息 (成员快照 / 广播共用)。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParticipantInfo {
@@ -51,6 +62,10 @@ pub struct ParticipantInfo {
     /// 是否开启摄像头 (true = 有视频)
     #[serde(default = "default_true")]
     pub video_enabled: bool,
+    /// 该成员发布的轨道列表 (mid + kind)。订阅者据此逐 track 订阅:
+    /// 一个发布者可能有 音频 + 摄像头视频 + 屏幕共享视频 等多条轨道。
+    #[serde(default)]
+    pub tracks: Vec<TrackInfo>,
 }
 
 fn default_true() -> bool {
@@ -225,10 +240,22 @@ pub enum SignalingResponse {
     Left { pc_id: String },
 
     #[serde(rename = "participant_joined")]
-    ParticipantJoined { participant_id: String },
+    ParticipantJoined {
+        participant_id: String,
+        /// 新成员的发布轨道列表 (可能为空: 刚加入尚未发布)。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tracks: Vec<TrackInfo>,
+    },
 
     #[serde(rename = "participant_left")]
     ParticipantLeft { participant_id: String },
+
+    /// 某成员发布的轨道列表发生变化 (重协商新增/删除 track, 如开始/停止屏幕共享)。
+    #[serde(rename = "participant_tracks")]
+    ParticipantTracks {
+        participant_id: String,
+        tracks: Vec<TrackInfo>,
+    },
 
     /// 房间内某成员的媒体状态变化 (静音 / 关摄像头)。
     #[serde(rename = "participant_updated")]
@@ -322,6 +349,10 @@ mod tests {
                 participant_id: "bob".into(),
                 audio_enabled: true,
                 video_enabled: false,
+                tracks: vec![TrackInfo {
+                    mid: "0".into(),
+                    kind: "audio".into(),
+                }],
             }],
         };
         let v: serde_json::Value = serde_json::to_value(&joined).unwrap();
