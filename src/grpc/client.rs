@@ -25,7 +25,8 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct GrpcControl {
     /// 全局 worker 编号 → 其所属媒体服务的 gRPC 地址
     peers: HashMap<u32, SocketAddr>,
-    runtime: tokio::runtime::Runtime,
+    /// 专用 gRPC runtime。用 `Option` 包裹以便在 `Drop` 中后台关闭。
+    runtime: Option<tokio::runtime::Runtime>,
     client_cache: Arc<Mutex<HashMap<SocketAddr, MediaControlClient<Channel>>>>,
     /// fire-and-forget 命令队列 (由 runtime 上的任务消费)
     tx: tokio::sync::mpsc::UnboundedSender<(u32, pb::Command)>,
@@ -43,7 +44,7 @@ impl GrpcControl {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let this = Arc::new(Self {
             peers,
-            runtime,
+            runtime: Some(runtime),
             client_cache: Arc::new(Mutex::new(HashMap::new())),
             tx,
         });
@@ -51,10 +52,15 @@ impl GrpcControl {
         this
     }
 
+    /// 内层 runtime 句柄 (仅在 `Drop` 之后不可用)。
+    fn runtime(&self) -> &tokio::runtime::Runtime {
+        self.runtime.as_ref().expect("gRPC runtime 已关闭")
+    }
+
     fn spawn_drain(self: Arc<Self>, mut rx: tokio::sync::mpsc::UnboundedReceiver<(u32, pb::Command)>) {
         let cache = self.client_cache.clone();
         let peers = self.peers.clone();
-        self.runtime.spawn(async move {
+        self.runtime().spawn(async move {
             while let Some((target, command)) = rx.recv().await {
                 let Some(addr) = peers.get(&target).copied() else {
                     warn!("gRPC 控制: 未知目标 worker {}", target);
@@ -87,7 +93,7 @@ impl GrpcControl {
         let addr = *self.peers.get(&target)?;
         let cache = self.client_cache.clone();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.runtime.spawn(async move {
+        self.runtime().spawn(async move {
             let result = async {
                 let mut client = media_client(addr, &cache).await.ok()?;
                 let req = tonic::Request::new(pb::CreateParticipantRequest {
@@ -144,7 +150,7 @@ impl GrpcControl {
         let addr = *self.peers.get(&target)?;
         let cache = self.client_cache.clone();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.runtime.spawn(async move {
+        self.runtime().spawn(async move {
             let result = async {
                 let mut client = media_client(addr, &cache).await.ok()?;
                 let req = tonic::Request::new(pb::GetPublisherTracksRequest {
@@ -169,6 +175,18 @@ impl GrpcControl {
             .recv_timeout(RPC_TIMEOUT + Duration::from_secs(1))
             .ok()
             .flatten()
+    }
+}
+
+impl Drop for GrpcControl {
+    fn drop(&mut self) {
+        // GrpcControl 可能被持有 `SignalingState` 的 async 任务在 runtime 线程上
+        // 释放。此时同步 drop 内层 runtime 会阻塞等待 blocking 线程池, 触发 tokio
+        // 「Cannot drop a runtime in a context where blocking is not allowed」
+        // panic。进程已在退出路径上, 后台关闭即可, 无需等待残留 RPC。
+        if let Some(rt) = self.runtime.take() {
+            rt.shutdown_background();
+        }
     }
 }
 
