@@ -37,6 +37,8 @@
 //! SFU_DISPATCHER_ADDR=0.0.0.0:5190
 //! # id@host:ws:quic:whip:whep[:weight];...  (端口 0 = 该入口禁用)
 //! SFU_SIGNALING_NODES="cell-a@10.0.0.1:5174:5173:5180:5181;cell-b@10.0.0.2:5174:5173:5180:5181:2"
+//! # 嵌入式: 与信令/媒体服务同进程启动 (默认独占)
+//! SFU_DISPATCHER_COHOST=on
 //! ```
 
 use crate::signaling::http::{parse_head, query_param, read_request, write_response};
@@ -117,6 +119,9 @@ pub struct DispatcherConfig {
     pub nodes: Vec<SignalingNode>,
     pub health_interval: Duration,
     pub health_timeout: Duration,
+    /// `true` = 嵌入式: 与其他服务 (信令/媒体) 同进程启动, 后台线程运行;
+    /// `false` = 独占进程, 本进程只做分配 (历史默认行为)。
+    pub cohost: bool,
 }
 
 impl DispatcherConfig {
@@ -152,13 +157,29 @@ impl DispatcherConfig {
                 .max(50),
         );
 
+        // 嵌入式模式: 与信令/媒体服务同进程启动 (默认独占, 保持向后兼容)。
+        let cohost = match std::env::var("SFU_DISPATCHER_COHOST") {
+            Ok(v) => !is_falsey(&v),
+            Err(_) => false,
+        };
+
         Some(Self {
             listen,
             nodes,
             health_interval,
             health_timeout,
+            cohost,
         })
     }
+}
+
+/// 判定 "关闭" 类取值: 空 / 0 / off / false / no。
+fn is_falsey(v: &str) -> bool {
+    v.is_empty()
+        || v == "0"
+        || v.eq_ignore_ascii_case("off")
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("no")
 }
 
 fn env_u64(key: &str) -> Option<u64> {
@@ -387,6 +408,16 @@ pub async fn run(cfg: DispatcherConfig) {
     {
         let state = state.clone();
         tokio::spawn(async move {
+            // 启动初期: 本地/同批启动的信令节点可能略晚于分配器开始监听,
+            // 首次探测易误判为不健康。前 10s 每 500ms 补探一次, 一旦全部
+            // 健康就立刻转入配置的正常周期, 避免启动窗口内 /allocate 误报 503。
+            for _ in 0..20 {
+                if state.healthy_count() == state.nodes.len() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                state.health_once().await;
+            }
             loop {
                 tokio::time::sleep(state.health_interval).await;
                 state.health_once().await;
@@ -613,6 +644,7 @@ mod tests {
             nodes,
             health_interval: Duration::from_secs(5),
             health_timeout: Duration::from_millis(100),
+            cohost: false,
         });
         let mut seen = std::collections::HashSet::new();
         for i in 0..32 {
@@ -629,6 +661,7 @@ mod tests {
             nodes,
             health_interval: Duration::from_secs(5),
             health_timeout: Duration::from_millis(100),
+            cohost: false,
         });
         // 同一房间稳定命中同一节点。
         let first = d.allocate("room-x").unwrap().id.clone();
@@ -653,6 +686,7 @@ mod tests {
             nodes,
             health_interval: Duration::from_secs(5),
             health_timeout: Duration::from_millis(100),
+            cohost: false,
         });
         for i in 0..50 {
             let got = d.allocate(&format!("room-{}", i));

@@ -24,12 +24,28 @@ fn main() {
         )
         .init();
 
-    // 信令分配器角色: 设置 SFU_DISPATCHER_ADDR 时本进程只做信令地址分配,
-    // 不启动 worker / 信令服务器。它通常独立部署为一组无状态实例 (前置 VIP/LB)。
+    // 信令分配器角色:
+    //  - 默认 (独占): 设置 SFU_DISPATCHER_ADDR 时本进程只做地址分配, 不启动
+    //    worker / 信令服务器; 通常独立部署为一组无状态实例 (前置 VIP/LB)。
+    //  - 嵌入式 (SFU_DISPATCHER_COHOST=on): 后台线程跑分配器, 本进程继续启动
+    //    信令/媒体服务, 适合单机一体化或与信令机同机部署。
     if let Some(dcfg) = dispatcher::DispatcherConfig::from_env() {
-        info!(?dcfg, "启动信令分配器");
-        dispatcher::run_blocking(dcfg);
-        return;
+        if dcfg.cohost {
+            info!(
+                ?dcfg,
+                "启动信令分配器 (嵌入模式, 监听 {}, 与其他服务同进程)",
+                dcfg.listen
+            );
+            let cfg = dcfg;
+            std::thread::Builder::new()
+                .name("sfu-dispatcher".to_string())
+                .spawn(move || dispatcher::run_blocking(cfg))
+                .expect("failed to spawn dispatcher thread");
+        } else {
+            info!(?dcfg, "启动信令分配器 (独占模式)");
+            dispatcher::run_blocking(dcfg);
+            return;
+        }
     }
 
     // 解析配置
