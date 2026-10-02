@@ -10,6 +10,7 @@
 > [`docs/deployment.md`](docs/deployment.md)。**
 > 跨线程/跨主机中继设计见 [`docs/multi-worker-relay.md`](docs/multi-worker-relay.md)。
 > 信令多机部署（客户端按 `room_id` 分配信令机）见 [`docs/signaling-dispatcher.md`](docs/signaling-dispatcher.md)。
+> **单核 fan-out 容量实测与 I/O 后端对比见 [`docs/capacity.md`](docs/capacity.md)。**
 
 ---
 
@@ -925,12 +926,24 @@ POST /allocate {"room_id":"demo"}
 
 ## 9. 性能指标预期
 
+**实测单核 fan-out 容量**（1 路 1.5 Mbps@30fps 视频 + Opus 64 kbps 音频；
+订阅端多进程并行；完整环境、方法与数据见 [`docs/capacity.md`](docs/capacity.md)）：
+
+| 订阅内容 | 单核满质量路数 | 此时 Worker CPU | 每订阅者 |
+|---|---:|---:|---|
+| 音 + 视频 | ≈ 200 | ≈ 79% | ~1.56 Mbps，~200 pps |
+| 只拉视频 | ≈ 250 | ≈ 75% | ~1.5 Mbps，~150 pps |
+| 只拉音频 | ≈ 500 | ≈ 70% | 64 kbps，50 pps |
+
+- 瓶颈是**每订阅者的每包转发量**（SRTP 加密 + `write_rtp`），单核约 **2.5–4 万次转发/秒**。
+- **io_uring 与 epoll 在满质量区间 CPU 基本一致**；过载时 io_uring 投递高约 28–40%。
+- 更高并发靠**多 Worker 按房间分片**（`SFU_WORKERS` + `SFU_ROOM_WORKERS`），而非单核堆订阅者。
+
+**设计目标**（非实测）：
+
 | 指标 | 预期值 | 说明 |
 |------|--------|------|
-| 单 Worker 并发连接 | 500-1000 | 取决于 simulcast 层数和带宽 |
-| 包转发延迟 (P99) | < 1ms | recvmmsg + 零拷贝路由 |
-| 吞吐量 (包/秒) | 100K+ | 64 包/批 × 2000 批/秒 |
-| CPU 利用率 | > 95% | 忙轮询模式下接近满载 |
+| 包转发延迟 (P99) | < 1ms | recvmmsg / io_uring + 零拷贝路由 |
 | 内存/连接 | ~2MB | str0m Rtc 实例 + 缓冲区 |
 
 ---

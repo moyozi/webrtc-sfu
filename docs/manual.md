@@ -612,6 +612,9 @@ ICE restart 恢复连接，无需重新加入房间：
 
 ## 13. 压测工具
 
+> 单核 fan-out 容量、io_uring/epoll 对比、批量参数影响等实测见
+> [`capacity.md`](capacity.md)。做高 fan-out 压测时**务必用多进程订阅**。
+
 ### 13.1 发布器
 
 ```bash
@@ -642,9 +645,12 @@ ICE restart 恢复连接，无需重新加入房间：
 | `--advertise` | 压测客户端对外 IP（须与 SFU 互通） |
 | `--video-kbps` / `--fps` | 仅发布器：每路视频码率/帧率 |
 | `--publisher` | 仅订阅器：`<id>:<audio_mid>:<video_mid>`，可重复 |
+| `--tracks` | 仅订阅器：`both`(默认)/`audio`/`video`，选择订阅范围 |
+| `--id-prefix` | 仅订阅器：participant_id 前缀，多进程压测时避免 ID 冲突 |
 
 > 压测客户端本身消耗 CPU 做 SRTP 解密；测 SFU 单核能力时建议把压测进程
-> 放到其它核或另一台机器。
+> 放到其它核或另一台机器。**单个 `load_subscriber` 进程**的接收上限约
+> **35–40k pps**，需要更高 fan-out 时开多个进程并各自指定 `--id-prefix`。
 
 ### 13.3 QUIC 信令调试
 
