@@ -937,7 +937,9 @@ POST /allocate {"room_id":"demo"}
 
 - 瓶颈是**每订阅者的每包转发量**（SRTP 加密 + `write_rtp`），单核约 **2.5–4 万次转发/秒**。
 - **io_uring 与 epoll 在满质量区间 CPU 基本一致**；过载时 io_uring 投递高约 28–40%。
-- 更高并发靠**多 Worker 按房间分片**（`SFU_WORKERS` + `SFU_ROOM_WORKERS`），而非单核堆订阅者。
+- **单房间跨 2 worker**：≈ 300–320 路（约 1.3–1.5× 单核；跨 worker 中继有 ~25–30% 开销）。
+- 更高并发优先靠多 Worker **按房间分散**（`SFU_WORKERS`）；只有单房间确实要更大容量，
+  才用 `SFU_ROOM_WORKERS` 跨 worker。
 
 **设计目标**（非实测）：
 
