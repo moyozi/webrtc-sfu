@@ -2,6 +2,10 @@
 
 > 适用版本：当前仓库 `main`（str0m 0.21 / RTP mode / 单房间多 worker / 跨主机中继 / WHIP 推流接入）
 
+> 📖 **按部署形态逐步配置、并逐条解释所有环境变量**，见专门的
+> [`deployment.md`](deployment.md)（单机单进程、多信令机 + 多媒体节点）。
+> 本手册侧重使用与协议。
+
 ---
 
 ## 目录
@@ -152,7 +156,7 @@ sudo firewall-cmd --reload
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `SFU_ANNOUNCE_IP` | 自动探测 | **对外通告 IP**，写入 SDP/ICE host 候选。生产必须显式设置（客户端可达地址）。 |
-| `SFU_WORKERS` | `1` | worker 线程数（= 媒体端口数）。 |
+| `SFU_WORKERS` | `1` | worker 线程数（= 媒体端口数）。设 `0` 为**纯信令节点**：本进程不跑任何 worker、不绑定媒体/中继端口，媒体全部在远端媒体机（必须同时配 `SFU_TOTAL_WORKERS` 与 `SFU_CONTROL_PEERS`）。 |
 | `SFU_DEFAULT_WORKER` | 未设 | 可选覆盖：强制未配置房间全落该 worker（默认按房间 id 哈希固定到单个 worker）。 |
 | `SFU_ROOM_WORKERS` | 未设 | 房间级分片：`room=w1,w2;*=...`，配置多个 worker 后房间才跨 worker（单机多 worker / 多主机多 worker 都需配置）。 |
 | `SFU_WS_ADDR` | `0.0.0.0:5174` | WebSocket 信令绑定地址。 |
@@ -187,6 +191,10 @@ sudo firewall-cmd --reload
 信令进程与 worker 进程可分离（worker-only 进程设 `SFU_SIGNALING=off`）。
 信令对远端 worker 的命令通道由自研 TCP 改为 **gRPC**
 （`proto/sfu.proto` 的 `MediaControl`），媒体面仍走 UDP。
+
+还支持**纯信令节点**：`SFU_WORKERS=0` + `SFU_SIGNALING=on`，本进程只维护房间
+状态并跑 WS/QUIC/WHIP/WHEP，不启动任何 worker、不绑定媒体端口，所有房间命令
+经 gRPC 下发到远端媒体机。示例见 `deploy/signaling-only.env`。
 
 `CreateParticipant` 为同步 RPC（返回 SDP answer），其余命令 fire-and-forget
 （`SendCommand`）。跨主机媒体中继 RTP 按 `SFU_RELAY_PEERS` 点对点 UDP 直连。

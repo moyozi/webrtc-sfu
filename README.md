@@ -6,6 +6,8 @@
 
 > 📖 **部署与各功能使用请看 [`docs/manual.md`](docs/manual.md)**（安装、配置、浏览器、
 > FFmpeg/GStreamer/OBS 推流、单机/多 worker/跨主机集群、压测、排障）。
+> **完整部署手册（单机单进程 / 多信令机+多媒体节点，逐变量说明）见
+> [`docs/deployment.md`](docs/deployment.md)。**
 > 跨线程/跨主机中继设计见 [`docs/multi-worker-relay.md`](docs/multi-worker-relay.md)。
 > 信令多机部署（客户端按 `room_id` 分配信令机）见 [`docs/signaling-dispatcher.md`](docs/signaling-dispatcher.md)。
 
@@ -856,6 +858,12 @@ SFU_JWT_SECRET=dev-secret ./scripts/gen-jwt.sh alice room-1 publisher 3600
 | `SFU_CONTROL_LISTEN` | 本进程 `MediaControl` gRPC 监听（worker 进程） |
 | `SFU_CONTROL_PEERS` | `全局worker=host:port,...`，远端 worker → 其 gRPC 地址 |
 | `SFU_SIGNALING` | `on`（默认）/ `off`（worker-only） |
+| `SFU_WORKERS` | `0` = **纯信令节点**（不跑 worker，媒体全在远端） |
+
+**纯信令节点**（`SFU_WORKERS=0` + `SFU_SIGNALING=on`）只维护房间状态并跑
+WS/QUIC/WHIP/WHEP，不启动任何 worker、不绑定媒体端口；房间命令经 gRPC 下发到
+远端媒体机。必须同时配置 `SFU_TOTAL_WORKERS` 与 `SFU_CONTROL_PEERS`，否则启动即
+报错退出。示例见 `deploy/signaling-only.env`。
 
 `CreateParticipant` 为同步 RPC（返回 SDP answer），其余命令 fire-and-forget
 （`SendCommand`）。跨主机媒体中继 RTP 仍按 `SFU_RELAY_PEERS` 点对点 UDP 直连。
@@ -881,6 +889,9 @@ POST /allocate {"room_id":"demo"}
 
 按带虚拟节点的一致性哈希把房间稳定映射到健康信令机，节点宕机自动顺延。
 详见 [`docs/signaling-dispatcher.md`](docs/signaling-dispatcher.md)。
+
+> **完整的两种部署形态（单机单进程 / 多信令机 + 多媒体节点）与所有环境变量的
+> 逐条说明见 [`docs/deployment.md`](docs/deployment.md)。**
 
 ---
 
