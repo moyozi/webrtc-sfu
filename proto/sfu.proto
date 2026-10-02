@@ -10,6 +10,8 @@ package sfu.control.v1;
 service MediaControl {
   // 创建参与者, 同步返回 SDP answer。
   rpc CreateParticipant(CreateParticipantRequest) returns (CreateParticipantResponse);
+  // 对已存在的参与者重新协商 (ICE restart / 重协商), 同步返回新的 SDP answer。
+  rpc Renegotiate(RenegotiateRequest) returns (RenegotiateResponse);
   // 查询发布者已发布的轨道 (WHEP 按发布者订阅用)。
   rpc GetPublisherTracks(GetPublisherTracksRequest) returns (GetPublisherTracksResponse);
   // 无应答 worker 命令 (ICE 候选 / 订阅 / 中继登记 / 关键帧请求 ...)。
@@ -42,6 +44,21 @@ message CreateParticipantRequest {
 }
 
 message CreateParticipantResponse {
+  bool ok = 1;
+  string participant_id = 2;
+  string sdp_answer = 3;
+  repeated string local_candidates = 4;
+  string error = 5;
+}
+
+message RenegotiateRequest {
+  // 目标全局 worker 编号
+  uint32 target_worker = 1;
+  string participant_id = 2;
+  string sdp_offer = 3;
+}
+
+message RenegotiateResponse {
   bool ok = 1;
   string participant_id = 2;
   string sdp_answer = 3;

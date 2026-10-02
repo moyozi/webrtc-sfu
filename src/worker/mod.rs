@@ -74,6 +74,13 @@ pub enum WorkerCommand {
         reply_tx: Sender<WorkerReply>,
     },
 
+    /// 对已存在的参与者重新协商 (ICE restart / 新增/删除轨道), SDP offer → answer
+    Renegotiate {
+        participant_id: String,
+        sdp_offer: String,
+        reply_tx: Sender<WorkerReply>,
+    },
+
     /// 添加远程 ICE 候选
     AddRemoteCandidate {
         participant_id: String,

@@ -519,6 +519,7 @@ WebSocket 与 QUIC 承载**完全相同**的 JSON 消息。一条连接可承载
 | `hello` | `protocol_version?`, `client?` | 可选握手；服务端回 `welcome` |
 | `ping` | `t?` | 应用层心跳；服务端回 `pong` |
 | `join` | `pc_id`, `room_id`, `participant_id`, `sdp`, `role?`, `token?` | 建立发布/订阅连接。`role`=`publisher`(默认)/`subscriber` |
+| `renegotiate` | `pc_id`, `sdp`, `token?` | 对已存在 PC 重新协商（典型为 **ICE restart**）→ 服务端回 `sdp_answer` |
 | `ice_candidate` | `pc_id`, `candidate`, `sdp_mid?`, `sdp_mline_index?` | trickle ICE |
 | `subscribe` | `pc_id`, `publisher_id`, `track_mid`, `subscriber_mid?` | 订阅某发布者轨道 |
 | `unsubscribe` | `pc_id`, `publisher_id`, `track_mid` | 取消订阅 |
@@ -548,6 +549,21 @@ WebSocket 与 QUIC 承载**完全相同**的 JSON 消息。一条连接可承载
 
 > 说明：SFU 的 ICE 候选为**单端口 host 候选**，直接内联在 `sdp_answer.ice_candidates` 中，
 > 当前不发送服务端 trickle `ice_candidate`。
+
+### 11.2.1 ICE restart（连接恢复）
+
+当客户端 `RTCPeerConnection` 进入 `failed`（或持续 `disconnected`）时，客户端可发起
+ICE restart 恢复连接，无需重新加入房间：
+
+1. 客户端 `pc.createOffer({ iceRestart: true })`，`setLocalDescription` 后发送
+   `{"type":"renegotiate", "pc_id":"...", "sdp":"...", "token?":"..."}`；
+2. 服务端复用该 pc_id 已有的参与者（Rtc）实例，`accept_offer` 检测到新的 ICE 凭证后
+   自动执行 ICE restart，回一个新的 `sdp_answer`；
+3. 客户端 `setRemoteDescription(answer)` 并添加新的 ICE 候选，连接恢复。
+
+订阅关系、房间成员状态、媒体转发均不受影响（不经过 `leave`/`join`）。
+`RoomChatWeb` 已内置该流程（`failed` 立即重试、`disconnected` 观察 3s 后重试，
+最多 5 次）。
 
 ### 11.3 `pc_id` 约定
 

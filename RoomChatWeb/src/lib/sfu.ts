@@ -25,6 +25,12 @@ const PROTOCOL_VERSION = 1;
 /** 应用层心跳间隔 (毫秒) */
 const HEARTBEAT_MS = 20_000;
 
+/** ICE restart: 等待重协商 answer 的超时 (毫秒) */
+const RENEGOTIATE_TIMEOUT_MS = 5_000;
+
+/** ICE restart: 单个 PC 的最大重试次数 */
+const MAX_ICE_RESTARTS = 5;
+
 /** 从 JWT 载荷中解析 `sub` (仅用于取用户 ID, 不做签名校验)。 */
 function jwtSubject(token: string): string | null {
   try {
@@ -89,6 +95,13 @@ export class SfuClient {
   private joinedPcs = new Set<string>();
   // join 前收集到的 ICE 候选缓冲 (pc_id -> candidates), joined 后补发。
   private pendingIce = new Map<string, RTCIceCandidate[]>();
+  // ICE restart: 正在重启 / 已发出 renegotiate 等待 answer 的 pc_id
+  private restarting = new Set<string>();
+  private awaitingRenegotiation = new Set<string>();
+  // ICE restart: 每个 pc 的待触发定时器 (重试 / answer 超时)
+  private restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // ICE restart: 每个 pc 的已尝试次数
+  private restartAttempts = new Map<string, number>();
   // 应用层心跳定时器
   private heartbeat: ReturnType<typeof setInterval> | null = null;
 
@@ -153,10 +166,7 @@ export class SfuClient {
     pc.onicecandidate = (e) => {
       if (e.candidate) this.sendIce(PUB_PC_ID, e.candidate);
     };
-    pc.onconnectionstatechange = () => {
-      this.cb.onLog(`发布连接状态: ${pc.connectionState}`);
-      this.cb.onConnectionStateChange(pc.connectionState);
-    };
+    pc.onconnectionstatechange = () => this.watchConnection(PUB_PC_ID, pc, "发布");
 
     // 5. 创建 offer, 等待 ICE 收集完成
     const offer = await pc.createOffer();
@@ -223,9 +233,7 @@ export class SfuClient {
     pc.onicecandidate = (e) => {
       if (e.candidate) this.sendIce(pcId, e.candidate);
     };
-    pc.onconnectionstatechange = () => {
-      this.cb.onLog(`订阅 ${publisherId} 连接状态: ${pc.connectionState}`);
-    };
+    pc.onconnectionstatechange = () => this.watchConnection(pcId, pc, `订阅 ${publisherId}`);
 
     this.registerPc(pcId, pc, "subscriber", publisherId);
     this.subPcByPublisher.set(publisherId, pcId);
@@ -260,6 +268,11 @@ export class SfuClient {
     entry?.pc.close();
     this.pcs.delete(pcId);
     this.subPcByPublisher.delete(publisherId);
+    // 清理该 pc 的 ICE restart 状态
+    this.clearRestartTimer(pcId);
+    this.restarting.delete(pcId);
+    this.awaitingRenegotiation.delete(pcId);
+    this.restartAttempts.delete(pcId);
     this.cb.onLog(`已取消订阅 ${publisherId}`);
     this.cb.onSubscriptionUpdate(publisherId, { status: "idle", stream: null });
   }
@@ -285,6 +298,11 @@ export class SfuClient {
     this.knownParticipants.clear();
     this.joinedPcs.clear();
     this.pendingIce.clear();
+    for (const t of this.restartTimers.values()) clearTimeout(t);
+    this.restartTimers.clear();
+    this.restarting.clear();
+    this.awaitingRenegotiation.clear();
+    this.restartAttempts.clear();
 
     // 停止本地轨道
     if (this.localStream) {
@@ -393,6 +411,8 @@ export class SfuClient {
           return;
         }
         const { pc, role, publisherId } = entry;
+        // 本次 sdp_answer 是否为 ICE restart 的应答 (由客户端主动发起)。
+        const isRenegotiation = this.awaitingRenegotiation.has(msg.pc_id);
 
         pc.setRemoteDescription({ type: "answer", sdp: msg.sdp })
           .then(() => {
@@ -408,6 +428,15 @@ export class SfuClient {
               }
             }
 
+            if (isRenegotiation) {
+              // ICE restart 完成: 清理状态, 不重发 subscribe (订阅关系仍在)。
+              this.awaitingRenegotiation.delete(msg.pc_id);
+              this.restarting.delete(msg.pc_id);
+              this.clearRestartTimer(msg.pc_id);
+              this.cb.onLog(`ICE 重启完成 (${msg.pc_id})`, "success");
+              return;
+            }
+
             if (role === "subscriber" && publisherId) {
               // SDP 完成后发送 subscribe (音频 mid=0 + 视频 mid=1), 复用同一 WebSocket
               this.sig?.send({ type: "subscribe", pc_id: msg.pc_id, publisher_id: publisherId, track_mid: "0" });
@@ -417,7 +446,14 @@ export class SfuClient {
               this.cb.onLog("SDP 协商完成, 已添加服务器候选", "success");
             }
           })
-          .catch((e) => this.cb.onLog(`SDP 设置失败: ${e}`, "error"));
+          .catch((e) => {
+            this.cb.onLog(`SDP 设置失败: ${e}`, "error");
+            if (isRenegotiation) {
+              this.awaitingRenegotiation.delete(msg.pc_id);
+              this.restarting.delete(msg.pc_id);
+              this.scheduleRestart(msg.pc_id, 1000);
+            }
+          });
         break;
       }
 
@@ -492,6 +528,97 @@ export class SfuClient {
     publisherId?: string
   ): void {
     this.pcs.set(pcId, { pc, role, publisherId });
+  }
+
+  // ── ICE restart (连接恢复) ────────────────────────
+
+  /**
+   * 监听 PC 连接状态; 连接失败时自动发起 ICE restart。
+   *
+   * - `failed`   : 立即尝试重启 (延迟 300ms 等待 ICE 状态稳定)。
+   * - `disconnected`: 可能是瞬时抖动, 先给 3s 观察窗口, 仍不恢复再重启。
+   * - `connected` : 清除重试计数与定时器。
+   */
+  private watchConnection(pcId: string, pc: RTCPeerConnection, label: string): void {
+    const state = pc.connectionState;
+    this.cb.onLog(`${label}连接状态: ${state}`);
+    if (pcId === PUB_PC_ID) this.cb.onConnectionStateChange(state);
+
+    if (state === "connected") {
+      this.clearRestartTimer(pcId);
+      this.restartAttempts.delete(pcId);
+      return;
+    }
+    if (state === "failed") {
+      this.clearRestartTimer(pcId);
+      this.scheduleRestart(pcId, 300);
+    } else if (state === "disconnected") {
+      this.scheduleRestart(pcId, 3000);
+    }
+  }
+
+  /** 延迟触发一次 ICE restart; 已有待触发任务或进行中则不重复排程。 */
+  private scheduleRestart(pcId: string, delayMs: number): void {
+    if (this.restartTimers.has(pcId) || this.restarting.has(pcId)) return;
+    const timer = setTimeout(() => {
+      this.restartTimers.delete(pcId);
+      const entry = this.pcs.get(pcId);
+      if (!entry || entry.pc.connectionState === "connected") return;
+      const attempts = this.restartAttempts.get(pcId) ?? 0;
+      if (attempts >= MAX_ICE_RESTARTS) {
+        this.cb.onLog(`${pcId} ICE 重启连续失败, 已放弃`, "error");
+        return;
+      }
+      this.restartAttempts.set(pcId, attempts + 1);
+      void this.restartIce(pcId, entry, attempts + 1);
+    }, delayMs);
+    this.restartTimers.set(pcId, timer);
+  }
+
+  private clearRestartTimer(pcId: string): void {
+    const timer = this.restartTimers.get(pcId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.restartTimers.delete(pcId);
+    }
+  }
+
+  /**
+   * 发起一次 ICE restart: `createOffer({iceRestart:true})` → 通过信令
+   * `renegotiate` 把新 offer 交给服务器 (复用同一参与者, 触发 str0m 的
+   * ICE restart), 收到 `sdp_answer` 后由 onMessage 的处理分支收尾。
+   */
+  private async restartIce(pcId: string, entry: PcEntry, attempt: number): Promise<void> {
+    if (this.restarting.has(pcId)) return;
+    this.restarting.add(pcId);
+    const pc = entry.pc;
+    this.cb.onLog(`连接中断, 发起 ICE 重启 (${pcId}, 第 ${attempt} 次)...`, "warn");
+    try {
+      const offer = await pc.createOffer({ iceRestart: true });
+      await pc.setLocalDescription(offer);
+      await this.waitIceComplete(pc);
+      this.awaitingRenegotiation.add(pcId);
+      this.sig?.send({
+        type: "renegotiate",
+        pc_id: pcId,
+        sdp: pc.localDescription!.sdp,
+        ...(this.token ? { token: this.token } : {}),
+      });
+      // 等待 answer 的超时保护: 超时则按失败处理, 稍后重试。
+      const timer = setTimeout(() => {
+        this.restartTimers.delete(pcId);
+        this.restarting.delete(pcId);
+        this.awaitingRenegotiation.delete(pcId);
+        this.cb.onLog(`ICE 重启超时 (${pcId}), 稍后重试`, "warn");
+        this.scheduleRestart(pcId, 0);
+      }, RENEGOTIATE_TIMEOUT_MS);
+      this.restartTimers.set(pcId, timer);
+    } catch (e) {
+      this.restarting.delete(pcId);
+      this.awaitingRenegotiation.delete(pcId);
+      this.cb.onLog(`ICE 重启失败 (${pcId}): ${e}`, "error");
+      this.scheduleRestart(pcId, 3000);
+    }
   }
 
   /**

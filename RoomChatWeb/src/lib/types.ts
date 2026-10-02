@@ -8,6 +8,7 @@ export type ClientMessage =
   | { type: "hello"; protocol_version?: number; client?: string }
   | { type: "ping"; t?: number }
   | { type: "join"; pc_id: string; room_id: string; participant_id: string; sdp: string; role: "publisher" | "subscriber"; token?: string }
+  | { type: "renegotiate"; pc_id: string; sdp: string; token?: string }
   | { type: "ice_candidate"; pc_id: string; candidate: string; sdp_mid: string | null; sdp_mline_index: number | null }
   | { type: "subscribe"; pc_id: string; publisher_id: string; track_mid: string; subscriber_mid?: string }
   | { type: "unsubscribe"; pc_id: string; publisher_id: string; track_mid: string }

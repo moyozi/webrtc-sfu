@@ -163,6 +163,10 @@ impl SignalingSession {
                     .await
             }
 
+            SignalingMessage::Renegotiate { pc_id, sdp, token } => {
+                self.on_renegotiate(pc_id, sdp, token).await
+            }
+
             SignalingMessage::IceCandidate {
                 pc_id,
                 candidate,
@@ -297,10 +301,11 @@ impl SignalingSession {
                 return;
             }
         }
-        let mut features: Vec<String> = ["heartbeat", "join_ack", "room_state", "media_state"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let mut features: Vec<String> =
+            ["heartbeat", "join_ack", "room_state", "media_state", "ice_restart"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         if self.state.auth.is_enabled() {
             features.push("jwt".to_string());
         }
@@ -525,6 +530,78 @@ impl SignalingSession {
                     "Worker 无响应",
                 );
             }
+        }
+    }
+
+    /// 对已存在的 pc_id 重新协商 (ICE restart / 重协商)。
+    ///
+    /// 复用已有的参与者 (Rtc) 实例, 只应用新的 SDP offer: 若 offer 携带新的
+    /// ICE 凭证, str0m 在 `accept_offer` 内部自动执行 ICE restart, 服务端回
+    /// 一个新的 `sdp_answer` (含重新生成的本地候选)。
+    async fn on_renegotiate(&mut self, pc_id: String, sdp: String, token: Option<String>) {
+        let target = self.sessions.get(&pc_id).map(|s| {
+            (
+                s.worker_idx,
+                s.participant_id.clone(),
+                s.room_id.clone(),
+                s.is_publisher,
+            )
+        });
+        let Some((worker_idx, participant_id, room_id, is_publisher)) = target else {
+            self.send_error(
+                Some(pc_id),
+                ErrorCode::UnknownSession,
+                "未知 pc_id, 请先 join",
+            );
+            return;
+        };
+
+        // 复用 join 的鉴权规则 (claims 已在 join 时校验过, 此处幂等重校验)。
+        let role = if is_publisher { "publisher" } else { "subscriber" };
+        if let Err(error) =
+            self.authenticate_join(token.as_deref(), &room_id, &participant_id, role)
+        {
+            warn!(transport = self.transport, peer = %self.peer, "重协商鉴权失败: {}", error);
+            self.send_error(Some(pc_id), ErrorCode::Unauthorized, error);
+            return;
+        }
+
+        let state = self.state.clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            state.renegotiate(worker_idx, participant_id, sdp)
+        })
+        .await
+        .unwrap_or(None);
+
+        match reply {
+            Some(WorkerReply::SdpAnswer {
+                sdp_answer,
+                local_candidates,
+                ..
+            }) => {
+                info!(
+                    transport = self.transport,
+                    peer = %self.peer,
+                    "pc_id {} 重新协商完成 (ICE restart)",
+                    pc_id
+                );
+                self.send(SignalingResponse::SdpAnswer {
+                    pc_id,
+                    sdp: sdp_answer,
+                    ice_candidates: local_candidates,
+                });
+            }
+            Some(WorkerReply::Error { error, .. }) => {
+                self.send_error(Some(pc_id), ErrorCode::WorkerError, error)
+            }
+            Some(_) => {
+                self.send_error(Some(pc_id), ErrorCode::Internal, "worker 返回了非预期响应")
+            }
+            None => self.send_error(
+                Some(pc_id),
+                ErrorCode::WorkerUnavailable,
+                "Worker 无响应",
+            ),
         }
     }
 

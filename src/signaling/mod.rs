@@ -138,6 +138,16 @@ impl SignalingState {
             .create_participant(global, room_id, participant_id, sdp_offer)
     }
 
+    /// 重新协商参与者 (ICE restart / 重协商)。
+    pub fn renegotiate(
+        &self,
+        global: usize,
+        participant_id: String,
+        sdp_offer: String,
+    ) -> Option<WorkerReply> {
+        self.router.renegotiate(global, participant_id, sdp_offer)
+    }
+
     /// 发送无需回复的 worker 命令。
     pub fn send_worker(&self, global: usize, cmd: WorkerCommand) {
         self.router.send(global, cmd);

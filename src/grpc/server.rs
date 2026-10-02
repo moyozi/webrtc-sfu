@@ -114,6 +114,64 @@ impl MediaControl for MediaControlSvc {
         Ok(Response::new(resp))
     }
 
+    async fn renegotiate(
+        &self,
+        request: Request<pb::RenegotiateRequest>,
+    ) -> Result<Response<pb::RenegotiateResponse>, Status> {
+        let req = request.into_inner();
+        let tx = self
+            .local_tx(req.target_worker)
+            .ok_or_else(|| Status::not_found(format!("worker {} 不在此媒体服务", req.target_worker)))?;
+        let reply = tokio::task::spawn_blocking(move || {
+            let (rtx, rrx) = crossbeam_channel::bounded(1);
+            let cmd = WorkerCommand::Renegotiate {
+                participant_id: req.participant_id,
+                sdp_offer: req.sdp_offer,
+                reply_tx: rtx,
+            };
+            if tx.send_timeout(cmd, CMD_SEND_TIMEOUT).is_err() {
+                return None;
+            }
+            rrx.recv_timeout(REPLY_TIMEOUT).ok()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("blocking task join 失败: {}", e)))?;
+
+        let resp = match reply {
+            Some(WorkerReply::SdpAnswer {
+                participant_id,
+                sdp_answer,
+                local_candidates,
+            }) => pb::RenegotiateResponse {
+                ok: true,
+                participant_id,
+                sdp_answer,
+                local_candidates,
+                error: String::new(),
+            },
+            Some(WorkerReply::Error {
+                participant_id,
+                error,
+            }) => pb::RenegotiateResponse {
+                ok: false,
+                participant_id,
+                error,
+                ..Default::default()
+            },
+            Some(_) => pb::RenegotiateResponse {
+                ok: false,
+                error: "非预期 worker 回复".to_string(),
+                ..Default::default()
+            },
+            None => pb::RenegotiateResponse {
+                ok: false,
+                error: "worker 未响应".to_string(),
+                ..Default::default()
+            },
+        };
+        Ok(Response::new(resp))
+    }
+
     async fn get_publisher_tracks(
         &self,
         request: Request<pb::GetPublisherTracksRequest>,

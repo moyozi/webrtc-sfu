@@ -628,6 +628,7 @@ Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉�
 | `hello` | `protocol_version?`, `client?` | 可选握手，协商版本 → `welcome` |
 | `ping` | `t?` | 应用层心跳 → `pong`（带 `t`） |
 | `join` | `pc_id`, `room_id`, `participant_id`, `sdp`, `role?`, `token?` | 创建发布/订阅 PC |
+| `renegotiate` | `pc_id`, `sdp`, `token?` | 对已存在 PC 重新协商 (ICE restart) → `sdp_answer` |
 | `ice_candidate` | `pc_id`, `candidate`, `sdp_mid?`, `sdp_mline_index?` | Trickle ICE |
 | `subscribe` | `pc_id`, `publisher_id`, `track_mid`, `subscriber_mid?` | 订阅轨道 |
 | `unsubscribe` | `pc_id`, `publisher_id`, `track_mid` | 取消订阅 |

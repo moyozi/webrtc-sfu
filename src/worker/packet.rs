@@ -310,3 +310,45 @@ pub(super) fn handle_create_participant(
         }
     }
 }
+
+/// 处理重新协商命令: 对已有参与者应用新的 SDP offer。
+///
+/// 典型场景是 **ICE restart**: offer 带新的 ICE ufrag/pwd, str0m 在
+/// `accept_sdp_offer` 内部检测到远端凭证变化后自动执行 ICE restart, 并生成
+/// 带新本地凭证的 answer。这里复用同一参与者实例, 不重建 Rtc。
+pub(super) fn handle_renegotiate(
+    table: &mut ParticipantTable,
+    router: &mut Router,
+    send_batch: &mut SendBatch,
+    wheel: &mut TimerWheel,
+    participant_id: String,
+    sdp_offer: String,
+    reply_tx: Sender<WorkerReply>,
+) {
+    let Some(participant) = table.get_mut(&participant_id) else {
+        let _ = reply_tx.send(WorkerReply::Error {
+            participant_id,
+            error: "参与者不存在 (可能已离开)".to_string(),
+        });
+        return;
+    };
+
+    match participant.accept_sdp_offer(&sdp_offer) {
+        Ok(sdp_answer) => {
+            let candidates = participant.local_candidates();
+            let _ = reply_tx.send(WorkerReply::SdpAnswer {
+                participant_id: participant_id.clone(),
+                sdp_answer,
+                local_candidates: candidates,
+            });
+            // 重新协商会产生新的 STUN/DTLS 输出, 立即 drain 并重排定时器。
+            drain_and_schedule(&participant_id, table, router, send_batch, wheel);
+        }
+        Err(e) => {
+            let _ = reply_tx.send(WorkerReply::Error {
+                participant_id,
+                error: format!("重新协商 SDP 失败: {}", e),
+            });
+        }
+    }
+}

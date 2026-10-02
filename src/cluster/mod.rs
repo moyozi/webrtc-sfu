@@ -82,6 +82,31 @@ impl WorkerRouter {
             .create_participant(global as u32, room_id, participant_id, sdp_offer)
     }
 
+    /// 重新协商参与者 (ICE restart / 重协商, 需要远端 gRPC 往返)。
+    pub fn renegotiate(
+        &self,
+        global: usize,
+        participant_id: String,
+        sdp_offer: String,
+    ) -> Option<WorkerReply> {
+        if let Some(li) = self.local_index(global) {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let cmd = WorkerCommand::Renegotiate {
+                participant_id,
+                sdp_offer,
+                reply_tx: tx,
+            };
+            self.local_txs
+                .get(li)?
+                .send_timeout(cmd, CMD_SEND_TIMEOUT)
+                .ok()?;
+            return rx.recv_timeout(REPLY_TIMEOUT).ok();
+        }
+        self.control
+            .as_ref()?
+            .renegotiate(global as u32, participant_id, sdp_offer)
+    }
+
     /// 查询发布者已发布的轨道 (mid, kind)，用于 WHEP 按发布者订阅。
     pub fn publisher_tracks(
         &self,

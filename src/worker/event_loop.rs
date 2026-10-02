@@ -14,7 +14,7 @@ use super::forward::{
     forward_relayed_rtp, gc_remote_publisher, request_publisher_keyframe, RelayTxState,
 };
 use super::output::{drain_and_schedule, drive_due_timers};
-use super::packet::{handle_create_participant, process_packet, PendingRtp};
+use super::packet::{handle_create_participant, handle_renegotiate, process_packet, PendingRtp};
 use super::relay::{RelayControl, RelayedRtp};
 use super::timer::TimerWheel;
 use super::{WorkerCommand, WorkerConfig, WorkerReply};
@@ -224,6 +224,22 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                         sdp_offer,
                         local_addr,
                         bwe_initial_bps,
+                        reply_tx,
+                    );
+                }
+
+                WorkerCommand::Renegotiate {
+                    participant_id,
+                    sdp_offer,
+                    reply_tx,
+                } => {
+                    handle_renegotiate(
+                        &mut table,
+                        &mut router,
+                        &mut send_batch,
+                        &mut wheel,
+                        participant_id,
+                        sdp_offer,
                         reply_tx,
                     );
                 }

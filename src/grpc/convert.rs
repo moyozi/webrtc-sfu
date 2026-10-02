@@ -79,6 +79,7 @@ pub fn command_to_proto(cmd: WorkerCommand) -> Option<pb::Command> {
             rid: rid.map(|r| r.to_string()),
         }),
         WorkerCommand::CreateParticipant { .. }
+        | WorkerCommand::Renegotiate { .. }
         | WorkerCommand::GetPublisherTracks { .. }
         | WorkerCommand::Shutdown => return None,
     };

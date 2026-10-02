@@ -119,6 +119,19 @@ pub enum SignalingMessage {
         token: Option<String>,
     },
 
+    /// 对**已存在**的 pc_id 重新协商: 典型场景是 ICE restart。
+    ///
+    /// 与 `join` 不同, 它复用服务器上已有的参与者 (Rtc) 实例, 只应用新的
+    /// SDP offer (新 ICE 凭证 → str0m 自动做 ICE restart), 服务端回 `sdp_answer`。
+    #[serde(rename = "renegotiate")]
+    Renegotiate {
+        pc_id: String,
+        sdp: String,
+        /// 用户鉴权 JWT (启用了鉴权时必填, 与 `join` 一致)。
+        #[serde(default)]
+        token: Option<String>,
+    },
+
     #[serde(rename = "ice_candidate")]
     IceCandidate {
         pc_id: String,

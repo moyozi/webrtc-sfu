@@ -132,6 +132,54 @@ impl GrpcControl {
         }
     }
 
+    /// 同步重新协商参与者 (远端媒体服务; ICE restart / 重协商)。
+    pub fn renegotiate(
+        &self,
+        target: u32,
+        participant_id: String,
+        sdp_offer: String,
+    ) -> Option<WorkerReply> {
+        let addr = *self.peers.get(&target)?;
+        let cache = self.client_cache.clone();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.runtime().spawn(async move {
+            let result = async {
+                let mut client = media_client(addr, &cache).await.ok()?;
+                let req = tonic::Request::new(pb::RenegotiateRequest {
+                    target_worker: target,
+                    participant_id,
+                    sdp_offer,
+                });
+                let resp = tokio::time::timeout(RPC_TIMEOUT, client.renegotiate(req))
+                    .await
+                    .ok()?
+                    .ok()?
+                    .into_inner();
+                Some(if resp.ok {
+                    WorkerReply::SdpAnswer {
+                        participant_id: resp.participant_id,
+                        sdp_answer: resp.sdp_answer,
+                        local_candidates: resp.local_candidates,
+                    }
+                } else {
+                    WorkerReply::Error {
+                        participant_id: resp.participant_id,
+                        error: resp.error,
+                    }
+                })
+            }
+            .await;
+            let _ = reply_tx.send(result);
+        });
+        match reply_rx.recv_timeout(RPC_TIMEOUT + Duration::from_secs(1)) {
+            Ok(reply) => reply,
+            Err(_) => {
+                warn!("gRPC Renegotiate 超时 (worker {})", target);
+                None
+            }
+        }
+    }
+
     /// 发送无需回复的 worker 命令 (非阻塞, 入队后由后台任务发送)。
     pub fn send(&self, target: u32, cmd: WorkerCommand) {
         if let Some(command) = convert::command_to_proto(cmd) {
