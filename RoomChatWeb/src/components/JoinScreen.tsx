@@ -1,7 +1,12 @@
 import { createSignal } from "solid-js";
 
 interface JoinScreenProps {
-  onJoin: (serverUrl: string, roomId: string, name: string, token: string) => void;
+  onJoin: (
+    endpoint: string,
+    roomId: string,
+    name: string,
+    token: string
+  ) => Promise<void>;
 }
 
 /** 随机生成一个昵称, 例如 user-7f3k2a */
@@ -13,22 +18,33 @@ function randomName(): string {
 }
 
 export default function JoinScreen(props: JoinScreenProps) {
-  const [serverUrl, setServerUrl] = createSignal("ws://192.168.31.112:5174");
+  // 默认填分配器地址；也可直接填 ws:// 信令地址绕过分配器。
+  const [endpoint, setEndpoint] = createSignal("http://192.168.31.112:5190");
   const [roomId, setRoomId] = createSignal("room-1");
   const [name, setName] = createSignal(randomName());
   const [token, setToken] = createSignal("");
   const [error, setError] = createSignal("");
   const [joining, setJoining] = createSignal(false);
 
-  const handleJoin = () => {
+  const handleJoin = async () => {
     const n = name().trim();
     if (!n) {
       setError("请输入昵称");
       return;
     }
+    if (!roomId().trim()) {
+      setError("请输入房间号");
+      return;
+    }
     setError("");
     setJoining(true);
-    props.onJoin(serverUrl(), roomId().trim(), n, token().trim());
+    try {
+      await props.onJoin(endpoint().trim(), roomId().trim(), n, token().trim());
+      // 成功时 App 会切换到通话界面, 本组件卸载
+    } catch (e: any) {
+      setError(e?.message ? String(e.message) : String(e));
+      setJoining(false);
+    }
   };
 
   return (
@@ -50,15 +66,20 @@ export default function JoinScreen(props: JoinScreenProps) {
           {/* Form */}
           <label class="form-control w-full mb-3">
             <div class="label py-1">
-              <span class="label-text text-xs">信令服务器</span>
+              <span class="label-text text-xs">信令分配器地址</span>
             </div>
             <input
               type="text"
               class="input input-bordered input-sm w-full"
-              value={serverUrl()}
-              onInput={(e) => setServerUrl(e.currentTarget.value)}
-              placeholder="ws://host:port"
+              value={endpoint()}
+              onInput={(e) => setEndpoint(e.currentTarget.value)}
+              placeholder="http://host:5190"
             />
+            <div class="label py-1">
+              <span class="label-text-alt text-[10px] text-base-content/50">
+                加入时按房间号向分配器请求信令地址。也可直接填 ws://host:5174 绕过分配器。
+              </span>
+            </div>
           </label>
 
           <label class="form-control w-full mb-3">
@@ -123,7 +144,7 @@ export default function JoinScreen(props: JoinScreenProps) {
           {/* Server info */}
           <div class="mt-6 pt-4 border-t border-base-300 text-center">
             <p class="text-xs text-base-content/50">
-              SFU 媒体端口 <code class="kbd kbd-xs">UDP 5175+</code>　信令端口 <code class="kbd kbd-xs">WS 5174</code>
+              分配器 <code class="kbd kbd-xs">HTTP 5190</code>　信令 <code class="kbd kbd-xs">WS 5174</code>　媒体 <code class="kbd kbd-xs">UDP 5175+</code>
             </p>
           </div>
         </div>

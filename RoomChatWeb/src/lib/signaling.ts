@@ -25,10 +25,17 @@ export class SignalingClient {
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
+      let opened = false;
       this.ws = new WebSocket(this.url);
 
-      this.ws.onopen = () => resolve();
-      this.ws.onerror = () => reject(new Error(`WebSocket 连接失败: ${this.url}`));
+      this.ws.onopen = () => {
+        opened = true;
+        resolve();
+      };
+      this.ws.onerror = () => {
+        // 仅当尚未 open 时用于 reject; 已 open 后的错误交给 onclose 处理。
+        if (!opened) reject(new Error(`WebSocket 连接失败: ${this.url}`));
+      };
 
       this.ws.onmessage = (event) => {
         try {
@@ -41,7 +48,12 @@ export class SignalingClient {
 
       this.ws.onclose = () => {
         this.ws = null;
-        this.onClose?.();
+        // 连接在 open 之前就被关闭: 让 connect() 以错误结束而不是永久挂起。
+        if (!opened) {
+          reject(new Error(`WebSocket 连接被关闭: ${this.url}`));
+        } else {
+          this.onClose?.();
+        }
       };
     });
   }

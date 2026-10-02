@@ -10,6 +10,8 @@ function App() {
   const [localStream, setLocalStream] = createSignal<MediaStream | null>(null);
   const [participants, setParticipants] = createSignal<RemoteParticipant[]>([]);
   const [logs, setLogs] = createSignal<LogEntry[]>([]);
+  // 分配器为本房间分配的"信令节点 · 地址"，用于界面展示
+  const [signalingNode, setSignalingNode] = createSignal("");
 
   let sfu: SfuClient | null = null;
 
@@ -18,7 +20,7 @@ function App() {
     setLogs((prev) => [...prev, { time, msg, level }].slice(-200));
   };
 
-  const handleJoin = async (serverUrl: string, rid: string, name: string, token: string) => {
+  const handleJoin = async (endpoint: string, rid: string, name: string, token: string) => {
     try {
       sfu = new SfuClient({
         onLog: addLog,
@@ -50,18 +52,25 @@ function App() {
         onWelcome: (info) => {
           addLog(`信令协议 v${info.protocol_version} (${info.features.join(", ")})`);
         },
+        onAllocated: (alloc) => {
+          setSignalingNode(`${alloc.nodeId} · ${alloc.wsUrl}`);
+        },
         onConnectionStateChange: (state) => {
           if (state === "connected") addLog("WebRTC 连接已建立", "success");
         },
       });
 
-      await sfu.join(serverUrl, rid, name, token);
+      await sfu.join(endpoint, rid, name, token);
       setRoomId(rid);
       setLocalStream(sfu.getLocalStream());
       setScreen("call");
     } catch (e: any) {
-      addLog(`加入失败: ${e.message || e}`, "error");
+      const msg = e?.message || String(e);
+      addLog(`加入失败: ${msg}`, "error");
+      sfu?.leave();
       sfu = null;
+      // 抛给 JoinScreen 展示在表单下方
+      throw new Error(msg);
     }
   };
 
@@ -71,6 +80,7 @@ function App() {
     setScreen("join");
     setParticipants([]);
     setLocalStream(null);
+    setSignalingNode("");
   };
 
   const handleSubscribe = (publisherId: string) => {
@@ -105,6 +115,7 @@ function App() {
       {screen() === "call" && (
         <CallScreen
           roomId={roomId()}
+          signalingNode={signalingNode()}
           localStream={localStream()}
           participants={participants()}
           logs={logs()}

@@ -5,6 +5,8 @@ import type { LogEntry, RemoteParticipant } from "../lib/types";
 
 interface CallScreenProps {
   roomId: string;
+  /** 分配器返回的"信令节点 · 地址" (空字符串表示未知) */
+  signalingNode?: string;
   localStream: MediaStream | null;
   participants: RemoteParticipant[];
   logs: LogEntry[];
@@ -42,6 +44,14 @@ export default function CallScreen(props: CallScreenProps) {
           <span class="text-base-content/50">房间</span>
           <span class="font-semibold">{props.roomId}</span>
           <span class="badge badge-ghost badge-sm ml-2">{totalCount()} 人</span>
+          <Show when={props.signalingNode}>
+            <span
+              class="badge badge-outline badge-sm ml-1 max-w-[40vw] truncate"
+              title={`信令节点: ${props.signalingNode}`}
+            >
+              信令 {props.signalingNode}
+            </span>
+          </Show>
         </div>
 
         <div class="flex items-center gap-2">

@@ -1,4 +1,5 @@
 import { SignalingClient } from "./signaling";
+import { allocateSignaling, type AllocateResult } from "./dispatcher";
 import type { ServerMessage, LogEntry, RemoteParticipant, ParticipantInfo } from "./types";
 
 /**
@@ -57,14 +58,22 @@ export interface SfuCallbacks {
   onParticipantUpdated?: (id: string, media: { audioEnabled: boolean; videoEnabled: boolean }) => void;
   /** 服务端握手完成 (welcome), 可用于展示协议版本/能力 */
   onWelcome?: (info: { protocol_version: number; server: string; features: string[] }) => void;
+  /** 分配器已返回本房间的信令地址 */
+  onAllocated?: (result: AllocateResult) => void;
 }
 
 export class SfuClient {
   // 身份
   private participantId = "";
   private roomId = "";
+  /** 用户填写的分配器地址 (http(s)://) 或直连信令地址 (ws(s)://) */
+  private endpoint = "";
+  /** 分配器返回的实际信令 WebSocket 地址 */
+  private wsUrl = "";
   /** 用户鉴权 JWT (可选; 服务端启用鉴权时必填) */
   private token = "";
+  /** 是否已主动离开 (用于区分正常关闭与意外断开) */
+  private leaving = false;
 
   // 单条信令连接 (所有 PC 复用)
   private sig: SignalingClient | null = null;
@@ -88,8 +97,10 @@ export class SfuClient {
 
   // ── 发布: 加入房间 ─────────────────────────────────────────
 
-  async join(serverUrl: string, roomId: string, participantId: string, token = ""): Promise<void> {
+  async join(endpoint: string, roomId: string, participantId: string, token = ""): Promise<void> {
+    this.endpoint = endpoint.trim();
     this.roomId = roomId;
+    this.leaving = false;
     // 启用 JWT 鉴权时, participant_id 必须等于 token 的 sub。
     // 若提供了 token, 则以其 sub 为准, 避免与昵称不一致而被拒。
     this.token = token.trim();
@@ -97,7 +108,14 @@ export class SfuClient {
       ? jwtSubject(this.token) ?? participantId
       : participantId;
 
-    // 1. 获取本地媒体
+    // 1. 固定先向分配器请求本房间的信令地址 (同一 room_id → 同一信令机)
+    this.cb.onLog(`正在向分配器请求信令地址 (room=${roomId})...`);
+    const alloc = await allocateSignaling(this.endpoint, roomId);
+    this.wsUrl = alloc.wsUrl;
+    this.cb.onAllocated?.(alloc);
+    this.cb.onLog(`分配信令节点 ${alloc.nodeId}: ${alloc.wsUrl}`, "success");
+
+    // 2. 获取本地媒体
     this.cb.onLog("正在获取摄像头和麦克风...");
     this.localStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
@@ -105,12 +123,13 @@ export class SfuClient {
     });
     this.cb.onLog("本地媒体流已就绪", "success");
 
-    // 2. 连接信令服务器 (整个会话只此一条 WebSocket)
-    this.sig = new SignalingClient(serverUrl, this.token || undefined);
+    // 3. 连接信令服务器 (整个会话只此一条 WebSocket)
+    this.sig = new SignalingClient(alloc.wsUrl, this.token || undefined);
     await this.sig.connect();
     this.sig.onMessage = (msg) => this.onMessage(msg);
     this.sig.onClose = () => {
-      this.cb.onLog("信令连接断开", "warn");
+      if (this.leaving) return;
+      this.cb.onLog("信令连接断开, 请重新加入房间", "warn");
       this.cb.onConnectionStateChange("disconnected");
     };
 
@@ -119,7 +138,7 @@ export class SfuClient {
     // 应用层心跳: 移动端切网 / NAT 空闲超时后保持信令通道活跃
     this.startHeartbeat();
 
-    // 3. 创建发布 PC (sendonly)
+    // 4. 创建发布 PC (sendonly)
     const pc = new RTCPeerConnection({ iceServers: [] });
     for (const track of this.localStream.getTracks()) {
       pc.addTransceiver(track, { direction: "sendonly", streams: [this.localStream] });
@@ -134,12 +153,12 @@ export class SfuClient {
       this.cb.onConnectionStateChange(pc.connectionState);
     };
 
-    // 4. 创建 offer, 等待 ICE 收集完成
+    // 5. 创建 offer, 等待 ICE 收集完成
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     await this.waitIceComplete(pc);
 
-    // 5. 发送 join (发布连接, role=publisher)
+    // 6. 发送 join (发布连接, role=publisher)
     this.sig.send({
       type: "join",
       pc_id: PUB_PC_ID,
@@ -155,6 +174,11 @@ export class SfuClient {
   /** 获取本地媒体流 (用于 UI 显示) */
   getLocalStream(): MediaStream | null {
     return this.localStream;
+  }
+
+  /** 分配器为本房间返回的实际信令地址 (join 成功后可用)。 */
+  get signalingUrl(): string {
+    return this.wsUrl;
   }
 
   // ── 订阅: 接收远端参与者媒体 (复用同一条 WebSocket) ──────────
@@ -238,6 +262,7 @@ export class SfuClient {
   // ── 离开 ──────────────────────────────────────────────────
 
   leave(): void {
+    this.leaving = true;
     this.stopHeartbeat();
     // 通知服务器关闭所有 PC 会话
     if (this.sig?.isConnected) {
