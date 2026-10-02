@@ -249,6 +249,22 @@ RUST_LOG=info \
 ./target/release/sfu-server
 ```
 
+推荐再**同进程内嵌一个信令分配器**，这样客户端可以统一先向分配器请求信令地址
+（单机/多机客户端逻辑一致）：
+
+```bash
+SFU_ANNOUNCE_IP=192.168.1.10 \
+SFU_WORKERS=4 \
+SFU_DISPATCHER_ADDR=0.0.0.0:5190 \
+SFU_DISPATCHER_COHOST=on \
+SFU_SIGNALING_NODES="self@192.168.1.10:5174:5173:5180:5181" \
+RUST_LOG=info \
+./target/release/sfu-server
+```
+
+Web 客户端（`RoomChatWeb`）在「信令分配器地址」填 `http://192.168.1.10:5190`
+即可；也兼容直接填 `ws://192.168.1.10:5174`（直连跳过分配器）。
+
 启动成功日志：
 
 ```
@@ -305,10 +321,12 @@ SFU_ANNOUNCE_IP=192.168.1.10 SFU_WORKERS=4 SFU_ROOM_WORKERS="roomB=0,1,2,3" \
 
 ### 8.1 模型：集中信令 + worker-only 主机
 
-- **信令主机（Host A）**：跑 WebSocket/QUIC/WHIP + 若干本地 worker。
+- **信令主机（Host A）**：跑 WebSocket/QUIC/WHIP；可再跑本地 worker
+  （`SFU_WORKERS≥1`），也可**完全不跑 worker**（`SFU_WORKERS=0` 纯信令节点，
+  此时必须配 `SFU_CONTROL_PEERS` 指向远端 worker）。
 - **worker 主机（Host B…）**：`SFU_SIGNALING=off`，只跑 worker + 控制面 + relay。
-- 客户端只连 Host A 的信令；媒体按分配到的 worker 所在主机直连（ICE 候选里是
-  该主机的 `announce_ip`）。
+- 客户端只连 Host A 的信令（多台信令机时经分配器选择）；媒体按分配到的 worker
+  所在主机直连（ICE 候选里是该主机的 `announce_ip`）。
 
 ### 8.2 worker 全局编号
 
@@ -368,11 +386,18 @@ SFU_RELAY_PEERS=0=10.0.0.1:5390,1=10.0.0.1:5390
 需要一个**信令分配器**把 `room_id` 稳定映射到一台健康信令机 —— 因为房间成员表
 是信令进程的**内存状态**，同一房间必须连到同一台信令机。
 
-分配器与 SFU 是同一个二进制，设了 `SFU_DISPATCHER_ADDR` 即只跑分配器：
+分配器与 SFU 是同一个二进制。设了 `SFU_DISPATCHER_ADDR`：默认**只跑分配器**；
+再加 `SFU_DISPATCHER_COHOST=on` 则**与信令/媒体服务同进程**启动（后台线程）。
 
 ```bash
-# 分配器（可多实例 + VIP，无状态）
+# 独占模式：可多实例 + VIP，无状态
 SFU_DISPATCHER_ADDR=0.0.0.0:5190 \
+SFU_SIGNALING_NODES="cell-a@10.0.0.1:5174:5173:5180:5181;cell-b@10.0.0.2:5174:5173:5180:5181:2" \
+./target/release/sfu-server
+
+# 嵌入模式：在已有信令机/一体化节点上追加（省去独立实例）
+SFU_DISPATCHER_ADDR=0.0.0.0:5190 \
+SFU_DISPATCHER_COHOST=on \
 SFU_SIGNALING_NODES="cell-a@10.0.0.1:5174:5173:5180:5181;cell-b@10.0.0.2:5174:5173:5180:5181:2" \
 ./target/release/sfu-server
 ```

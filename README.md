@@ -992,9 +992,9 @@ cargo build --release
 SFU_ANNOUNCE_IP=203.0.113.10 RUST_LOG=info ./target/release/sfu-server
 # 默认端口: QUIC 信令 udp/5173, WebSocket 信令 tcp/5174, 媒体 udp/5175..
 
-# 环境变量调优
+# 常用环境变量
 SFU_ANNOUNCE_IP=203.0.113.10  # 对外通告 IP — 写入 SDP/ICE host 候选 (必须为客户端可达地址)
-SFU_WORKERS=4                 # 本进程 worker 线程数 (媒体端口数)
+SFU_WORKERS=4                 # 本进程 worker 线程数 (媒体端口数); 0 = 纯信令节点 (不跑 worker)
 SFU_DEFAULT_WORKER=0          # 可选: 强制未配置房间全落该 worker; 不设则按房间哈希
 SFU_ROOM_WORKERS="load=0;roomA=1,2;*=0,1,2,3"
                               # 房间 -> 全局 worker 列表; 缺省按房间哈希固定到单个 worker。
@@ -1006,7 +1006,7 @@ SFU_MEDIA_ADDR=0.0.0.0:5175   # 媒体 UDP 绑定地址 (默认 0.0.0.0:5175)
 SFU_BWE_INITIAL_BPS=1000000   # BWE 初始带宽估计 (bit/s, 默认 1 Mbps)
 SFU_SOCK_BUF_MB=16            # UDP socket 收发缓冲区目标 (MB); 实际值受内核 rmem_max/wmem_max 限制
 
-# JWT 用户鉴权 (可选; 未配置密钥则关闭)
+# JWT 用户鉴权 (可选; 未配置任何密钥则关闭)
 SFU_JWT_SECRET=change-me      # HMAC 对称密钥 (HS256/384/512)
 # SFU_JWT_PUBLIC_KEY_FILE=/etc/sfu/jwt-pub.pem  # 或非对称公钥 (RS/ES/EdDSA)
 # SFU_JWT_ALGORITHM=RS256     # 可选, 缺省按密钥类型推断
@@ -1014,25 +1014,27 @@ SFU_JWT_SECRET=change-me      # HMAC 对称密钥 (HS256/384/512)
 # SFU_JWT_AUDIENCE=webrtc-sfu # 可选, 校验 aud
 # SFU_JWT_REQUIRED=on         # 配置密钥后默认 on; off=有 token 才校验
 
-# 跨主机中继 (单房间跨机扩展)
-SFU_WORKER_OFFSET=0           # 本进程 worker 全局编号起始
-SFU_RELAY_LISTEN=0.0.0.0:5390 # 本进程 relay UDP 监听地址 (启用跨主机中继)
-SFU_RELAY_PEERS=1=10.0.0.2:5390,2=10.0.0.2:5390  # (旧) 远端全局 worker -> 对端 relay 地址
-
-# 信令 / worker 进程分离 (控制面 gRPC, 媒体面 UDP)
+# 信令 / worker 进程分离 + 跨主机 (控制面 gRPC, 媒体面 UDP relay)
+SFU_SIGNALING=on              # worker-only 进程设 off
 SFU_TOTAL_WORKERS=4           # 整集群 worker 总数 (全局编号 0..total)
 SFU_WORKER_OFFSET=0           # 本进程 worker 全局编号起始
-SFU_SIGNALING=on              # worker-only 进程设 off
-SFU_CONTROL_LISTEN=0.0.0.0:5600               # worker 进程: MediaControl gRPC 监听
-SFU_CONTROL_PEERS=2=10.0.0.2:5600,3=10.0.0.2:5600  # 远端全局 worker -> 其 gRPC 地址
+SFU_CONTROL_LISTEN=0.0.0.0:5400                    # worker 进程: MediaControl gRPC 监听
+SFU_CONTROL_PEERS=2=10.0.0.2:5400,3=10.0.0.2:5400  # 信令进程: 远端 worker -> 其 gRPC 地址
+SFU_RELAY_LISTEN=0.0.0.0:5390                      # 本进程 relay UDP 监听 (启用跨主机中继)
+SFU_RELAY_PEERS=2=10.0.0.2:5390,3=10.0.0.2:5390    # 远端 worker -> 对端 relay UDP 地址
 
-# WHIP 推流接入 (FFmpeg/GStreamer/OBS 直推 WebRTC)
+# 信令分配器 (客户端按 room_id 向它请求信令地址 -> 房间亲和)
+SFU_DISPATCHER_ADDR=0.0.0.0:5190
+SFU_DISPATCHER_COHOST=on      # on = 嵌入式(与信令/媒体同进程); 不设 = 独占进程
+SFU_SIGNALING_NODES="self@203.0.113.10:5174:5173:5180:5181"  # id@host:ws:quic:whip:whep[:weight]
+
+# WHIP/WHEP 接入
 SFU_WHIP_ADDR=0.0.0.0:5180    # WHIP HTTP 监听; 不设则不启用
-# WHEP 拉流接入 (浏览器/播放器)
 SFU_WHEP_ADDR=0.0.0.0:5181    # WHEP HTTP 监听; 不设则不启用
-SO_BUSY_POLL=50               # 内核忙轮询微秒数 (0=禁用)
-BATCH_SIZE=64                 # recvmmsg 批量大小
 ```
+
+> `batch_size`(64)、`send_batch_size`(128)、`busy_poll_us`(0) 目前是**编译期常量**，
+> 没有对应环境变量。
 
 > **系统 socket 缓冲区**：内核默认 `rmem_max/wmem_max` 仅 4MB，会把 socket 缓冲
 > 截断到 ~8MB，高 fanout 时造成丢包。建议部署前调大（见 `scripts/sysctl-sfu.sh`）：
