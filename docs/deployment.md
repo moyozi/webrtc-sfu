@@ -18,12 +18,19 @@
 | **一体化单进程** | 默认（什么都不设） | 信令 + N 个 worker，全在一台机器一个进程 | — |
 | **纯信令节点** | `SFU_WORKERS=0` + `SFU_SIGNALING=on` | 维护房间状态、跑 WS/QUIC/WHIP/WHEP | 不跑 worker、不绑定媒体端口 |
 | **纯媒体节点**（worker-only） | `SFU_SIGNALING=off` | 跑 worker、媒体转发、gRPC 控制面、跨主机中继 | 不跑信令、不维护房间状态 |
-| **信令分配器** | `SFU_DISPATCHER_ADDR=...` | 把 `room_id` 稳定映射到一台健康信令机 | 不跑 worker、不跑信令 |
+| **信令分配器（独占）** | `SFU_DISPATCHER_ADDR=...` | 把 `room_id` 稳定映射到一台健康信令机 | 不跑 worker、不跑信令 |
+| **信令分配器（嵌入）** | 上者 + `SFU_DISPATCHER_COHOST=on` | 后台线程跑分配器，**主进程照常**跑信令/媒体 | — |
+
+> 分配器既可以独立部署，也可以**与信令/媒体服务同进程启动**（`SFU_DISPATCHER_COHOST=on`），
+> 适合单机一体化或「信令机自带分配器」拓扑。
 
 角色判定在 `main.rs` 里的顺序是：
 
-1. **先看 `SFU_DISPATCHER_ADDR`**：只要它被设成非空、非 `0`/`off`，本进程就
-   **只当分配器**，其它 `SFU_*` 一律忽略（只有 `RUST_LOG` 生效）。
+1. **先看 `SFU_DISPATCHER_ADDR`**：
+   - 默认（未设 `SFU_DISPATCHER_COHOST`）→ 本进程**只当分配器**，其它
+     `SFU_*` 一律忽略（只有 `RUST_LOG` 生效）；
+   - 设了 `SFU_DISPATCHER_COHOST=on` → 后台线程启动分配器，**继续**按 2 启动
+     信令/媒体服务。
 2. 否则读取其余配置，再看 `SFU_SIGNALING` 与 `SFU_WORKERS`：
    - `SFU_SIGNALING=off` → 纯媒体节点（`SFU_WORKERS` 必须 ≥ 1）；
    - `SFU_SIGNALING=on` 且 `SFU_WORKERS=0` → 纯信令节点；
@@ -220,6 +227,43 @@ cargo run --release --example load_publisher -- \
 
 看到 `已连接` 与收发统计即正常。更多验证命令见 [`manual.md`](manual.md)。
 
+### 2.8 单机 + 内嵌分配器（推荐：客户端始终先请求分配器）
+
+即使只部署一台机器，也推荐把**分配器与 SFU 同进程启动**，这样客户端可以
+**统一先用分配器拿地址**，无需为单机/多机写两套逻辑：
+
+```bash
+SFU_ANNOUNCE_IP=192.168.1.10
+SFU_WORKERS=4
+
+# 内嵌分配器（与上面的信令 + worker 同进程）
+SFU_DISPATCHER_ADDR=0.0.0.0:5190
+SFU_DISPATCHER_COHOST=on
+# 信令机清单：这里只有本机一个节点
+SFU_SIGNALING_NODES="self@192.168.1.10:5174:5173:5180:5181"
+
+RUST_LOG=info
+```
+
+启动后同一个进程监听 5190（分配器）、5174（WS）、5173（QUIC）、5175+（媒体）。
+客户端流程：
+
+```text
+POST http://192.168.1.10:5190/allocate  {"room_id":"demo"}
+  → {"node_id":"self","ws_url":"ws://192.168.1.10:5174"}
+  → 连接 ws_url 并发起 join
+```
+
+Web 客户端（`RoomChatWeb`）已内置这套逻辑：在「信令分配器地址」填
+`http://192.168.1.10:5190` 即可；它也兼容直接填 `ws://192.168.1.10:5174`
+（直连模式，跳过分配器）。
+
+**测试期关闭 JWT 鉴权**：只要**不配置任何密钥**（`SFU_JWT_SECRET` /
+`SFU_JWT_PUBLIC_KEY`），鉴权即整体关闭，客户端无需携带 token。
+
+> 若已配置密钥、只想放宽要求，可设 `SFU_JWT_REQUIRED=off`（有 token 才校验，
+> 无 token 也放行）。
+
 ---
 
 ## 3. 多信令机 + 多媒体节点部署
@@ -413,8 +457,29 @@ SFU_DISPATCHER_ADDR=0.0.0.0:5190
 SFU_SIGNALING_NODES="sig-a@10.0.0.1:5174:5173:0:0;sig-b@10.0.0.2:5174:5173:0:0"
 SFU_DISPATCHER_HEALTH_INTERVAL_SECS=5
 SFU_DISPATCHER_HEALTH_TIMEOUT_MS=1000
+# 也可省去独立实例, 直接嵌到某台信令机上 (见 3.7.1)
+# SFU_DISPATCHER_COHOST=on
 RUST_LOG=info
 ```
+
+#### 3.7.1 嵌入模式（与信令/媒体同进程）
+
+不想单独维护分配器实例时，可以把它嵌到任意一个已部署的 `sfu-server` 进程里：
+
+```bash
+# 在已有的信令机 / 一体化节点上追加:
+SFU_DISPATCHER_ADDR=0.0.0.0:5190
+SFU_DISPATCHER_COHOST=on
+SFU_SIGNALING_NODES="sig-a@10.0.0.1:5174:5173:0:0;sig-b@10.0.0.2:5174:5173:0:0"
+```
+
+- 分配器在其独立线程 + 独立 Tokio runtime 上运行，不干扰媒体路径；
+- 同一进程内的信令节点也会被登记进 `SFU_SIGNALING_NODES` 并参与健康检查；
+- 分配器启动时会做一轮短周期补探（每 500ms，最多 20 次），避免刚起来的
+  本地信令节点在首个探测窗口内被误判为不健康。
+
+> 嵌入模式下，主机宕机会同时失去分配器与它托管的信令节点。对可用性要求高的
+> 生产环境，仍建议分配器独立多实例 + VIP/LB。
 
 `SFU_SIGNALING_NODES` 格式：
 
@@ -530,7 +595,8 @@ WHIP/WHEP 客户端同理：先拿 `whip_url` / `whep_url`，再 POST SDP。
 
 | 变量 | 默认 | 取值 | 说明 | 生效角色 |
 |---|---|---|---|---|
-| `SFU_DISPATCHER_ADDR` | 未设 | 地址 / `0` / `off` / 空 | 设置后本进程**只当分配器**，忽略其它所有 `SFU_*` | 分配器 |
+| `SFU_DISPATCHER_ADDR` | 未设 | 地址 / `0` / `off` / 空 | 设置后本进程当分配器；默认**独占**，设 `SFU_DISPATCHER_COHOST=on` 则与其他服务同进程 | 分配器 |
+| `SFU_DISPATCHER_COHOST` | `off` | `on`/`off`（也认 `0`/`false`/`no`/空为关） | 分配器**嵌入**模式: 后台线程跑分配器，主进程继续启动信令/媒体 | 分配器 |
 | `SFU_SIGNALING` | `on` | `on`/`off`（也认 `0`/`false`/空为关闭） | 是否跑信令服务器；`off` = worker-only | 全部 |
 | `SFU_WORKERS` | `1` | `0` ~ 约 `65535 - 媒体端口` | worker 线程数=媒体端口数；**`0` = 纯信令节点** | 全部 |
 

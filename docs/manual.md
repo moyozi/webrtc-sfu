@@ -169,7 +169,8 @@ sudo firewall-cmd --reload
 | `SFU_SIGNALING` | `on` | 本进程是否跑信令；worker-only 进程设 `off`。 |
 | `SFU_TOTAL_WORKERS` | `=SFU_WORKERS` | 整集群 worker 总数（全局编号 `0..total`）。 |
 | `SFU_WORKER_OFFSET` | `0` | 本进程 worker 的全局编号起始。 |
-| `SFU_DISPATCHER_ADDR` | 未设 | 设了则本进程**只运行信令分配器**（不启动 worker/信令）。 |
+| `SFU_DISPATCHER_ADDR` | 未设 | 设了则本进程运行信令分配器（默认只跑分配器，不启动 worker/信令）。 |
+| `SFU_DISPATCHER_COHOST` | `off` | `on` = 分配器**嵌入**模式：与信令/媒体同进程启动（后台线程）。 |
 | `SFU_SIGNALING_NODES` | 未设 | 分配器的信令机清单 `id@host:ws:quic:whip:whep[:weight];...`。 |
 | `SFU_DISPATCHER_HEALTH_INTERVAL_SECS` | `5` | 分配器健康检查周期（秒）。 |
 | `SFU_DISPATCHER_HEALTH_TIMEOUT_MS` | `1000` | 分配器单次健康探测超时（毫秒）。 |
@@ -392,11 +393,14 @@ npm install
 npm run dev        # 打开 http://localhost:5173
 ```
 
-在界面「服务器地址」填 `ws://<SFU_IP>:5174`，然后：
+在界面「信令分配器地址」填 `http://<SFU_IP>:5190`（也可直接填 `ws://<SFU_IP>:5174`
+跳过分配器），然后：
 1. **发布**：点「加入」→ 授摄像头/麦克风 → 发布。
 2. **订阅**：房间内其他人加入后，在侧栏点订阅。
 
-默认服务器地址在 `RoomChatWeb/src/components/JoinScreen.tsx`，可改为你的 SFU 地址后构建：
+客户端会先按房间号向分配器请求本房间的信令地址，再连接；单机部署可让分配器与
+SFU 同进程启动（`SFU_DISPATCHER_COHOST=on`，见 [`deployment.md`](deployment.md)）。
+默认地址在 `RoomChatWeb/src/components/JoinScreen.tsx`，可改为你的地址后构建：
 
 ```bash
 npm run build      # 产出 RoomChatWeb/dist 静态文件，用 nginx 托管

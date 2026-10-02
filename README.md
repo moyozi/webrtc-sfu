@@ -888,6 +888,8 @@ POST /allocate {"room_id":"demo"}
 ```
 
 按带虚拟节点的一致性哈希把房间稳定映射到健康信令机，节点宕机自动顺延。
+分配器也可用 `SFU_DISPATCHER_COHOST=on` **与信令/媒体服务同进程启动**
+（后台线程），适合单机一体化或信令机自带分配器。
 详见 [`docs/signaling-dispatcher.md`](docs/signaling-dispatcher.md)。
 
 > **完整的两种部署形态（单机单进程 / 多信令机 + 多媒体节点）与所有环境变量的
