@@ -61,7 +61,7 @@
 
 | 项 | 要求 |
 |---|---|
-| 操作系统 | **Linux**（依赖 `recvmmsg` / `sendmmsg` / `epoll` / `sched_setaffinity`） |
+| 操作系统 | **Linux**（依赖 `recvmmsg`/`sendmmsg`/`epoll`/`sched_setaffinity`；io_uring 可选，内核 5.11+） |
 | Rust | 1.75+（edition 2021） |
 | 内存 | 单 worker 约 200MB 起；大规模按订阅数增长 |
 | CPU | 每 worker 独占一核（建议 `SFU_WORKERS ≤ 物理核数`） |
@@ -163,6 +163,7 @@ sudo firewall-cmd --reload
 | `SFU_MEDIA_ADDR` | `0.0.0.0:5175` | 媒体 UDP 绑定基地址。 |
 | `SFU_QUIC_ADDR` | `0.0.0.0:5173` | QUIC 信令地址；设 `0`/`off`/空 则禁用。 |
 | `SFU_BWE_INITIAL_BPS` | `1000000` | 订阅者侧 BWE 初始带宽（bit/s）。 |
+| `SFU_IO_URING` | `auto` | 收包/等待后端：`auto`（支持则用 io_uring）/`on`（强制，不可用则启动失败）/`off`（epoll）。 |
 | `SFU_SOCK_BUF_MB` | `16` | 媒体 socket 收/发缓冲区目标（MB），受内核上限截断。 |
 | `SFU_WHIP_ADDR` | 未设 | WHIP 推流 HTTP 监听；不设则不启用。 |
 | `SFU_WHEP_ADDR` | 未设 | WHEP 拉流 HTTP 监听；不设则不启用。 |

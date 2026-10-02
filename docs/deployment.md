@@ -619,6 +619,7 @@ WHIP/WHEP 客户端同理：先拿 `whip_url` / `whep_url`，再 POST SDP。
 | `SFU_MEDIA_ADDR` | `0.0.0.0:5175` | 媒体 UDP 绑定基地址；**worker i 用 `端口+i`** |
 | `SFU_ANNOUNCE_IP` | 自动探测 | **对外通告 IP**，写入 ICE host 候选。生产务必显式设置；纯信令节点可忽略 |
 | `SFU_SOCK_BUF_MB` | `16` | socket 收发缓冲区目标（MB），受内核 `rmem_max`/`wmem_max` 截断 |
+| `SFU_IO_URING` | `auto` | 收包/等待 I/O 后端：`auto`(支持则用 io_uring, 否则回退 epoll) / `on`(强制, 不可用则拒绝启动) / `off`(始终 epoll+recvmmsg) |
 | `SFU_BWE_INITIAL_BPS` | `1000000` | 订阅者侧 BWE 初始带宽（bit/s），最小 50000 |
 | `SFU_WORKER_OFFSET` | `0` | 本进程 worker 的**全局编号起始** |
 | `SFU_TOTAL_WORKERS` | `max(SFU_WORKERS,1)` | **整集群** worker 总数，全局编号范围 `0..total` |

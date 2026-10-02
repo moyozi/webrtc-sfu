@@ -22,6 +22,7 @@ pub mod timer;
 pub use event_loop::run_worker;
 pub use relay::{dispatch_relay_control, RelayHub, RelayedRtp};
 
+use crate::net::uring::IoUringMode;
 use crossbeam_channel::{Receiver, Sender};
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
@@ -51,6 +52,8 @@ pub struct WorkerConfig {
     pub busy_poll_us: u32,
     /// BWE 初始带宽估计 (bit/s)
     pub bwe_initial_bps: u64,
+    /// 收包/等待 I/O 后端选择 (io_uring / epoll)
+    pub io_uring: IoUringMode,
     /// UDP socket 收发缓冲区目标大小 (字节)
     pub sock_buf_bytes: usize,
     /// 本 worker 在当前进程内的编号 (0-based)

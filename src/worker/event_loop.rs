@@ -20,11 +20,12 @@ use super::timer::TimerWheel;
 use super::{WorkerCommand, WorkerConfig, WorkerReply};
 use crate::net::poll::Poll;
 use crate::net::udp::{RecvBatch, SendBatch, UdpSocket, MTU};
+use crate::net::uring::{IoUringMode, UringDriver};
 use crate::sfu::participant::ParticipantTable;
 use crate::sfu::router::Router;
 use ahash::AHashMap;
 use crossbeam_channel::Receiver;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +37,33 @@ use tracing::{debug, error, info, warn};
 /// 定时器已改为 deadline 驱动, 但仍需周期性醒来处理信令命令
 /// (命令走 crossbeam channel, 无法唤醒 epoll)。该值即信令命令的最坏延迟。
 const MAX_WAIT: Duration = Duration::from_millis(10);
+
+/// Worker 的 I/O 后端: io_uring (支持时) 或 epoll 回退。
+enum IoBackend {
+    Epoll(Poll),
+    /// `Box` 以缩小枚举体积 (UringDriver 较大)。
+    Uring(Box<UringDriver>),
+}
+
+/// 创建 epoll 并注册 socket 与唤醒管道; 失败返回 None。
+fn make_epoll(socket_fd: RawFd, wake_fd: RawFd, cpu_id: usize) -> Option<Poll> {
+    let poll = match Poll::new() {
+        Ok(p) => p,
+        Err(e) => {
+            error!(cpu_id, "创建 epoll 失败: {}", e);
+            return None;
+        }
+    };
+    if let Err(e) = poll.add(socket_fd) {
+        error!(cpu_id, "注册 socket 到 epoll 失败: {}", e);
+        return None;
+    }
+    if let Err(e) = poll.add(wake_fd) {
+        error!(cpu_id, "注册 wake 管道到 epoll 失败: {}", e);
+        return None;
+    }
+    Some(poll)
+}
 
 /// Worker 线程主函数
 pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
@@ -84,28 +112,45 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
         }
     }
 
-    // ── 3. 创建 epoll ──
-    let mut poll = match Poll::new() {
-        Ok(p) => p,
-        Err(e) => {
-            error!(cpu_id, "创建 epoll 失败: {}", e);
-            return;
-        }
-    };
-
-    if let Err(e) = poll.add(socket.raw_fd()) {
-        error!(cpu_id, "注册 socket 到 epoll 失败: {}", e);
-        return;
-    }
-    // 注册中继唤醒管道读端
-    if let Err(e) = poll.add(wake_rx.as_raw_fd()) {
-        error!(cpu_id, "注册 wake 管道到 epoll 失败: {}", e);
-        return;
-    }
-
-    // ── 4. 预分配缓冲区 ──
+    // ── 3. 选择 I/O 后端: io_uring (支持则用) / epoll 回退 ──
     let batch_size = config.batch_size;
     let send_batch_size = config.send_batch_size;
+    let mut backend = match config.io_uring {
+        IoUringMode::Off => {
+            info!(cpu_id, "I/O 后端: epoll + recvmmsg (SFU_IO_URING=off)");
+            match make_epoll(socket.raw_fd(), wake_rx.as_raw_fd(), cpu_id) {
+                Some(p) => IoBackend::Epoll(p),
+                None => return,
+            }
+        }
+        mode => match UringDriver::new(socket.raw_fd(), wake_rx.as_raw_fd(), batch_size) {
+            Some(driver) => {
+                info!(
+                    cpu_id,
+                    "I/O 后端: {} (常驻 RECVMSG 批量收包)",
+                    driver.name()
+                );
+                IoBackend::Uring(Box::new(driver))
+            }
+            None if mode == IoUringMode::On => {
+                error!(
+                    cpu_id,
+                    "SFU_IO_URING=on 但 io_uring 不可用 (需内核 5.11+, 或被 seccomp 禁用)"
+                );
+                return;
+            }
+            None => {
+                info!(cpu_id, "io_uring 不可用, 回退 epoll + recvmmsg");
+                match make_epoll(socket.raw_fd(), wake_rx.as_raw_fd(), cpu_id) {
+                    Some(p) => IoBackend::Epoll(p),
+                    None => return,
+                }
+            }
+        },
+    };
+
+    // ── 4. 预分配缓冲区 ──
+    // recv_batch 仅 epoll 路径使用; io_uring 路径由 UringDriver 自带缓冲。
     let mut recv_batch = RecvBatch::new(batch_size, MTU);
     let mut send_batch = SendBatch::new(send_batch_size);
     // 媒体暂存缓冲区跨包复用，避免每包新建 Vec
@@ -152,45 +197,66 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
             );
         }
 
-        // ═══ Phase 1: 批量收包 (recvmmsg) ═══
+        // ═══ Phase 1: 收包 ═══
         //
-        // 使用 recvmmsg 批量接收 UDP 包，单次系统调用最多收 batch_size 个包。
-        // 如果收满了一批，继续循环收下一批，直到 EAGAIN。
-        // 这是性能的关键路径 — 每次循环零内存分配。
+        // epoll: 非阻塞 recvmmsg 循环读到 EAGAIN;
+        // io_uring: 重新挂载常驻 RECVMSG, 对每个完成事件调用回调。
+        // 两者都零内存分配。
 
-        loop {
-            match recv_batch.recv(socket.raw_fd()) {
-                Ok(0) => break, // EAGAIN — 没有更多数据
-                Ok(n) => {
-                    // 处理收到的 n 个包
-                    for i in 0..n {
-                        let (source, data) = recv_batch.get(i);
-                        process_packet(
-                            source,
-                            data,
-                            now,
-                            local_addr,
-                            self_global,
-                            &relay,
-                            &mut relay_tx,
-                            &mut table,
-                            &mut router,
-                            &mut send_batch,
-                            &mut pending_media,
-                            &mut wheel,
-                            &remote_publishers,
-                        );
+        match &mut backend {
+            IoBackend::Epoll(_) => loop {
+                match recv_batch.recv(socket.raw_fd()) {
+                    Ok(0) => break, // EAGAIN — 没有更多数据
+                    Ok(n) => {
+                        // 处理收到的 n 个包
+                        for i in 0..n {
+                            let (source, data) = recv_batch.get(i);
+                            process_packet(
+                                source,
+                                data,
+                                now,
+                                local_addr,
+                                self_global,
+                                &relay,
+                                &mut relay_tx,
+                                &mut table,
+                                &mut router,
+                                &mut send_batch,
+                                &mut pending_media,
+                                &mut wheel,
+                                &remote_publishers,
+                            );
+                        }
+                        // 如果没收满，说明数据已读完
+                        if n < batch_size {
+                            break;
+                        }
                     }
-                    // 如果没收满，说明数据已读完
-                    if n < batch_size {
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        warn!(cpu_id, "recvmmsg 错误: {}", e);
                         break;
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    warn!(cpu_id, "recvmmsg 错误: {}", e);
-                    break;
-                }
+            },
+            IoBackend::Uring(driver) => {
+                driver.process_ready(|source, data| {
+                    process_packet(
+                        source,
+                        data,
+                        now,
+                        local_addr,
+                        self_global,
+                        &relay,
+                        &mut relay_tx,
+                        &mut table,
+                        &mut router,
+                        &mut send_batch,
+                        &mut pending_media,
+                        &mut wheel,
+                        &remote_publishers,
+                    );
+                });
             }
         }
 
@@ -490,12 +556,20 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
             .unwrap_or(MAX_WAIT)
             .min(MAX_WAIT);
 
-        match poll.wait(Some(wait)) {
-            Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                error!(cpu_id, "epoll_wait 错误: {}", e);
-                std::thread::sleep(Duration::from_millis(1));
+        match &mut backend {
+            IoBackend::Epoll(poll) => match poll.wait(Some(wait)) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    error!(cpu_id, "epoll_wait 错误: {}", e);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            },
+            IoBackend::Uring(driver) => {
+                if let Err(e) = driver.wait(wait) {
+                    error!(cpu_id, "io_uring 等待错误: {}", e);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
         }
     }

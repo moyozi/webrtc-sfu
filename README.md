@@ -156,7 +156,17 @@ enum WorkerReply {
 
 ---
 
-## 3. I/O 模型 — recvmmsg + epoll
+## 3. I/O 模型 — io_uring / recvmmsg + epoll
+
+收包与等待后端在启动时探测选择 (见 `src/net/uring.rs`):
+
+- **io_uring** (内核 5.11+, 默认 `SFU_IO_URING=auto`): 常驻 `IORING_OP_RECVMSG`
+  (每个 worker 挂载 `batch_size` 个), 数据到达即产生完成事件; 等待用
+  `io_uring_enter` 的 `EXT_ARG` 计时超时, 省去每轮 `recvmmsg` 系统调用。
+- **epoll + recvmmsg**: io_uring 不可用 (旧内核 / seccomp 禁用) 或
+  `SFU_IO_URING=off` 时回退。
+
+发送方向统一走 `sendmmsg` (`src/net/udp.rs`)。
 
 ### 3.1 批量收包流程
 
@@ -1006,6 +1016,7 @@ SFU_QUIC_ADDR=0.0.0.0:5173    # QUIC 信令监听地址; 设为 0/off/空 则禁
 SFU_MEDIA_ADDR=0.0.0.0:5175   # 媒体 UDP 绑定地址 (默认 0.0.0.0:5175)
 SFU_BWE_INITIAL_BPS=1000000   # BWE 初始带宽估计 (bit/s, 默认 1 Mbps)
 SFU_SOCK_BUF_MB=16            # UDP socket 收发缓冲区目标 (MB); 实际值受内核 rmem_max/wmem_max 限制
+SFU_IO_URING=auto             # 收包/等待后端: auto(支持则用 io_uring)/on(强制)/off(epoll)
 
 # JWT 用户鉴权 (可选; 未配置任何密钥则关闭)
 SFU_JWT_SECRET=change-me      # HMAC 对称密钥 (HS256/384/512)

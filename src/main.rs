@@ -216,6 +216,7 @@ fn main() {
             send_batch_size: config.send_batch_size,
             busy_poll_us: config.busy_poll_us,
             bwe_initial_bps: config.bwe_initial_bps,
+            io_uring: config.io_uring,
             sock_buf_bytes: config.sock_buf_bytes,
             self_idx: cpu_id,
             relay: relay_hub.clone(),

@@ -17,6 +17,9 @@ str0m = "0.23.1"
 nix = { version = "0.31.3", features = ["net", "socket", "uio", "event", "fs", "process", "signal", "sched"] }
 libc = "0.2.189"
 
+# io_uring 批量收包 (Linux 5.11+; 探测失败自动回退 epoll+recvmmsg)
+io-uring = "0.7.9"
+
 # Lock-free cross-thread channels (signaling → media workers)
 crossbeam-channel = "0.5.17"
 

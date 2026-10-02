@@ -1,5 +1,6 @@
 //! SFU 配置定义
 
+use crate::net::uring::IoUringMode;
 use crate::signaling::auth::JwtSettings;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -27,6 +28,8 @@ pub struct SfuConfig {
     pub busy_poll_us: u32,
     /// BWE 初始带宽估计 (bit/s)。订阅者侧用于启动带宽估计。
     pub bwe_initial_bps: u64,
+    /// 收包/等待 I/O 后端: io_uring (支持则用) / epoll 回退。
+    pub io_uring: IoUringMode,
     /// UDP socket 收发缓冲区目标大小 (字节)。实际值受内核 rmem_max/wmem_max 限制。
     pub sock_buf_bytes: usize,
     /// 本进程 worker 的全局编号起始 (跨主机唯一)
@@ -242,6 +245,7 @@ impl SfuConfig {
             send_batch_size: 128,
             busy_poll_us: 0,
             bwe_initial_bps,
+            io_uring: IoUringMode::from_env(),
             sock_buf_bytes,
             worker_offset,
             relay_listen,
