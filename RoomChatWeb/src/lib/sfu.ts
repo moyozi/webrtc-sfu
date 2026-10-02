@@ -20,7 +20,7 @@ import type { ServerMessage, LogEntry, RemoteParticipant, ParticipantInfo, Track
 const PUB_PC_ID = "pub";
 
 /** 与 Rust 端 `PROTOCOL_VERSION` 保持一致 */
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 
 /** 应用层心跳间隔 (毫秒) */
 const HEARTBEAT_MS = 20_000;
@@ -219,13 +219,11 @@ export class SfuClient {
       return;
     }
 
-    // 该发布者发布的轨道列表 (来自服务端广播); 缺省回退到旧的 音频+视频 约定。
-    let list = tracks ?? this.tracksById.get(publisherId) ?? [];
+    // 该发布者发布的轨道列表 (来自服务端广播)。
+    const list = tracks ?? this.tracksById.get(publisherId) ?? [];
     if (list.length === 0) {
-      list = [
-        { mid: "0", kind: "audio" },
-        { mid: "1", kind: "video" },
-      ];
+      this.cb.onLog(`无可订阅轨道: ${publisherId}, 跳过`, "warn");
+      return;
     }
 
     this.cb.onLog(
@@ -563,11 +561,6 @@ export class SfuClient {
                 });
               }
               this.cb.onLog(`订阅 ${publisherId} SDP 完成, 已发送 ${trackSubs.length} 条 subscribe`, "success");
-            } else if (role === "subscriber" && publisherId) {
-              // 回退: 旧的 0/1 约定
-              this.sig?.send({ type: "subscribe", pc_id: msg.pc_id, publisher_id: publisherId, track_mid: "0" });
-              this.sig?.send({ type: "subscribe", pc_id: msg.pc_id, publisher_id: publisherId, track_mid: "1" });
-              this.cb.onLog(`订阅 ${publisherId} SDP 完成, 已发送 subscribe`, "success");
             } else {
               this.cb.onLog("SDP 协商完成, 已添加服务器候选", "success");
             }
@@ -794,7 +787,6 @@ export class SfuClient {
       pc_id: pcId,
       candidate: cand.candidate,
       sdp_mid: cand.sdpMid,
-      sdp_mline_index: cand.sdpMLineIndex,
     });
   }
 

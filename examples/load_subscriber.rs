@@ -296,7 +296,6 @@ async fn subscriber(
                 "pc_id": "sub",
                 "candidate": local_candidate.to_sdp_string(),
                 "sdp_mid": "0",
-                "sdp_mline_index": 0,
             })
             .to_string(),
         ))

@@ -501,14 +501,6 @@ impl SignalingSession {
                         participants: roster.clone(),
                     });
 
-                    // 兼容旧客户端: 逐个推送既有成员 (含各自轨道列表)
-                    for p in &roster {
-                        self.send(SignalingResponse::ParticipantJoined {
-                            participant_id: p.participant_id.clone(),
-                            tracks: p.tracks.clone(),
-                        });
-                    }
-
                     // 通知房间内其他参与者有新人加入 (含其轨道列表)
                     let notify = serde_json::to_string(&SignalingResponse::ParticipantJoined {
                         participant_id: participant_id.clone(),

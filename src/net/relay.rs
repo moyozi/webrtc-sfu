@@ -50,7 +50,7 @@ pub enum DecodedControl {
         publisher_mid: Mid,
         subscriber_worker: usize,
         subscriber_id: String,
-        subscriber_mid: Option<Mid>,
+        subscriber_mid: Mid,
     },
     Unregister {
         target_worker: u32,
@@ -222,7 +222,7 @@ pub fn encode_register(
     publisher_mid: Mid,
     subscriber_worker: usize,
     subscriber_id: &str,
-    subscriber_mid: Option<Mid>,
+    subscriber_mid: Mid,
 ) -> Vec<u8> {
     let mut w = Writer::new();
     w.u8(MSG_REGISTER);
@@ -231,10 +231,7 @@ pub fn encode_register(
     w.mid(publisher_mid);
     w.u32(subscriber_worker as u32);
     w.str(subscriber_id);
-    w.u8(subscriber_mid.is_some() as u8);
-    if let Some(m) = subscriber_mid {
-        w.mid(m);
-    }
+    w.mid(subscriber_mid);
     w.buf
 }
 
@@ -389,8 +386,7 @@ pub fn decode(buf: &[u8], cache: &mut ParamsCache) -> io::Result<Decoded> {
             let publisher_mid = r.mid()?;
             let subscriber_worker = r.u32()? as usize;
             let subscriber_id = r.string()?;
-            let has_mid = r.u8()? != 0;
-            let subscriber_mid = if has_mid { Some(r.mid()?) } else { None };
+            let subscriber_mid = r.mid()?;
             Ok(Decoded::Control(DecodedControl::Register {
                 target_worker,
                 publisher_id,
@@ -524,7 +520,7 @@ mod tests {
 
     #[test]
     fn control_roundtrip() {
-        let b = encode_register(7, "p", Mid::from("0"), 2, "sub-1", Some(Mid::from("s")));
+        let b = encode_register(7, "p", Mid::from("0"), 2, "sub-1", Mid::from("s"));
         match decode(&b, &mut ParamsCache::default()).unwrap() {
             Decoded::Control(DecodedControl::Register {
                 target_worker,
@@ -538,7 +534,7 @@ mod tests {
                 assert_eq!(publisher_id, "p");
                 assert_eq!(subscriber_worker, 2);
                 assert_eq!(subscriber_id, "sub-1");
-                assert_eq!(subscriber_mid, Some(Mid::from("s")));
+                assert_eq!(subscriber_mid, Mid::from("s"));
             }
             _ => panic!("expected Register"),
         }

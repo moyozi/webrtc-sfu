@@ -103,7 +103,7 @@ message Subscribe {
   string subscriber_id = 2;
   string publisher_id = 3;
   string publisher_mid = 4;
-  optional string subscriber_mid = 5;
+  string subscriber_mid = 5;
   uint32 publisher_worker = 6;
 }
 
@@ -119,7 +119,7 @@ message RegisterRelaySubscriber {
   string publisher_mid = 2;
   uint32 subscriber_worker = 3;
   string subscriber_id = 4;
-  optional string subscriber_mid = 5;
+  string subscriber_mid = 5;
 }
 
 message UnregisterRelaySubscriber {

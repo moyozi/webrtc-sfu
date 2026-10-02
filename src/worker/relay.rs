@@ -48,7 +48,7 @@ pub enum RelayControl {
         publisher_mid: Mid,
         subscriber_worker: usize,
         subscriber_id: String,
-        subscriber_mid: Option<Mid>,
+        subscriber_mid: Mid,
     },
     Unregister {
         publisher_id: String,
@@ -141,7 +141,7 @@ impl RelayHub {
                     publisher_mid: publisher_mid.to_string(),
                     subscriber_worker,
                     subscriber_id,
-                    subscriber_mid: subscriber_mid.map(|m| m.to_string()),
+                    subscriber_mid: subscriber_mid.to_string(),
                 },
                 RelayControl::Unregister {
                     publisher_id,
@@ -239,7 +239,7 @@ pub fn dispatch_relay_control(hub: &RelayHub, decoded: relay::DecodedControl) {
                 publisher_mid: publisher_mid.to_string(),
                 subscriber_worker,
                 subscriber_id,
-                subscriber_mid: subscriber_mid.map(|m| m.to_string()),
+                subscriber_mid: subscriber_mid.to_string(),
             },
         ),
         relay::DecodedControl::Unregister {

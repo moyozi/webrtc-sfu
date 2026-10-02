@@ -12,7 +12,8 @@
 //!     │── join (SDP offer) ──────────────────►│
 //!     │◄────────────── sdp_answer ────────────│
 //!     │◄────────────── joined (房间快照) ──────│
-//!     │◄────────────── participant_joined* ───│  (房间内既有成员, 兼容旧客户端)
+//!     │◄─ participant_joined (他人加入时广播) ─│
+//!     │◄─ participant_tracks (他人轨道变化) ──│
 //!     │── ice_candidate ─────────────────────►│
 //!     │── subscribe / unsubscribe ───────────►│
 //!     │◄────────────── subscribed/unsubscribed│
@@ -25,18 +26,14 @@
 //!     │── leave ─────────────────────────────►│
 //!     │◄────────────── left ──────────────────│
 //! ```
-//!
-//! ## 兼容性
-//!
-//! 协议为**纯增量演进**: 旧客户端只识别 `sdp_answer` / `participant_joined` /
-//! `participant_left` / `subscribed` / `error`, 新增消息 (joined/welcome/pong/...)
-//! 会被它们安全忽略 (JSON 反序列化按 `type` 匹配)。新客户端应优先使用
-//! `joined.participants` 作为初始成员快照, 并对 `participant_joined` 去重。
 
 use serde::{Deserialize, Serialize};
 
-/// 当前协议版本。新增不兼容字段时递增。
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 当前协议版本。
+///
+/// v2: `subscribe` 必须携带 `subscriber_mid`; 移除旧客户端的 "0"/"1" 约定
+/// 与逐条 `participant_joined` 快照推送。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 服务端标识 (写入 `welcome`)。
 pub const SERVER_NAME: &str = concat!("webrtc-sfu/", env!("CARGO_PKG_VERSION"));
@@ -152,10 +149,6 @@ pub enum SignalingMessage {
         pc_id: String,
         candidate: String,
         sdp_mid: Option<String>,
-        /// 兼容浏览器 RTCPeerConnection.onicecandidate 的字段, 当前服务端忽略。
-        #[serde(default)]
-        #[allow(dead_code)]
-        sdp_mline_index: Option<u32>,
     },
 
     #[serde(rename = "subscribe")]
@@ -163,12 +156,11 @@ pub enum SignalingMessage {
         pc_id: String,
         publisher_id: String,
         track_mid: String,
-        /// 订阅者自身对应的 mid (可选)。
+        /// 订阅者自身对应的 mid (必填)。
         ///
-        /// 发布者与订阅者的 SDP mid 未必相同 (str0m 会随机分配 mid)。
-        /// 缺省时退化为与 `track_mid` 相同, 兼容浏览器 "0"/"1" 约定。
-        #[serde(default)]
-        subscriber_mid: Option<String>,
+        /// 发布者与订阅者的 SDP mid 未必相同 (str0m 会随机分配 mid),
+        /// 订阅方必须显式给出自己接收该轨道的 mid。
+        subscriber_mid: String,
     },
 
     #[serde(rename = "unsubscribe")]
@@ -310,9 +302,8 @@ mod tests {
         let ping: SignalingMessage = serde_json::from_str(r#"{"type":"ping","t":42}"#).unwrap();
         assert!(matches!(ping, SignalingMessage::Ping { t: Some(42) }));
 
-        // 兼容浏览器 ice_candidate 的额外字段
         let ice: SignalingMessage = serde_json::from_str(
-            r#"{"type":"ice_candidate","pc_id":"pub","candidate":"c","sdp_mid":"0","sdp_mline_index":0}"#,
+            r#"{"type":"ice_candidate","pc_id":"pub","candidate":"c","sdp_mid":"0"}"#,
         )
         .unwrap();
         assert!(matches!(ice, SignalingMessage::IceCandidate { .. }));

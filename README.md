@@ -640,8 +640,8 @@ Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉�
 | `ping` | `t?` | 应用层心跳 → `pong`（带 `t`） |
 | `join` | `pc_id`, `room_id`, `participant_id`, `sdp`, `role?`, `token?` | 创建发布/订阅 PC |
 | `renegotiate` | `pc_id`, `sdp`, `token?` | 对已存在 PC 重新协商 (ICE restart) → `sdp_answer` |
-| `ice_candidate` | `pc_id`, `candidate`, `sdp_mid?`, `sdp_mline_index?` | Trickle ICE |
-| `subscribe` | `pc_id`, `publisher_id`, `track_mid`, `subscriber_mid?` | 订阅轨道 |
+| `ice_candidate` | `pc_id`, `candidate`, `sdp_mid?` | Trickle ICE |
+| `subscribe` | `pc_id`, `publisher_id`, `track_mid`, `subscriber_mid` | 订阅一条轨道（必须给出订阅者自身 mid） |
 | `unsubscribe` | `pc_id`, `publisher_id`, `track_mid` | 取消订阅 |
 | `update_media` | `pc_id`, `audio_enabled?`, `video_enabled?` | 静音/关摄像头，广播给房间 |
 | `get_room_state` | `room_id?` | 请求成员快照（重连/刷新） |
@@ -656,7 +656,7 @@ Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉�
 | `sdp_answer` | SDP answer + 内联 ICE 候选 |
 | `joined` | `join` 成功确认，携带成员快照 `participants`（每项含 `tracks: [{mid,kind}]` 轨道列表） |
 | `left` | `leave` 成功确认 |
-| `participant_joined` | 成员加入广播，含其 `tracks`（兼容旧客户端，新客户端对 `joined.participants` 去重） |
+| `participant_joined` | 成员加入广播，含其 `tracks` |
 | `participant_left` | 成员离开广播 |
 | `participant_tracks` | 某成员发布的轨道列表变化（如开始/停止屏幕共享），订阅者据此调整订阅 |
 | `participant_updated` | 成员媒体状态变化（静音/关摄像头） |
@@ -723,8 +723,7 @@ Worker 交互行为完全一致，不会出现 QUIC 与 WebSocket 语义分叉�
   "type": "ice_candidate",
   "pc_id": "sub-bob-uuid",
   "candidate": "candidate:842163049 1 udp 1677729535 ...",
-  "sdp_mid": "0",
-  "sdp_mline_index": 0
+  "sdp_mid": "0"
 }
 
 // 客户端 → 服务器: 订阅轨道 / 取消订阅

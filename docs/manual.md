@@ -532,8 +532,8 @@ WebSocket 与 QUIC 承载**完全相同**的 JSON 消息。一条连接可承载
 | `ping` | `t?` | 应用层心跳；服务端回 `pong` |
 | `join` | `pc_id`, `room_id`, `participant_id`, `sdp`, `role?`, `token?` | 建立发布/订阅连接。`role`=`publisher`(默认)/`subscriber` |
 | `renegotiate` | `pc_id`, `sdp`, `token?` | 对已存在 PC 重新协商（典型为 **ICE restart**）→ 服务端回 `sdp_answer` |
-| `ice_candidate` | `pc_id`, `candidate`, `sdp_mid?`, `sdp_mline_index?` | trickle ICE |
-| `subscribe` | `pc_id`, `publisher_id`, `track_mid`, `subscriber_mid?` | 订阅某发布者轨道 |
+| `ice_candidate` | `pc_id`, `candidate`, `sdp_mid?` | trickle ICE |
+| `subscribe` | `pc_id`, `publisher_id`, `track_mid`, `subscriber_mid` | 订阅某发布者轨道（必须给出订阅者自身 mid） |
 | `unsubscribe` | `pc_id`, `publisher_id`, `track_mid` | 取消订阅 |
 | `update_media` | `pc_id`, `audio_enabled?`, `video_enabled?` | 静音/关摄像头，广播给房间内其他人 |
 | `get_room_state` | `room_id?` | 请求房间成员快照（重连/刷新） |

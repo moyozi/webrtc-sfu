@@ -110,8 +110,8 @@ pub enum WorkerCommand {
         subscriber_id: String,
         publisher_id: String,
         publisher_mid: String,
-        /// 订阅者自身该轨道的 mid (None = 与 publisher_mid 相同)
-        subscriber_mid: Option<String>,
+        /// 订阅者自身该轨道的 mid (必填)
+        subscriber_mid: String,
         /// 发布者所在 worker (用于判断是否需要跨 worker 中继)
         publisher_worker: usize,
     },
@@ -131,7 +131,7 @@ pub enum WorkerCommand {
         /// 订阅者所在 worker
         subscriber_worker: usize,
         subscriber_id: String,
-        subscriber_mid: Option<String>,
+        subscriber_mid: String,
     },
 
     /// 注销发布者 worker 上的远端订阅者

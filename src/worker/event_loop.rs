@@ -394,7 +394,7 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                         &subscriber_id,
                         &publisher_id,
                         &publisher_mid,
-                        subscriber_mid.as_deref(),
+                        &subscriber_mid,
                         self_global as usize,
                     );
 
@@ -423,7 +423,7 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                                 publisher_mid: Mid::from(publisher_mid.as_str()),
                                 subscriber_worker: self_global as usize,
                                 subscriber_id: subscriber_id.clone(),
-                                subscriber_mid: subscriber_mid.as_deref().map(Mid::from),
+                                subscriber_mid: Mid::from(subscriber_mid.as_str()),
                             },
                         );
                     }
@@ -475,7 +475,7 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
                         &subscriber_id,
                         &publisher_id,
                         &publisher_mid,
-                        subscriber_mid.as_deref(),
+                        &subscriber_mid,
                         subscriber_worker,
                     );
                     // 新订阅者接入: 让该目标的参数补发节流重置，下一个包立即带参数。

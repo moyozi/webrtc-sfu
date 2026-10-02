@@ -66,12 +66,12 @@ impl Router {
         subscriber_id: &str,
         publisher_id: &str,
         publisher_mid: &str,
-        subscriber_mid: Option<&str>,
+        subscriber_mid: &str,
         worker_idx: usize,
     ) {
         let publisher_key = Mid::from(publisher_mid);
-        // 订阅者自身该轨道的 mid；缺省退化为发布者 mid，兼容浏览器 "0"/"1" 约定。
-        let subscriber_mid = subscriber_mid.map(Mid::from).unwrap_or(publisher_key);
+        // 订阅者自身该轨道的 mid (必填; 与发布者 mid 可不同)。
+        let subscriber_mid = Mid::from(subscriber_mid);
 
         let subs = self
             .subscriptions
@@ -217,11 +217,11 @@ mod tests {
         let mut router = Router::new();
 
         // 发布者尚未注册时先订阅
-        router.add_subscription("sub-1", "pub-1", "0", None, 0);
+        router.add_subscription("sub-1", "pub-1", "0", "0", 0);
         assert_eq!(router.subscribers("pub-1", Mid::from("0")).len(), 1);
 
         // 重复订阅应去重
-        router.add_subscription("sub-1", "pub-1", "0", None, 0);
+        router.add_subscription("sub-1", "pub-1", "0", "0", 0);
         assert_eq!(router.subscribers("pub-1", Mid::from("0")).len(), 1);
     }
 
@@ -229,8 +229,8 @@ mod tests {
     #[test]
     fn remove_participant_cleans_subscriptions() {
         let mut router = Router::new();
-        router.add_subscription("sub-1", "pub-1", "0", None, 0);
-        router.add_subscription("sub-2", "pub-1", "0", None, 0);
+        router.add_subscription("sub-1", "pub-1", "0", "0", 0);
+        router.add_subscription("sub-2", "pub-1", "0", "0", 0);
         router.remove_participant("sub-1");
         let subs = router.subscribers("pub-1", Mid::from("0"));
         assert_eq!(subs.len(), 1);
@@ -241,31 +241,25 @@ mod tests {
         assert_eq!(router.subscribers("pub-1", Mid::from("0")).len(), 0);
     }
 
-    /// 订阅者自身 mid 与发布者不同时应被原样保存 (不再假定两者相同)。
+    /// 订阅者自身 mid 与发布者不同时应被原样保存。
     #[test]
     fn subscriber_mid_is_stored_independently() {
         let mut router = Router::new();
-
-        // 未提供 subscriber_mid 时退化为发布者 mid
-        router.add_subscription("sub-legacy", "pub-1", "pubA", None, 0);
-        // 显式提供不同的 subscriber_mid
-        router.add_subscription("sub-1", "pub-1", "pubA", Some("subA"), 0);
+        router.add_subscription("sub-1", "pub-1", "pubA", "subA", 0);
+        router.add_subscription("sub-2", "pub-1", "pubA", "subB", 0);
         let subs = router.subscribers("pub-1", Mid::from("pubA"));
         assert_eq!(subs.len(), 2);
-        let legacy = subs
-            .iter()
-            .find(|s| s.subscriber_id == "sub-legacy")
-            .unwrap();
-        assert_eq!(legacy.subscriber_mid, Mid::from("pubA"));
-        let explicit = subs.iter().find(|s| s.subscriber_id == "sub-1").unwrap();
-        assert_eq!(explicit.subscriber_mid, Mid::from("subA"));
+        let a = subs.iter().find(|s| s.subscriber_id == "sub-1").unwrap();
+        assert_eq!(a.subscriber_mid, Mid::from("subA"));
+        let b = subs.iter().find(|s| s.subscriber_id == "sub-2").unwrap();
+        assert_eq!(b.subscriber_mid, Mid::from("subB"));
     }
 
     /// PLI/FIR 反向映射: 由订阅者自己的 mid 找到发布轨道。
     #[test]
     fn reverse_lookup_publisher_by_subscriber_mid() {
         let mut router = Router::new();
-        router.add_subscription("sub-1", "pub-1", "p0", Some("s0"), 0);
+        router.add_subscription("sub-1", "pub-1", "p0", "s0", 0);
         let targets = router.publisher_for_subscriber_mid("sub-1", Mid::from("s0"));
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].0, "pub-1");

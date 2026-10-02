@@ -212,7 +212,7 @@ async fn handle(
                                 subscriber_id: id.clone(),
                                 publisher_id: publisher.clone(),
                                 publisher_mid: publisher_mid.clone(),
-                                subscriber_mid: Some(subscriber_mid.clone()),
+                                subscriber_mid: subscriber_mid.clone(),
                                 publisher_worker,
                             },
                         );

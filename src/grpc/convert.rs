@@ -147,7 +147,7 @@ mod tests {
             publisher_mid: "1".into(),
             subscriber_worker: 3,
             subscriber_id: "alice-recv-bob".into(),
-            subscriber_mid: Some("0".into()),
+            subscriber_mid: "0".into(),
         };
         let proto = command_to_proto(cmd).unwrap();
         let back = proto_to_command(proto).unwrap();
@@ -160,7 +160,7 @@ mod tests {
             } => {
                 assert_eq!(subscriber_worker, 3);
                 assert_eq!(subscriber_id, "alice-recv-bob");
-                assert_eq!(subscriber_mid.as_deref(), Some("0"));
+                assert_eq!(subscriber_mid, "0");
             }
             _ => panic!("unexpected variant"),
         }
