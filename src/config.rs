@@ -63,10 +63,11 @@ impl SfuConfig {
         // 同一房间固定到同一 worker, 所有媒体转发在 worker 内部完成。
         // 需保证防火墙放行 [base_port, base_port + num_workers - 1] 的 UDP 端口。
         // 默认单 worker; 通过环境变量 SFU_WORKERS 开启更多 worker。
+        // SFU_WORKERS=0 为特殊值: 纯信令节点, 本进程不跑任何 worker,
+        // 媒体全部在远端媒体机 (需配合 SFU_TOTAL_WORKERS / SFU_CONTROL_PEERS)。
         let num_workers = std::env::var("SFU_WORKERS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n > 0)
             .unwrap_or(1);
 
         // 监听地址一律绑定 0.0.0.0 (所有网卡), 由防火墙控制暴露面。
@@ -91,11 +92,13 @@ impl SfuConfig {
         // 对外通告 IP — 专门配置, 与监听地址解耦。
         // 优先 SFU_ANNOUNCE_IP; 未配置时尝试自动探测本机非环回 IP,
         // 探测失败则回退 127.0.0.1 (仅本机可用, 会打印告警)。
+        // 纯信令节点 (num_workers=0) 不产生 ICE 候选, 此处静默占位、不告警。
         let announce_ip = match std::env::var("SFU_ANNOUNCE_IP")
             .ok()
             .and_then(|v| v.parse::<IpAddr>().ok())
         {
             Some(ip) => ip,
+            None if num_workers == 0 => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             None => match detect_local_ip() {
                 Some(ip) => {
                     warn!(
@@ -151,11 +154,13 @@ impl SfuConfig {
         }
 
         // 集群控制面 + 全局 worker 分配
+        // 纯信令节点 (num_workers=0) 必须显式配置 SFU_TOTAL_WORKERS; 未配置时
+        // 至少回退为 1, 避免出现 0 个 worker 的非法拓扑。
         let total_workers = std::env::var("SFU_TOTAL_WORKERS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v >= num_workers as u32)
-            .unwrap_or(num_workers as u32);
+            .unwrap_or_else(|| (num_workers as u32).max(1));
 
         // 房间级 worker 配置 (可选):
         //   SFU_ROOM_WORKERS="roomA=0;roomB=1,2,3;*=0,1,2,3"

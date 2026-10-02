@@ -72,6 +72,20 @@ fn main() {
         );
     }
 
+    // 纯信令节点 (SFU_WORKERS=0): 不跑任何 worker, 媒体全部在远端媒体机。
+    // 需要保证命令能路由到远端 worker, 否则启动即失败而不是静默丢弃。
+    if !config.signaling && num_workers == 0 {
+        error!("SFU_SIGNALING=off 且 SFU_WORKERS=0: 本进程既无信令也无 worker, 拒绝启动");
+        std::process::exit(2);
+    }
+    if config.signaling && num_workers == 0 && config.control_peers.is_empty() {
+        error!(
+            "纯信令节点 (SFU_WORKERS=0) 必须配置 SFU_CONTROL_PEERS 指向远端 worker, \
+             否则房间命令无处下发"
+        );
+        std::process::exit(2);
+    }
+
     // ── 1. 创建 Worker 线程 ──
     //
     // 跨 worker 中继平面: 每个 worker 一对 UnixStream (唤醒管道) +
@@ -104,19 +118,23 @@ fn main() {
         wake_txs.push(Arc::new(tx));
     }
 
-    // 跨主机 relay UDP 端点 (可选)
-    let relay_endpoint = match config.relay_listen {
-        Some(addr) => match net::relay::RelayEndpoint::bind(addr) {
-            Ok(ep) => {
-                info!("跨主机 relay 监听 {}", addr);
-                Some(Arc::new(ep))
-            }
-            Err(e) => {
-                warn!("绑定 relay 地址 {} 失败, 跨主机中继禁用: {}", addr, e);
-                None
-            }
-        },
-        None => None,
+    // 跨主机 relay UDP 端点 (可选)。纯信令节点没有本地 worker, 不监听 relay。
+    let relay_endpoint = if num_workers == 0 {
+        None
+    } else {
+        match config.relay_listen {
+            Some(addr) => match net::relay::RelayEndpoint::bind(addr) {
+                Ok(ep) => {
+                    info!("跨主机 relay 监听 {}", addr);
+                    Some(Arc::new(ep))
+                }
+                Err(e) => {
+                    warn!("绑定 relay 地址 {} 失败, 跨主机中继禁用: {}", addr, e);
+                    None
+                }
+            },
+            None => None,
+        }
     };
 
     let relay_hub = Arc::new(worker::RelayHub {
@@ -201,14 +219,18 @@ fn main() {
         worker_handles.push(handle);
     }
 
-    info!(
-        "已启动 {} 个 worker 线程, 监听 {} (媒体端口范围 {}..{}), 对外通告 IP {}",
-        num_workers,
-        listen_addr,
-        listen_addr.port(),
-        listen_addr.port() + (num_workers as u16).saturating_sub(1),
-        announce_ip
-    );
+    if num_workers == 0 {
+        info!("本进程为纯信令节点 (SFU_WORKERS=0), 不启动任何 worker 线程");
+    } else {
+        info!(
+            "已启动 {} 个 worker 线程, 监听 {} (媒体端口范围 {}..{}), 对外通告 IP {}",
+            num_workers,
+            listen_addr,
+            listen_addr.port(),
+            listen_addr.port() + (num_workers as u16).saturating_sub(1),
+            announce_ip
+        );
+    }
 
     // ── 控制面: 信令 → 本地/远端 worker (远端经 gRPC MediaControl) ──
     let grpc_control = if config.control_peers.is_empty() {
