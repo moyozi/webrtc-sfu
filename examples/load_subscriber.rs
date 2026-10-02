@@ -73,6 +73,8 @@ struct Config {
     count: usize,
     duration: Duration,
     advertise_ip: IpAddr,
+    /// participant_id 前缀 (多进程压测时避免进程间 ID 冲突)。
+    id_prefix: String,
     publishers: Vec<PublisherTracks>,
 }
 
@@ -84,6 +86,7 @@ impl Config {
             count: 10,
             duration: Duration::from_secs(20),
             advertise_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            id_prefix: String::new(),
             publishers: Vec::new(),
         };
 
@@ -101,6 +104,15 @@ impl Config {
                     if let Ok(ip) = val().parse() {
                         cfg.advertise_ip = ip;
                     }
+                }
+                "--id-prefix" => {
+                    let p = val();
+                    // 加分隔符避免与自动编号粘连 (如 "a" + "sub-0" → "a-sub-0")。
+                    cfg.id_prefix = if p.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}-sub", p.trim_end_matches('-'))
+                    };
                 }
                 "--publisher" => {
                     let spec = val();
@@ -208,7 +220,11 @@ async fn subscriber(
     cfg: Arc<Config>,
     stats: Arc<Stats>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let participant_id = format!("sub-{}", idx);
+    let participant_id = if cfg.id_prefix.is_empty() {
+        format!("sub-{}", idx)
+    } else {
+        format!("{}-{}", cfg.id_prefix, idx)
+    };
 
     // ── 1. 独立 UDP socket ──
     let udp = UdpSocket::bind("0.0.0.0:0").await?;

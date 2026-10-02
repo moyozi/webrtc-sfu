@@ -115,6 +115,7 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
     // ── 3. 选择 I/O 后端: io_uring (支持则用) / epoll 回退 ──
     let batch_size = config.batch_size;
     let send_batch_size = config.send_batch_size;
+    let send_backlog = config.send_backlog;
     let mut backend = match config.io_uring {
         IoUringMode::Off => {
             info!(cpu_id, "I/O 后端: epoll + recvmmsg (SFU_IO_URING=off)");
@@ -152,7 +153,7 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
     // ── 4. 预分配缓冲区 ──
     // recv_batch 仅 epoll 路径使用; io_uring 路径由 UringDriver 自带缓冲。
     let mut recv_batch = RecvBatch::new(batch_size, MTU);
-    let mut send_batch = SendBatch::new(send_batch_size);
+    let mut send_batch = SendBatch::new(send_batch_size, send_backlog);
     // 媒体暂存缓冲区跨包复用，避免每包新建 Vec
     let mut pending_media: Vec<PendingRtp> = Vec::with_capacity(64);
     // 跨 worker 中继发送侧状态 (目标 worker 去重列表 + 参数补发节流)

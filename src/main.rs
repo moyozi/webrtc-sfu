@@ -214,6 +214,7 @@ fn main() {
             announce_addr: worker_announce_addr,
             batch_size: config.batch_size,
             send_batch_size: config.send_batch_size,
+            send_backlog: config.send_backlog,
             busy_poll_us: config.busy_poll_us,
             bwe_initial_bps: config.bwe_initial_bps,
             io_uring: config.io_uring,

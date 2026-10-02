@@ -1017,6 +1017,9 @@ SFU_MEDIA_ADDR=0.0.0.0:5175   # 媒体 UDP 绑定地址 (默认 0.0.0.0:5175)
 SFU_BWE_INITIAL_BPS=1000000   # BWE 初始带宽估计 (bit/s, 默认 1 Mbps)
 SFU_SOCK_BUF_MB=16            # UDP socket 收发缓冲区目标 (MB); 实际值受内核 rmem_max/wmem_max 限制
 SFU_IO_URING=auto             # 收包/等待后端: auto(支持则用 io_uring)/on(强制)/off(epoll)
+SFU_BATCH_SIZE=64             # recvmmsg / io_uring 批量收包大小 (≤256)
+SFU_SEND_BATCH=128            # 每次 sendmmsg 的最大包数 (≤256)
+SFU_SEND_BACKLOG=8192         # 发送队列积压上限 (超限丢最旧包); 高 fan-out 可调大
 
 # JWT 用户鉴权 (可选; 未配置任何密钥则关闭)
 SFU_JWT_SECRET=change-me      # HMAC 对称密钥 (HS256/384/512)
@@ -1045,8 +1048,7 @@ SFU_WHIP_ADDR=0.0.0.0:5180    # WHIP HTTP 监听; 不设则不启用
 SFU_WHEP_ADDR=0.0.0.0:5181    # WHEP HTTP 监听; 不设则不启用
 ```
 
-> `batch_size`(64)、`send_batch_size`(128)、`busy_poll_us`(0) 目前是**编译期常量**，
-> 没有对应环境变量。
+> `busy_poll_us`(0) 目前是**编译期常量**，没有对应环境变量。
 
 > **系统 socket 缓冲区**：内核默认 `rmem_max/wmem_max` 仅 4MB，会把 socket 缓冲
 > 截断到 ~8MB，高 fanout 时造成丢包。建议部署前调大（见 `scripts/sysctl-sfu.sh`）：

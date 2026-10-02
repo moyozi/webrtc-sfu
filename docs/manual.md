@@ -164,6 +164,9 @@ sudo firewall-cmd --reload
 | `SFU_QUIC_ADDR` | `0.0.0.0:5173` | QUIC 信令地址；设 `0`/`off`/空 则禁用。 |
 | `SFU_BWE_INITIAL_BPS` | `1000000` | 订阅者侧 BWE 初始带宽（bit/s）。 |
 | `SFU_IO_URING` | `auto` | 收包/等待后端：`auto`（支持则用 io_uring）/`on`（强制，不可用则启动失败）/`off`（epoll）。 |
+| `SFU_BATCH_SIZE` | `64` | recvmmsg / io_uring 批量收包大小（≤256）。 |
+| `SFU_SEND_BATCH` | `128` | 每次 sendmmsg 最大包数（≤256）。 |
+| `SFU_SEND_BACKLOG` | `8192` | 发送队列积压上限（超限丢最旧包）；高 fan-out 可调大以减少突发丢包。 |
 | `SFU_SOCK_BUF_MB` | `16` | 媒体 socket 收/发缓冲区目标（MB），受内核上限截断。 |
 | `SFU_WHIP_ADDR` | 未设 | WHIP 推流 HTTP 监听；不设则不启用。 |
 | `SFU_WHEP_ADDR` | 未设 | WHEP 拉流 HTTP 监听；不设则不启用。 |
@@ -186,7 +189,7 @@ sudo firewall-cmd --reload
 | `SFU_JWT_REQUIRED` | 配置密钥后 `on` | 是否强制所有 join 携带有效 token；`off` = 有 token 才校验。 |
 | `RUST_LOG` | `info` | 日志级别，如 `info` / `sfu_server::worker::event_loop=debug`。 |
 
-> 说明：`batch_size`(64)、`send_batch_size`(128)、`busy_poll_us`(0) 目前为编译期默认，无对应环境变量。
+> 说明：`busy_poll_us`(0) 目前为编译期默认，无对应环境变量。
 
 ### 5.1 信令 → 媒体：控制面 gRPC
 

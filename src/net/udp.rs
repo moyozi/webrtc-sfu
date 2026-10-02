@@ -21,9 +21,13 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 /// MTU — WebRTC RTP 包最大 1500 字节 (以太网 MTU)
 pub const MTU: usize = 1500;
 
-/// SendBatch 最大积压包数 (约 8192 × 1.5KB ≈ 12MB)。
+/// SendBatch 默认最大积压包数 (约 8192 × 1.5KB ≈ 12MB)。
 /// 超过时丢弃最旧的包，避免发送缓冲长时间满时内存无限增长。
+/// 可通过 `SFU_SEND_BACKLOG` 调整 (高 fan-out 时可调大以减少丢包)。
 pub const MAX_SEND_BACKLOG: usize = 8192;
+
+/// SendBatch 积压上限的硬上限 (避免误配导致内存暴增)。
+pub const MAX_SEND_BACKLOG_LIMIT: usize = 262_144;
 
 /// recv/send iov 栈上数组的最大容量。
 ///
@@ -263,12 +267,16 @@ pub struct SendBatch {
     /// 预分配的 nix MultiHeaders
     headers: MultiHeaders<SockaddrStorage>,
     capacity: usize,
+    /// 积压上限: 超过时丢弃最旧的包 (可配, 见 `SFU_SEND_BACKLOG`)
+    max_backlog: usize,
     /// 因积压超限而丢弃的包数 (诊断用)
     dropped: u64,
 }
 
 impl SendBatch {
-    pub fn new(capacity: usize) -> Self {
+    /// `capacity` = 每次 `sendmmsg` 的最大包数 (≤ [`MAX_BATCH`]);
+    /// `max_backlog` = 队列积压上限, 低于 `capacity` 时会被抬到 `capacity`。
+    pub fn new(capacity: usize, max_backlog: usize) -> Self {
         assert!(
             capacity <= MAX_BATCH,
             "send capacity {} 超过 MAX_BATCH={}",
@@ -282,6 +290,7 @@ impl SendBatch {
             packets: Vec::with_capacity(capacity),
             headers,
             capacity,
+            max_backlog: max_backlog.max(capacity),
             dropped: 0,
         }
     }
@@ -292,8 +301,8 @@ impl SendBatch {
     /// sendmmsg 发出。大关键帧 x 多订阅者时不会丢包。
     pub fn push(&mut self, dest: SocketAddr, data: Vec<u8>) {
         // 积压超限: 丢弃最旧的包，保留新鲜数据。
-        if self.packets.len() >= MAX_SEND_BACKLOG {
-            let overflow = self.packets.len() - MAX_SEND_BACKLOG + 1;
+        if self.packets.len() >= self.max_backlog {
+            let overflow = self.packets.len() - self.max_backlog + 1;
             self.packets.drain(0..overflow);
             self.dropped += overflow as u64;
         }

@@ -20,10 +20,12 @@ pub struct SfuConfig {
     pub announce_ip: IpAddr,
     /// Worker 线程数 (每个 worker 占用一个媒体端口, 需放行端口段)
     pub num_workers: usize,
-    /// recvmmsg 批量大小
+    /// recvmmsg / io_uring 批量收包大小 (≤ [crate::net::udp::MAX_BATCH])
     pub batch_size: usize,
-    /// sendmmsg 批量大小
+    /// sendmmsg 批量大小 (≤ [crate::net::udp::MAX_BATCH])
     pub send_batch_size: usize,
+    /// 发送队列积压上限 (超过时丢弃最旧的包)
+    pub send_backlog: usize,
     /// SO_BUSY_POLL 微秒数 (0 = 禁用)
     pub busy_poll_us: u32,
     /// BWE 初始带宽估计 (bit/s)。订阅者侧用于启动带宽估计。
@@ -134,6 +136,25 @@ impl SfuConfig {
             * 1024
             * 1024;
 
+        // 批量参数 (可配)。收/发批量受 MAX_BATCH=256 约束 (栈上 iov 数组);
+        // 发送积压上限用于高 fan-out 时减少丢包 (代价是内存)。
+        let max_batch = crate::net::udp::MAX_BATCH;
+        let batch_size = std::env::var("SFU_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, max_batch))
+            .unwrap_or(64);
+        let send_batch_size = std::env::var("SFU_SEND_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, max_batch))
+            .unwrap_or(128);
+        let send_backlog = std::env::var("SFU_SEND_BACKLOG")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(send_batch_size, crate::net::udp::MAX_SEND_BACKLOG_LIMIT))
+            .unwrap_or(crate::net::udp::MAX_SEND_BACKLOG);
+
         // 跨主机中继配置
         let worker_offset = std::env::var("SFU_WORKER_OFFSET")
             .ok()
@@ -241,8 +262,9 @@ impl SfuConfig {
             quic_listen_addr,
             announce_ip,
             num_workers,
-            batch_size: 64,
-            send_batch_size: 128,
+            batch_size,
+            send_batch_size,
+            send_backlog,
             busy_poll_us: 0,
             bwe_initial_bps,
             io_uring: IoUringMode::from_env(),

@@ -49,6 +49,8 @@ pub struct WorkerConfig {
     pub announce_addr: SocketAddr,
     pub batch_size: usize,
     pub send_batch_size: usize,
+    /// 发送队列积压上限 (超过时丢弃最旧的包)
+    pub send_backlog: usize,
     pub busy_poll_us: u32,
     /// BWE 初始带宽估计 (bit/s)
     pub bwe_initial_bps: u64,
