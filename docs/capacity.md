@@ -25,7 +25,7 @@
   io_uring 的优势只在**过载**时体现（同样 CPU 下投递更多、丢包更少）。
 - `SFU_SEND_BATCH` / `SFU_SEND_BACKLOG` 只影响**突发吸收**，不改变稳态上限。
 - **单房间跨 2 worker**：满质量 ≈ 300–320 路（约 **1.3–1.5×** 单 worker），
-  因跨 worker 中继有 ~25–30% 额外开销，详见 §5。
+  且总 CPU 多出 ~60%（share-nothing，目标 worker 要重跑每包处理），详见 §5。
 
 ---
 
@@ -140,16 +140,38 @@ SFU_ANNOUNCE_IP=127.0.0.1 SFU_WORKERS=1 SFU_IO_URING=auto \
 | 2 worker | 400 | 77.2% + 78.1% | 416 / 626 | 66% |
 
 - 2 worker 仅提升约 **1.3–1.5×**，而非 2×。
-- 原因：**跨 worker 中继开销**。同一个发布者的每个包在发布者 worker 上要
-  「本地转发 + 编码中继」，在另一 worker 上要「解码 + 转发」；总转发量不变
-  但多了中继处理。实测单房间 N=100 时，1 worker 总 CPU 55% → 2 worker 71%
-  （**+28%**）。
-- 两个 worker 的 CPU 基本均衡（发布者所在 worker 略高）。
-- 每个 worker 的 CPU 仍平台化在 ~79%（与单 worker 一致）。
+- 每个 worker 的 CPU 仍平台化在 ~79%（与单 worker 一致）；两个 worker 负载均衡。
 
-> **结论**：优先让每个房间落在**单 worker**（靠 `SFU_WORKERS` 把不同房间分散到不同核）；
-> 只有单个房间确实需要更大容量时，才用 `SFU_ROOM_WORKERS` 将它跨 worker，
-> 并接受 ~25–30% 的中继开销。
+### 为什么跨 worker 有额外开销？
+
+先澄清一点：**同进程跨 worker 不做编码/序列化**。`RelayHub::relay` 对**本地** worker
+只做一次进程内 channel 投递 + 唤醒管道写（`try_send` + `wake`）；只有**跨主机**才走
+`encode_rtp` + UDP。
+
+但本架构是 **share-nothing / thread-per-core**：每个 worker 独占自己的 `Rtc` 实例、
+UDP socket、速率统计（`RateWindow`）、路由表、定时器与事件循环，并各自 pin 一个核。
+发布者的 `Rtc`（解密后拥有媒体）只在发布者 worker 上，订阅者的 `Rtc` 在另一
+worker 上——两者不共享任何状态。因此目标 worker 必须**把每包处理重跑一遍**：
+
+- 自己维护 `RemotePublisherStats` 速率窗口；
+- 重算 simulcast/SVC 候选（`svc_candidates` / `layer_rates`）与关键帧判定；
+- 逐订阅者 SRTP 加密、重写序号、发送（这部分是本来就该由它做的）。
+
+于是**每包的固定开销被算了两遍**，加上跨线程唤醒，总 CPU 约为单 worker 的 1.6×。
+
+隔离实验（单房间 N=250，音+视频）：
+
+| 配置 | 各 worker CPU | 合计 | 实收 |
+|---|---|---:|---:|
+| 1 worker | 80.8% | 80.8% | 378 Mbps |
+| 2 worker，房间**不跨**（全落 1 个 worker） | 0.2% + 81.8% | 82.0% | 332 Mbps |
+| 2 worker，房间**跨** worker(0,1) | 68.4% + 66.0% | **134.4%** | 319 Mbps |
+
+「房间不跨」与单 worker **等价**（无中继）；一旦跨 worker，总 CPU ≈ **+65%**。
+
+> **结论**：同机情况下，**能放一个 worker 就不要跨**——用一个 worker 更省 CPU。
+> `SFU_ROOM_WORKERS` 只在单个房间**确实超过单核容量**时才用，且要接受 ~60% 的
+> 额外 CPU（换来约 1.4–1.5× 吞吐）。跨主机中继还额外有 UDP 编解码与网络开销，更贵。
 
 ---
 
