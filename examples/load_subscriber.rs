@@ -24,6 +24,8 @@
 //!   --duration   持续秒数 (默认 20)
 //!   --advertise  本端对外公布的 IP (默认 127.0.0.1)
 //!   --publisher  <id>:<audio_mid>:<video_mid>，可重复，指定要订阅的发布者 track
+//!   --tracks     订阅范围: both(默认) / audio(仅音频) / video(仅视频)
+//!   --id-prefix  participant_id 前缀 (多进程压测时避免跨进程 ID 冲突)
 //!
 //! 说明: 每个订阅者用一个 Rtc 承载全部 m-line (每个发布者一对 audio/video,
 //! 均为 recvonly)，并显式上报自身 mid，使 SFU 不再依赖「发布/订阅 mid 相同」的
@@ -75,6 +77,9 @@ struct Config {
     advertise_ip: IpAddr,
     /// participant_id 前缀 (多进程压测时避免进程间 ID 冲突)。
     id_prefix: String,
+    /// 订阅哪些 track: (audio, video)。默认都订阅。
+    sub_audio: bool,
+    sub_video: bool,
     publishers: Vec<PublisherTracks>,
 }
 
@@ -87,6 +92,8 @@ impl Config {
             duration: Duration::from_secs(20),
             advertise_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             id_prefix: String::new(),
+            sub_audio: true,
+            sub_video: true,
             publishers: Vec::new(),
         };
 
@@ -114,6 +121,12 @@ impl Config {
                         format!("{}-sub", p.trim_end_matches('-'))
                     };
                 }
+                "--tracks" => match val().as_str() {
+                    "both" => { cfg.sub_audio = true; cfg.sub_video = true; }
+                    "audio" => { cfg.sub_audio = true; cfg.sub_video = false; }
+                    "video" => { cfg.sub_audio = false; cfg.sub_video = true; }
+                    other => return Err(format!("--tracks 需为 both/audio/video, 收到: {}", other)),
+                },
                 "--publisher" => {
                     let spec = val();
                     let parts: Vec<&str> = spec.split(':').collect();
@@ -338,29 +351,22 @@ async fn subscriber(
                     }
                     add_candidates_from_answer(&text, &mut rtc);
 
-                    // SDP 完成后为每个发布者 track 发送 subscribe (携带自身 mid)
+                    // SDP 完成后按选择为每个发布者 track 发送 subscribe (携带自身 mid)
+                    let mut n_sub = 0usize;
                     for (i, pubr) in cfg.publishers.iter().enumerate() {
                         let (own_a, own_v) = own_mids[i];
-                        subscribe(
-                            &mut ws_tx,
-                            &pubr.id,
-                            &pubr.audio_mid,
-                            &own_a.to_string(),
-                        )
-                        .await?;
-                        subscribe(
-                            &mut ws_tx,
-                            &pubr.id,
-                            &pubr.video_mid,
-                            &own_v.to_string(),
-                        )
-                        .await?;
+                        if cfg.sub_audio {
+                            subscribe(&mut ws_tx, &pubr.id, &pubr.audio_mid, &own_a.to_string())
+                                .await?;
+                            n_sub += 1;
+                        }
+                        if cfg.sub_video {
+                            subscribe(&mut ws_tx, &pubr.id, &pubr.video_mid, &own_v.to_string())
+                                .await?;
+                            n_sub += 1;
+                        }
                     }
-                    println!(
-                        "[{}] SDP 完成, 已发送 {} 条 subscribe",
-                        participant_id,
-                        cfg.publishers.len() * 2
-                    );
+                    println!("[{}] SDP 完成, 已发送 {} 条 subscribe", participant_id, n_sub);
                 } else if is_ice_candidate(&text) {
                     add_candidate_message(&text, &mut rtc);
                 }
