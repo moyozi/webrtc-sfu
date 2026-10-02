@@ -131,12 +131,15 @@ nokhwa Camera.frame()
 
 - `join` (`pc_id`: `pub` / `sub-<publisher_id>`; `role`: `publisher` / `subscriber`)
 - `ice_candidate` (trickle ICE)
-- `subscribe` / `unsubscribe` (`track_mid` = 发布者 mid, 音频 `0`、视频 `1`)
+- `subscribe` / `unsubscribe` (`track_mid` = 发布者 mid; `subscriber_mid` = 本地 recvonly mid, 音频 `0`、视频 `1`)
+- `joined` / `participant_joined` / `participant_tracks` (成员与轨道发现)
 - `leave`
 
-订阅流程: recvonly PC (音频 mid=0 + 视频 mid=1) → `join(role=subscriber)` →
-收到 `sdp_answer` 后 `set_remote_description` + 添加 SFU 候选 → 对 mid 0/1 发
-`subscribe` → `on_track` 收到远端轨, 视频挂 `on_frame` 回传 UI。
+订阅流程: 从 `joined.participants` / `participant_joined.tracks` 读取发布者轨道
+→ 创建 recvonly PC (音频 mid=0 + 视频 mid=1) → `join(role=subscriber)` →
+收到 `sdp_answer` 后 `set_remote_description` + 添加 SFU 候选 → 按发布者 mid 发
+`subscribe` → `on_track` 收到远端轨, 视频挂 `on_frame` 回传 UI;
+`participant_tracks` 更新时增量补发 `subscribe`。
 
 ## 目录结构
 

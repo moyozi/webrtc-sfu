@@ -297,13 +297,8 @@ export class SfuClient {
 
     // 通知服务器取消订阅 (按实际订阅的 track)
     const subs = entry?.trackSubs ?? [];
-    if (subs.length > 0) {
-      for (const ts of subs) {
-        this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: ts.publisherMid });
-      }
-    } else {
-      this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: "0" });
-      this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: "1" });
+    for (const ts of subs) {
+      this.sig?.send({ type: "unsubscribe", pc_id: pcId, publisher_id: publisherId, track_mid: ts.publisherMid });
     }
     this.sig?.send({ type: "leave", pc_id: pcId });
 

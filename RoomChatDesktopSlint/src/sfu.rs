@@ -11,7 +11,8 @@
 //! 订阅流程:
 //!   1. 创建 recvonly PC (音频 mid=0, 视频 mid=1), 生成 offer 并 `join` (role=subscriber)
 //!   2. 收到 `sdp_answer` 后 `set_remote_description` + 添加 SFU 候选
-//!   3. 对每个 mid 发送 `subscribe` (track_mid="0"/"1")
+//!   3. 依据发布者已知轨道发送 `subscribe`
+//!      (track_mid=发布者 mid, subscriber_mid=本地音频 mid 0 / 视频 mid 1)
 //!   4. `on_track` 回调收到远端轨: 视频挂 `on_frame` 转发给 UI, 音频保持存活
 
 use std::collections::HashMap;
@@ -28,7 +29,7 @@ use reactor_webrtc::{
 };
 
 use crate::media::{bgra_to_rgba, AudioGenerator, VideoCapture};
-use crate::protocol::{ClientMessage, ServerMessage};
+use crate::protocol::{ClientMessage, ServerMessage, TrackInfo};
 use crate::signaling::Signaling;
 use crate::ui::{LogLevel, SubStatus, UiEvent};
 
@@ -70,6 +71,10 @@ struct SubEntry {
     pc: PeerConnection,
     status: SubStatus,
     has_video: bool,
+    /// 是否已收到 `sdp_answer` (收到后才能发送 subscribe)。
+    negotiated: bool,
+    /// 已发送 subscribe 的发布者 track_mid 列表 (用于去重与取消订阅)。
+    sent_tracks: Vec<String>,
     // 远端轨句柄必须保活, 否则 native track 被销毁, on_frame 不再触发
     _video_track: Option<VideoTrack>,
     _audio_track: Option<AudioTrack>,
@@ -123,6 +128,8 @@ struct SfuClient {
 
     // 订阅端
     subs: HashMap<String, SubEntry>,
+    /// 各发布者已知的轨道 (mid + kind), 用于订阅与取消订阅。
+    publisher_tracks: HashMap<String, Vec<TrackInfo>>,
 
     audio_enabled: bool,
     video_enabled: bool,
@@ -152,6 +159,7 @@ impl SfuClient {
             synthetic_audio: true,
             use_real_devices: true,
             subs: HashMap::new(),
+            publisher_tracks: HashMap::new(),
             audio_enabled: true,
             video_enabled: true,
         }
@@ -238,6 +246,11 @@ impl SfuClient {
                 return;
             }
         }
+        // 协议握手: 声明协议版本, 服务端回 `welcome`。
+        self.send(ClientMessage::Hello {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            client: format!("{}/desktop", env!("CARGO_PKG_NAME")),
+        });
 
         // 3. 发布连接
         if let Err(e) = self.create_publisher() {
@@ -279,6 +292,7 @@ impl SfuClient {
         }
 
         self.subs.clear();
+        self.publisher_tracks.clear();
         self.pub_pc = None;
         self.pub_shared = None;
         self.local_audio = None;
@@ -448,6 +462,8 @@ impl SfuClient {
                 pc,
                 status: SubStatus::Connecting,
                 has_video: false,
+                negotiated: false,
+                sent_tracks: Vec::new(),
                 _video_track: None,
                 _audio_track: None,
             },
@@ -464,16 +480,14 @@ impl SfuClient {
         let Some(entry) = self.subs.remove(publisher_id) else {
             return;
         };
-        self.send(ClientMessage::Unsubscribe {
-            pc_id: entry.pc_id.clone(),
-            publisher_id: publisher_id.to_string(),
-            track_mid: "0".to_string(),
-        });
-        self.send(ClientMessage::Unsubscribe {
-            pc_id: entry.pc_id.clone(),
-            publisher_id: publisher_id.to_string(),
-            track_mid: "1".to_string(),
-        });
+        self.publisher_tracks.remove(publisher_id);
+        for track_mid in &entry.sent_tracks {
+            self.send(ClientMessage::Unsubscribe {
+                pc_id: entry.pc_id.clone(),
+                publisher_id: publisher_id.to_string(),
+                track_mid: track_mid.clone(),
+            });
+        }
         self.send(ClientMessage::Leave {
             pc_id: entry.pc_id.clone(),
         });
@@ -510,6 +524,32 @@ impl SfuClient {
                             format!("收到未知 pc_id 的 sdp_answer: {pc_id}"),
                         ),
                     }
+                }
+            }
+
+            ServerMessage::Joined {
+                participants,
+                room_id,
+                role,
+                ..
+            } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "已加入房间 {room_id} ({} 位已有成员, role={role})",
+                        participants.len()
+                    ),
+                );
+                for p in participants {
+                    if self.is_self_or_shadow(&p.participant_id) {
+                        continue;
+                    }
+                    self.publisher_tracks
+                        .insert(p.participant_id.clone(), p.tracks);
+                    let _ = self.ui_tx.send(UiEvent::ParticipantJoined {
+                        id: p.participant_id.clone(),
+                    });
+                    self.subscribe(p.participant_id);
                 }
             }
 
@@ -550,20 +590,74 @@ impl SfuClient {
                 self.log(LogLevel::Success, format!("订阅确认: {publisher_id} ({pc_id})"));
             }
 
-            ServerMessage::ParticipantJoined { participant_id } => {
-                // 过滤自己, 以及自己订阅连接产生的伪参与者 (xxx-recv-yyy)
-                if participant_id == self.participant_id
-                    || participant_id.starts_with(&format!("{}-recv-", self.participant_id))
-                {
+            ServerMessage::ParticipantJoined {
+                participant_id,
+                tracks,
+            } => {
+                if self.is_self_or_shadow(&participant_id) {
                     return;
                 }
+                self.publisher_tracks.insert(participant_id.clone(), tracks);
                 let _ = self.ui_tx.send(UiEvent::ParticipantJoined {
                     id: participant_id.clone(),
                 });
                 self.log(LogLevel::Info, format!("参与者加入: {participant_id}"));
-                // 稍等发布者就绪后自动订阅
-                thread::sleep(Duration::from_millis(300));
                 self.subscribe(participant_id);
+            }
+
+            ServerMessage::ParticipantTracks {
+                participant_id,
+                tracks,
+            } => {
+                if self.is_self_or_shadow(&participant_id) {
+                    return;
+                }
+                self.publisher_tracks.insert(participant_id.clone(), tracks);
+                if self.subs.contains_key(&participant_id) {
+                    self.maybe_subscribe_tracks(&participant_id);
+                } else {
+                    self.subscribe(participant_id);
+                }
+            }
+
+            ServerMessage::ParticipantUpdated {
+                participant_id,
+                audio_enabled,
+                video_enabled,
+            } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "参与者状态更新: {participant_id} (audio={audio_enabled}, video={video_enabled})"
+                    ),
+                );
+            }
+
+            ServerMessage::Welcome {
+                protocol_version,
+                server,
+            } => {
+                self.log(
+                    LogLevel::Info,
+                    format!("信令握手: {server} (v{protocol_version})"),
+                );
+            }
+
+            ServerMessage::Pong { .. } => {}
+
+            ServerMessage::Left { pc_id } => {
+                self.log(LogLevel::Info, format!("连接已关闭: {pc_id}"));
+            }
+
+            ServerMessage::Unsubscribed { publisher_id, .. } => {
+                self.log(LogLevel::Info, format!("已取消订阅: {publisher_id}"));
+            }
+
+            ServerMessage::RoomState { participants, .. } => {
+                self.log(
+                    LogLevel::Info,
+                    format!("房间快照: {} 位成员", participants.len()),
+                );
             }
 
             ServerMessage::ParticipantLeft { participant_id } => {
@@ -615,7 +709,7 @@ impl SfuClient {
     }
 
     fn on_sub_answer(&mut self, publisher_id: String, sdp: String, candidates: Vec<String>) {
-        let (pc_id, ok) = {
+        let (_pc_id, ok) = {
             let Some(entry) = self.subs.get(&publisher_id) else {
                 return;
             };
@@ -660,22 +754,70 @@ impl SfuClient {
             return;
         }
 
-        // 发送 subscribe (音频 mid=0 + 视频 mid=1)
-        self.send(ClientMessage::Subscribe {
-            pc_id: pc_id.clone(),
-            publisher_id: publisher_id.clone(),
-            track_mid: "0".to_string(),
-            subscriber_mid: None,
-        });
-        self.send(ClientMessage::Subscribe {
-            pc_id,
-            publisher_id: publisher_id.clone(),
-            track_mid: "1".to_string(),
-            subscriber_mid: None,
-        });
+        // 协商完成后, 依据发布者已知轨道发送 subscribe。
+        if let Some(e) = self.subs.get_mut(&publisher_id) {
+            e.negotiated = true;
+        }
+        self.maybe_subscribe_tracks(&publisher_id);
+    }
+
+    /// 判断是否为自身或订阅连接产生的伪参与者 (xxx-recv-yyy)。
+    fn is_self_or_shadow(&self, participant_id: &str) -> bool {
+        participant_id == self.participant_id
+            || participant_id.starts_with(&format!("{}-recv-", self.participant_id))
+    }
+
+    /// 依据已知的发布者轨道发送 `subscribe` (音频→本地 mid 0, 视频→本地 mid 1)。
+    ///
+    /// 仅在 `sdp_answer` 之后发送; 可重复调用 (只补发尚未订阅的 mid),
+    /// 以应对 `participant_tracks` 在协商之后才到达的场景。
+    fn maybe_subscribe_tracks(&mut self, publisher_id: &str) {
+        let Some(entry) = self.subs.get(publisher_id) else {
+            return;
+        };
+        if !entry.negotiated {
+            return;
+        }
+        let pc_id = entry.pc_id.clone();
+        let sent = entry.sent_tracks.clone();
+        let Some(tracks) = self.publisher_tracks.get(publisher_id).cloned() else {
+            return;
+        };
+
+        // 桌面端仅呈现一路音频 + 一路视频; 每种 kind 取第一条轨道。
+        let mut want: Vec<(String, &'static str)> = Vec::new();
+        if let Some(a) = tracks.iter().find(|t| t.kind == "audio") {
+            want.push((a.mid.clone(), "0"));
+        }
+        if let Some(v) = tracks.iter().find(|t| t.kind == "video") {
+            want.push((v.mid.clone(), "1"));
+        }
+
+        let fresh: Vec<(String, &'static str)> = want
+            .into_iter()
+            .filter(|(mid, _)| !sent.iter().any(|m| m == mid))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+
+        for (track_mid, subscriber_mid) in &fresh {
+            self.send(ClientMessage::Subscribe {
+                pc_id: pc_id.clone(),
+                publisher_id: publisher_id.to_string(),
+                track_mid: track_mid.clone(),
+                subscriber_mid: (*subscriber_mid).to_string(),
+            });
+        }
+        if let Some(e) = self.subs.get_mut(publisher_id) {
+            e.sent_tracks.extend(fresh.iter().map(|(m, _)| m.clone()));
+        }
         self.log(
             LogLevel::Success,
-            format!("订阅 {publisher_id} SDP 完成, 已发送 subscribe"),
+            format!(
+                "订阅 {publisher_id} SDP 完成, 已发送 {} 条 subscribe",
+                fresh.len()
+            ),
         );
     }
 
@@ -774,7 +916,6 @@ impl SfuClient {
             pc_id: pc_id.to_string(),
             candidate: cand.candidate.clone(),
             sdp_mid: cand.sdp_mid.clone(),
-            sdp_mline_index: cand.sdp_mline_index,
         });
     }
 

@@ -67,6 +67,8 @@ class SfuClient(
 
     companion object {
         const val PUB_PC_ID = "pub"
+        /// 与 SFU 服务端 PROTOCOL_VERSION 对应。
+        const val PROTOCOL_VERSION = 2
         private const val TAG = "SfuClient"
         private const val VIDEO_WIDTH = 640
         private const val VIDEO_HEIGHT = 480
@@ -103,6 +105,12 @@ class SfuClient(
     private val readyPcs: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val pendingIce = ConcurrentHashMap<String, MutableList<IceCandidate>>()
 
+    /** 各发布者已知的轨道 (mid + kind)。 */
+    private val publisherTracks = ConcurrentHashMap<String, List<TrackInfo>>()
+
+    /** 已发送 subscribe 的发布者 track_mid 集合 (去重 + 取消订阅用)。 */
+    private val sentSubscribeMids = ConcurrentHashMap<String, MutableSet<String>>()
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var disposed = false
@@ -126,6 +134,14 @@ class SfuClient(
         }
         s.connect()
         sig = s
+        // 协议握手: 声明协议版本, 服务端回 welcome。
+        s.send(
+            JSONObject().apply {
+                put("type", "hello")
+                put("protocol_version", PROTOCOL_VERSION)
+                put("client", "roomchat-android")
+            }
+        )
 
         createPublisher()
     }
@@ -286,10 +302,9 @@ class SfuClient(
         val pcId = subPcByPublisher.remove(publisherId) ?: return
         val entry = pcs.remove(pcId)
 
-        entry?.pc?.transceivers?.forEach { tr ->
-            tr.mid?.let {
-                sig?.send(unsubscribeMessage(pcId, publisherId, it))
-            }
+        // 按发布者实际 mid 取消订阅 (与 subscribe 时发送的 track_mid 对应)。
+        sentSubscribeMids.remove(publisherId)?.forEach { trackMid ->
+            sig?.send(unsubscribeMessage(pcId, publisherId, trackMid))
         }
         sig?.send(leaveMessage(pcId))
 
@@ -397,6 +412,18 @@ class SfuClient(
                 val mid = if (msg.isNull("sdp_mid")) null else msg.optString("sdp_mid")
                 entry.pc.addIceCandidate(IceCandidate(mid ?: "0", 0, candidate))
             }
+            "joined" -> {
+                val arr = msg.optJSONArray("participants")
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val p = arr.optJSONObject(i) ?: continue
+                        val pid = p.optString("participant_id")
+                        if (pid == participantId || pid.startsWith("$participantId-recv-")) continue
+                        publisherTracks[pid] = parseTracks(p.optJSONArray("tracks"))
+                        callbacks.onParticipantJoined(pid)
+                    }
+                }
+            }
             "subscribed" -> {
                 val pcId = msg.optString("pc_id")
                 val entry = pcs[pcId]
@@ -404,18 +431,57 @@ class SfuClient(
                 callbacks.onSubscriptionUpdate(pid, SubStatus.SUBSCRIBED, null)
                 callbacks.onLog("订阅确认: $pid", LogLevel.SUCCESS)
             }
+            "unsubscribed" -> {
+                callbacks.onLog("已取消订阅: ${msg.optString("publisher_id")}", LogLevel.INFO)
+            }
             "participant_joined" -> {
                 val pid = msg.optString("participant_id")
                 if (pid == participantId || pid.startsWith("$participantId-recv-")) return
+                publisherTracks[pid] = parseTracks(msg.optJSONArray("tracks"))
                 callbacks.onLog("参与者加入: $pid", LogLevel.INFO)
                 callbacks.onParticipantJoined(pid)
+            }
+            "participant_tracks" -> {
+                val pid = msg.optString("participant_id")
+                if (pid == participantId || pid.startsWith("$participantId-recv-")) return
+                publisherTracks[pid] = parseTracks(msg.optJSONArray("tracks"))
+                val pcId = subPcByPublisher[pid]
+                if (pcId != null) {
+                    sendSubscribes(pcId, pid)
+                } else {
+                    // 之前因无轨道未订阅, 现在有轨道了 → 发起订阅
+                    callbacks.onParticipantJoined(pid)
+                }
+            }
+            "participant_updated" -> {
+                callbacks.onLog(
+                    "参与者状态更新: ${msg.optString("participant_id")} " +
+                        "(audio=${msg.optBoolean("audio_enabled", true)}, " +
+                        "video=${msg.optBoolean("video_enabled", true)})",
+                    LogLevel.INFO
+                )
             }
             "participant_left" -> {
                 val pid = msg.optString("participant_id")
                 callbacks.onLog("参与者离开: $pid", LogLevel.WARN)
+                publisherTracks.remove(pid)
                 unsubscribe(pid)
                 callbacks.onParticipantLeft(pid)
             }
+            "welcome" -> {
+                callbacks.onLog(
+                    "信令握手: ${msg.optString("server")} (v${msg.optInt("protocol_version")})",
+                    LogLevel.INFO
+                )
+            }
+            "left" -> {
+                callbacks.onLog("连接已关闭: ${msg.optString("pc_id")}", LogLevel.INFO)
+            }
+            "room_state" -> {
+                val arr = msg.optJSONArray("participants")
+                callbacks.onLog("房间快照: ${arr?.length() ?: 0} 位成员", LogLevel.INFO)
+            }
+            "pong" -> {}
             "error" -> {
                 val err = msg.optString("error")
                 val pcId = if (msg.isNull("pc_id")) null else msg.optString("pc_id")
@@ -467,17 +533,44 @@ class SfuClient(
         scanReceivers(entry)
 
         if (entry.role == "subscriber" && entry.publisherId != null) {
-            entry.pc.transceivers.forEach { tr ->
-                val mid = tr.mid ?: return@forEach
-                sig?.send(subscribeMessage(pcId, entry.publisherId, mid))
-            }
-            callbacks.onLog(
-                "订阅 ${entry.publisherId} SDP 完成, 已发送 subscribe",
-                LogLevel.SUCCESS
-            )
+            sendSubscribes(pcId, entry.publisherId)
         } else {
             callbacks.onLog("SDP 协商完成, 已添加服务器候选", LogLevel.SUCCESS)
         }
+    }
+
+    /**
+     * 依据发布者已知轨道发送 subscribe: track_mid = 发布者 mid,
+     * subscriber_mid = 本地 recvonly mid (音频=0, 视频=1)。
+     * 可重复调用, 只补发尚未发送的 mid。
+     */
+    private fun sendSubscribes(pcId: String, publisherId: String) {
+        val tracks = publisherTracks[publisherId] ?: return
+        val sent = sentSubscribeMids.getOrPut(publisherId) { ConcurrentHashMap.newKeySet<String>() }
+        val want = mutableListOf<Pair<String, String>>()
+        tracks.firstOrNull { it.kind == "audio" }?.let { want += it.mid to "0" }
+        tracks.firstOrNull { it.kind == "video" }?.let { want += it.mid to "1" }
+        val fresh = want.filter { it.first.isNotEmpty() && it.first !in sent }
+        if (fresh.isEmpty()) return
+        fresh.forEach { (trackMid, subscriberMid) ->
+            sig?.send(subscribeMessage(pcId, publisherId, trackMid, subscriberMid))
+        }
+        sent.addAll(fresh.map { it.first })
+        callbacks.onLog(
+            "订阅 $publisherId SDP 完成, 已发送 ${fresh.size} 条 subscribe",
+            LogLevel.SUCCESS
+        )
+    }
+
+    /** 解析 `tracks` JSON 数组。 */
+    private fun parseTracks(arr: JSONArray?): List<TrackInfo> {
+        if (arr == null) return emptyList()
+        val out = ArrayList<TrackInfo>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            out.add(TrackInfo(o.optString("mid"), o.optString("kind")))
+        }
+        return out
     }
 
     private fun scanReceivers(entry: PcEntry) {
@@ -654,16 +747,20 @@ class SfuClient(
         put("pc_id", pcId)
         put("candidate", c.sdp)
         put("sdp_mid", c.sdpMid)
-        put("sdp_mline_index", c.sdpMLineIndex)
     }
 
-    private fun subscribeMessage(pcId: String, publisherId: String, mid: String): JSONObject =
-        JSONObject().apply {
-            put("type", "subscribe")
-            put("pc_id", pcId)
-            put("publisher_id", publisherId)
-            put("track_mid", mid)
-        }
+    private fun subscribeMessage(
+        pcId: String,
+        publisherId: String,
+        trackMid: String,
+        subscriberMid: String,
+    ): JSONObject = JSONObject().apply {
+        put("type", "subscribe")
+        put("pc_id", pcId)
+        put("publisher_id", publisherId)
+        put("track_mid", trackMid)
+        put("subscriber_mid", subscriberMid)
+    }
 
     private fun unsubscribeMessage(pcId: String, publisherId: String, mid: String): JSONObject =
         JSONObject().apply {

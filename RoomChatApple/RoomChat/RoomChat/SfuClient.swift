@@ -29,6 +29,8 @@ enum SfuError: Error {
 final class SfuClient: NSObject {
 
     static let pubPcId = "pub"
+    /// 与 SFU 服务端 PROTOCOL_VERSION 对应。
+    static let protocolVersion = 2
 
     private static let factory: RTCPeerConnectionFactory = {
         _ = RTCInitializeSSL()
@@ -67,6 +69,10 @@ final class SfuClient: NSObject {
     private(set) var remoteVideoTracks: [String: RTCVideoTrack] = [:]
     private var readyPcs = Set<String>()
     private var pendingIce: [String: [RTCIceCandidate]] = [:]
+    /// 各发布者已知的轨道 (mid + kind)。
+    private var publisherTracks: [String: [TrackInfo]] = [:]
+    /// 已发送 subscribe 的发布者 track_mid 集合 (去重 + 取消订阅用)。
+    private var sentSubscribeMids: [String: Set<String>] = [:]
 
     // ── 加入 / 发布 ────────────────────────────────────────────
 
@@ -92,6 +98,12 @@ final class SfuClient: NSObject {
         }
         try await sig.connect()
         self.signaling = sig
+        // 协议握手: 声明协议版本, 服务端回 welcome。
+        signaling?.send([
+            "type": "hello",
+            "protocol_version": SfuClient.protocolVersion,
+            "client": "roomchat-apple",
+        ])
 
         try await createPublisher()
     }
@@ -216,16 +228,14 @@ final class SfuClient: NSObject {
               let entry = pcs.removeValue(forKey: pcId) else { return }
         unregister(entry.pc)
 
-        for transceiver in entry.pc.transceivers {
-            let mid = transceiver.mid
-            if !mid.isEmpty {
-                signaling?.send([
-                    "type": "unsubscribe",
-                    "pc_id": pcId,
-                    "publisher_id": publisherId,
-                    "track_mid": mid,
-                ])
-            }
+        // 按发布者实际 mid 取消订阅 (与 subscribe 时发送的 track_mid 对应)。
+        for trackMid in sentSubscribeMids.removeValue(forKey: publisherId) ?? [] {
+            signaling?.send([
+                "type": "unsubscribe",
+                "pc_id": pcId,
+                "publisher_id": publisherId,
+                "track_mid": trackMid,
+            ])
         }
         signaling?.send(["type": "leave", "pc_id": pcId])
         entry.pc.close()
@@ -250,6 +260,8 @@ final class SfuClient: NSObject {
         remoteVideoTracks.removeAll()
         readyPcs.removeAll()
         pendingIce.removeAll()
+        publisherTracks.removeAll()
+        sentSubscribeMids.removeAll()
 
         stopLocalMedia()
         signaling?.close()
@@ -314,23 +326,70 @@ final class SfuClient: NSObject {
             let ice = RTCIceCandidate(sdp: candidate, sdpMLineIndex: 0, sdpMid: mid)
             Task { try? await entry.pc.add(ice) }
 
+        case "joined":
+            if let arr = obj["participants"] as? [[String: Any]] {
+                for p in arr {
+                    guard let pid = p["participant_id"] as? String else { continue }
+                    if pid == participantId || pid.hasPrefix("\(participantId)-recv-") { continue }
+                    publisherTracks[pid] = parseTracks(p["tracks"])
+                    delegate?.sfu(self, didJoin: pid)
+                }
+            }
+
         case "subscribed":
             let pcId = obj["pc_id"] as? String ?? ""
             let pid = pcs[pcId]?.publisherId ?? (obj["publisher_id"] as? String ?? "")
             delegate?.sfu(self, didUpdate: pid, status: .subscribed, hasVideo: nil)
             log("订阅确认: \(pid)", .success)
 
+        case "unsubscribed":
+            log("已取消订阅: \(obj["publisher_id"] as? String ?? "")", .info)
+
         case "participant_joined":
             guard let pid = obj["participant_id"] as? String else { return }
             if pid == participantId || pid.hasPrefix("\(participantId)-recv-") { return }
+            publisherTracks[pid] = parseTracks(obj["tracks"])
             log("参与者加入: \(pid)", .info)
             delegate?.sfu(self, didJoin: pid)
+
+        case "participant_tracks":
+            guard let pid = obj["participant_id"] as? String else { return }
+            if pid == participantId || pid.hasPrefix("\(participantId)-recv-") { return }
+            publisherTracks[pid] = parseTracks(obj["tracks"])
+            if let pcId = subPcByPublisher[pid] {
+                sendSubscribes(pcId: pcId, publisherId: pid)
+            } else {
+                // 之前因无轨道未订阅, 现在有轨道了 → 发起订阅
+                delegate?.sfu(self, didJoin: pid)
+            }
+
+        case "participant_updated":
+            let pid = obj["participant_id"] as? String ?? ""
+            let audio = obj["audio_enabled"] as? Bool ?? true
+            let video = obj["video_enabled"] as? Bool ?? true
+            log("参与者状态更新: \(pid) (audio=\(audio), video=\(video))", .info)
 
         case "participant_left":
             guard let pid = obj["participant_id"] as? String else { return }
             log("参与者离开: \(pid)", .warn)
+            publisherTracks[pid] = nil
             unsubscribe(pid)
             delegate?.sfu(self, didLeave: pid)
+
+        case "welcome":
+            let server = obj["server"] as? String ?? ""
+            let version = obj["protocol_version"] as? Int ?? 0
+            log("信令握手: \(server) (v\(version))", .info)
+
+        case "left":
+            log("连接已关闭: \(obj["pc_id"] as? String ?? "")", .info)
+
+        case "room_state":
+            let count = (obj["participants"] as? [[String: Any]])?.count ?? 0
+            log("房间快照: \(count) 位成员", .info)
+
+        case "pong":
+            break
 
         case "error":
             let err = obj["error"] as? String ?? "unknown"
@@ -376,20 +435,43 @@ final class SfuClient: NSObject {
         scanReceivers(entry)
 
         if entry.role == "subscriber", let publisherId = entry.publisherId {
-            for transceiver in entry.pc.transceivers {
-                let mid = transceiver.mid
-                if !mid.isEmpty {
-                    signaling?.send([
-                        "type": "subscribe",
-                        "pc_id": pcId,
-                        "publisher_id": publisherId,
-                        "track_mid": mid,
-                    ])
-                }
-            }
-            log("订阅 \(publisherId) SDP 完成, 已发送 subscribe", .success)
+            sendSubscribes(pcId: pcId, publisherId: publisherId)
         } else {
             log("SDP 协商完成, 已添加服务器候选", .success)
+        }
+    }
+
+    /// 依据发布者已知轨道发送 subscribe: track_mid = 发布者 mid,
+    /// subscriber_mid = 本地 recvonly mid (音频=0, 视频=1)。
+    /// 可重复调用, 只补发尚未发送的 mid。
+    private func sendSubscribes(pcId: String, publisherId: String) {
+        guard let tracks = publisherTracks[publisherId] else { return }
+        var sent = sentSubscribeMids[publisherId] ?? Set<String>()
+        var want: [(String, String)] = []
+        if let a = tracks.first(where: { $0.kind == "audio" }) { want.append((a.mid, "0")) }
+        if let v = tracks.first(where: { $0.kind == "video" }) { want.append((v.mid, "1")) }
+        let fresh = want.filter { !$0.0.isEmpty && !sent.contains($0.0) }
+        if fresh.isEmpty { return }
+        for (trackMid, subscriberMid) in fresh {
+            signaling?.send([
+                "type": "subscribe",
+                "pc_id": pcId,
+                "publisher_id": publisherId,
+                "track_mid": trackMid,
+                "subscriber_mid": subscriberMid,
+            ])
+        }
+        sent.formUnion(fresh.map { $0.0 })
+        sentSubscribeMids[publisherId] = sent
+        log("订阅 \(publisherId) SDP 完成, 已发送 \(fresh.count) 条 subscribe", .success)
+    }
+
+    /// 解析 `tracks` JSON 数组。
+    private func parseTracks(_ any: Any?) -> [TrackInfo] {
+        guard let arr = any as? [[String: Any]] else { return [] }
+        return arr.compactMap { d in
+            guard let mid = d["mid"] as? String, let kind = d["kind"] as? String else { return nil }
+            return TrackInfo(mid: mid, kind: kind)
         }
     }
 
@@ -453,7 +535,6 @@ final class SfuClient: NSObject {
             "pc_id": pcId,
             "candidate": candidate.sdp,
             "sdp_mid": candidate.sdpMid ?? "0",
-            "sdp_mline_index": Int(candidate.sdpMLineIndex),
         ]
     }
 

@@ -16,6 +16,12 @@ enum SubStatus {
     case error
 }
 
+/// 发布者的一条媒体轨道 (mid + kind), 与信令协议 `TrackInfo` 对应。
+struct TrackInfo: Equatable {
+    let mid: String
+    let kind: String
+}
+
 /// 一条事件日志
 struct LogEntry: Identifiable {
     let id = UUID()
