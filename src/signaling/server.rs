@@ -30,7 +30,18 @@ pub async fn run_server(addr: SocketAddr, state: Arc<SignalingState>) -> std::io
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(stream, peer_addr, state).await {
-                        warn!("WebSocket 连接错误: {}", e);
+                        let msg = e.to_string();
+                        // 分配器健康检查等 TCP 探针会在握手完成前断开连接, 属预期行为,
+                        // 降为 debug 避免刷屏; 其余错误仍按 warn 输出。
+                        if msg.contains("Handshake not finished")
+                            || msg.contains("Connection reset")
+                            || msg.contains("connection reset")
+                            || msg.contains("Unexpected EOF")
+                        {
+                            tracing::debug!("WebSocket 连接提前结束 ({}): {}", peer_addr, msg);
+                        } else {
+                            warn!("WebSocket 连接错误 ({}): {}", peer_addr, msg);
+                        }
                     }
                 });
             }

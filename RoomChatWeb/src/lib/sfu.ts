@@ -84,6 +84,11 @@ export class SfuClient {
   private subPcByPublisher = new Map<string, string>();
   // 已入房的远端成员 (用于 joined 快照与 participant_joined 去重)
   private knownParticipants = new Set<string>();
+  // 已向服务器 join 成功的 pc_id (收到 joined 后置位)。
+  // 用于避免在服务器登记会话前发送 ice_candidate (会被判为"未知 pc_id")。
+  private joinedPcs = new Set<string>();
+  // join 前收集到的 ICE 候选缓冲 (pc_id -> candidates), joined 后补发。
+  private pendingIce = new Map<string, RTCIceCandidate[]>();
   // 应用层心跳定时器
   private heartbeat: ReturnType<typeof setInterval> | null = null;
 
@@ -278,6 +283,8 @@ export class SfuClient {
     this.pcs.clear();
     this.subPcByPublisher.clear();
     this.knownParticipants.clear();
+    this.joinedPcs.clear();
+    this.pendingIce.clear();
 
     // 停止本地轨道
     if (this.localStream) {
@@ -347,6 +354,8 @@ export class SfuClient {
         break;
 
       case "joined": {
+        // 会话已在服务器登记, 现在补发此前缓冲的 ICE 候选。
+        this.flushPendingIce(msg.pc_id);
         this.ingestRoster(msg.participants, true);
         this.cb.onLog(
           `已加入房间 ${msg.room_id} (${msg.participants.length} 位已有成员)`,
@@ -485,7 +494,24 @@ export class SfuClient {
     this.pcs.set(pcId, { pc, role, publisherId });
   }
 
+  /**
+   * 发送 ICE 候选 (trickle)。
+   *
+   * `pc.onicecandidate` 会在发送 join **之前** 就触发 (offer/ICE 收集阶段),
+   * 而服务器此时还没有该 pc_id 的会话, 直接发送会被判为 "未知 pc_id, 请先 join"。
+   * 因此未 join 的 pc 先缓冲, 收到 `joined` 后再补发。
+   */
   private sendIce(pcId: string, cand: RTCIceCandidate): void {
+    if (!this.joinedPcs.has(pcId)) {
+      const pending = this.pendingIce.get(pcId) ?? [];
+      pending.push(cand);
+      this.pendingIce.set(pcId, pending);
+      return;
+    }
+    this.sendIceNow(pcId, cand);
+  }
+
+  private sendIceNow(pcId: string, cand: RTCIceCandidate): void {
     this.sig?.send({
       type: "ice_candidate",
       pc_id: pcId,
@@ -493,6 +519,16 @@ export class SfuClient {
       sdp_mid: cand.sdpMid,
       sdp_mline_index: cand.sdpMLineIndex,
     });
+  }
+
+  /** 服务器确认 pc 已 join 后, 标记并补发缓冲的 ICE 候选。 */
+  private flushPendingIce(pcId: string): void {
+    this.joinedPcs.add(pcId);
+    const pending = this.pendingIce.get(pcId);
+    if (pending && pending.length) {
+      for (const cand of pending) this.sendIceNow(pcId, cand);
+    }
+    this.pendingIce.delete(pcId);
   }
 
   /** 等待 ICE 收集完成 */
