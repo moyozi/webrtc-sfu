@@ -1022,6 +1022,7 @@ SFU_ANNOUNCE_IP=203.0.113.10 RUST_LOG=info ./target/release/sfu-server
 # 常用环境变量
 SFU_ANNOUNCE_IP=203.0.113.10  # 对外通告 IP — 写入 SDP/ICE host 候选 (必须为客户端可达地址)
 SFU_WORKERS=4                 # 本进程 worker 线程数 (媒体端口数); 0 = 纯信令节点 (不跑 worker)
+SFU_CPU_BASE=0                # worker i pin 到 CPU (cpu_base+i); 同机多进程时错开核心
 SFU_DEFAULT_WORKER=0          # 可选: 强制未配置房间全落该 worker; 不设则按房间哈希
 SFU_ROOM_WORKERS="load=0;roomA=1,2;*=0,1,2,3"
                               # 房间 -> 全局 worker 列表; 缺省按房间哈希固定到单个 worker。

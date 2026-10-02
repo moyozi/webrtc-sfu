@@ -599,6 +599,7 @@ WHIP/WHEP 客户端同理：先拿 `whip_url` / `whep_url`，再 POST SDP。
 | `SFU_DISPATCHER_COHOST` | `off` | `on`/`off`（也认 `0`/`false`/`no`/空为关） | 分配器**嵌入**模式: 后台线程跑分配器，主进程继续启动信令/媒体 | 分配器 |
 | `SFU_SIGNALING` | `on` | `on`/`off`（也认 `0`/`false`/空为关闭） | 是否跑信令服务器；`off` = worker-only | 全部 |
 | `SFU_WORKERS` | `1` | `0` ~ 约 `65535 - 媒体端口` | worker 线程数=媒体端口数；**`0` = 纯信令节点** | 全部 |
+| `SFU_CPU_BASE` | `0` | 整数 | worker i 线程 pin 到 CPU `cpu_base + i`；同机多进程时错开核心 | 媒体 |
 
 ### 4.2 信令入口（信令节点）
 

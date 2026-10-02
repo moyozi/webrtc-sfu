@@ -20,6 +20,9 @@ pub struct SfuConfig {
     pub announce_ip: IpAddr,
     /// Worker 线程数 (每个 worker 占用一个媒体端口, 需放行端口段)
     pub num_workers: usize,
+    /// Worker 线程 CPU 亲和性的起始编号 (worker i pin 到 `cpu_base + i`)。
+    /// 默认 0; 同机跑多个 worker 进程时用它错开核心。
+    pub cpu_base: usize,
     /// recvmmsg / io_uring 批量收包大小 (≤ [crate::net::udp::MAX_BATCH])
     pub batch_size: usize,
     /// sendmmsg 批量大小 (≤ [crate::net::udp::MAX_BATCH])
@@ -74,6 +77,12 @@ impl SfuConfig {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1);
+
+        // Worker 线程 pin 的起始 CPU (worker i → cpu_base + i)。默认 0。
+        let cpu_base = std::env::var("SFU_CPU_BASE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
 
         // 监听地址一律绑定 0.0.0.0 (所有网卡), 由防火墙控制暴露面。
         let ws_listen_addr: SocketAddr = std::env::var("SFU_WS_ADDR")
@@ -262,6 +271,7 @@ impl SfuConfig {
             quic_listen_addr,
             announce_ip,
             num_workers,
+            cpu_base,
             batch_size,
             send_batch_size,
             send_backlog,

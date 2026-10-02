@@ -210,6 +210,7 @@ fn main() {
 
         let worker_config = worker::WorkerConfig {
             cpu_id,
+            cpu_base: config.cpu_base,
             listen_addr: worker_listen_addr,
             announce_addr: worker_announce_addr,
             batch_size: config.batch_size,

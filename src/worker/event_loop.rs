@@ -85,8 +85,8 @@ pub fn run_worker(config: WorkerConfig, cmd_rx: Receiver<WorkerCommand>) {
     let mut remote_stats: AHashMap<String, RemotePublisherStats> = AHashMap::new();
     info!(cpu_id, self_idx, "Worker 线程启动");
 
-    // ── 1. 设置 CPU 亲和性 ──
-    set_cpu_affinity(cpu_id);
+    // ── 1. 设置 CPU 亲和性 (pin 到 cpu_base + cpu_id) ──
+    set_cpu_affinity(cpu_id, config.cpu_base);
 
     // ── 2. 创建 UDP socket (每个 worker 独立端口, 不再依赖 SO_REUSEPORT) ──
     let socket = match UdpSocket::new(config.listen_addr, false, config.sock_buf_bytes) {
@@ -597,17 +597,18 @@ fn drain_wake(wake_rx: &UnixStream) {
         }
     }
 }
-/// 设置当前线程的 CPU 亲和性，绑定到指定核心
-fn set_cpu_affinity(cpu_id: usize) {
+/// 设置当前线程的 CPU 亲和性，绑定到 `cpu_base + cpu_id`。
+fn set_cpu_affinity(cpu_id: usize, cpu_base: usize) {
     use nix::sched::{sched_setaffinity, CpuSet};
     use nix::unistd::Pid;
 
+    let cpu = cpu_base + cpu_id;
     let mut cpuset = CpuSet::new();
-    let _ = cpuset.set(cpu_id);
+    let _ = cpuset.set(cpu);
 
     if let Err(e) = sched_setaffinity(Pid::this(), &cpuset) {
-        warn!(cpu_id, "设置 CPU 亲和性失败: {}", e);
+        warn!(cpu_id, cpu, "设置 CPU 亲和性失败: {}", e);
     } else {
-        debug!(cpu_id, "已绑定到 CPU {}", cpu_id);
+        debug!(cpu_id, cpu, "已绑定到 CPU {}", cpu);
     }
 }

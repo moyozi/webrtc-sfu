@@ -157,6 +157,7 @@ sudo firewall-cmd --reload
 |---|---|---|
 | `SFU_ANNOUNCE_IP` | 自动探测 | **对外通告 IP**，写入 SDP/ICE host 候选。生产必须显式设置（客户端可达地址）。 |
 | `SFU_WORKERS` | `1` | worker 线程数（= 媒体端口数）。设 `0` 为**纯信令节点**：本进程不跑任何 worker、不绑定媒体/中继端口，媒体全部在远端媒体机（必须同时配 `SFU_TOTAL_WORKERS` 与 `SFU_CONTROL_PEERS`）。 |
+| `SFU_CPU_BASE` | `0` | worker i 线程 pin 到 CPU `cpu_base + i`。同机跑多个 worker 进程时用它错开核心。 |
 | `SFU_DEFAULT_WORKER` | 未设 | 可选覆盖：强制未配置房间全落该 worker（默认按房间 id 哈希固定到单个 worker）。 |
 | `SFU_ROOM_WORKERS` | 未设 | 房间级分片：`room=w1,w2;*=...`，配置多个 worker 后房间才跨 worker（单机多 worker / 多主机多 worker 都需配置）。 |
 | `SFU_WS_ADDR` | `0.0.0.0:5174` | WebSocket 信令绑定地址。 |

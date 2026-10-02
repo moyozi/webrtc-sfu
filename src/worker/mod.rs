@@ -43,6 +43,8 @@ pub const RELAY_CHANNEL_CAP: usize = 4_096;
 /// Worker 线程配置
 pub struct WorkerConfig {
     pub cpu_id: usize,
+    /// Worker 线程 pin 的起始 CPU: 实际 pin 到 `cpu_base + cpu_id`。
+    pub cpu_base: usize,
     /// UDP 实际绑定地址 (通常 0.0.0.0:base_port)
     pub listen_addr: SocketAddr,
     /// 对外通告地址 (announce_ip:base_port), 用于 ICE host 候选与 Receive destination
