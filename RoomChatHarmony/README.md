@@ -46,12 +46,13 @@ RoomChatHarmony/
 功能完全对齐 Android 端：
 
 - 加入房间（信令地址 / 房间号 / 昵称，可配置）
-- 发布本地音视频（音频 mid=0、视频 mid=1）
+- 发布本地音视频（音频 + 摄像头视频）
 - 自动订阅新加入的参与者（500ms 延迟，与 Web / Android 一致）
 - 参与者面板：订阅状态、手动订阅、取消订阅、事件日志
 - 麦克风 / 摄像头开关、前后摄像头切换、挂断
-- `sdp_answer` / `ice_candidate` / `participant_joined` / `participant_left` /
-  `subscribed` / `error` 信令处理
+- 信令协议 v2：`hello`/`welcome` 握手、轨道发现 (`joined` / `participant_joined` /
+  `participant_tracks`)、按发布者实际 mid 订阅、`participant_updated` / `left` /
+  `room_state` / `unsubscribed` / `error` 等消息处理
 
 ## 构建
 
@@ -135,25 +136,32 @@ curl -L -o ohos_webrtc/src/main/cpp/deps/webrtc/libs/arm64-v8a/libwebrtc.a \
 与 Rust 服务端 `src/signaling/protocol.rs` 完全对应，客户端发送：
 
 ```jsonc
+// 握手 (可选，声明协议版本)
+{ "type": "hello", "protocol_version": 2, "client": "roomchat-harmony" }
 // 加入 / 发布
 { "type": "join", "pc_id": "pub", "room_id": "...", "participant_id": "...", "sdp": "...", "role": "publisher" }
 // 订阅 (role=subscriber，participant_id 形如 "<name>-recv-<publisherId>")
 { "type": "join", "pc_id": "sub-<id>", "room_id": "...", "participant_id": "...-recv-<id>", "sdp": "...", "role": "subscriber" }
-{ "type": "ice_candidate", "pc_id": "...", "candidate": "...", "sdp_mid": "...", "sdp_mline_index": 0 }
-{ "type": "subscribe", "pc_id": "...", "publisher_id": "...", "track_mid": "0|1" }
-{ "type": "unsubscribe", "pc_id": "...", "publisher_id": "...", "track_mid": "0|1" }
+{ "type": "ice_candidate", "pc_id": "...", "candidate": "...", "sdp_mid": "..." }
+// track_mid = 发布者实际 mid；subscriber_mid = 订阅端本地 recvonly mid
+{ "type": "subscribe", "pc_id": "...", "publisher_id": "...", "track_mid": "<发布者 mid>", "subscriber_mid": "0|1" }
+{ "type": "unsubscribe", "pc_id": "...", "publisher_id": "...", "track_mid": "<发布者 mid>" }
 { "type": "leave", "pc_id": "..." }
 ```
 
 接收：
 
 ```jsonc
+{ "type": "welcome", "protocol_version": 2, "server": "...", "features": ["..."] }
 { "type": "sdp_answer", "pc_id": "...", "sdp": "...", "ice_candidates": ["..."] }
-{ "type": "ice_candidate", "pc_id": "...", "candidate": "...", "sdp_mid": "..." }
-{ "type": "participant_joined", "participant_id": "..." }
+{ "type": "joined", "pc_id": "...", "participant_id": "...", "room_id": "...", "role": "...", "participants": [{ "participant_id": "...", "tracks": [{ "mid": "...", "kind": "audio|video" }] }] }
+{ "type": "participant_joined", "participant_id": "...", "tracks": [{ "mid": "...", "kind": "..." }] }
+{ "type": "participant_tracks", "participant_id": "...", "tracks": ["..."] }
 { "type": "participant_left", "participant_id": "..." }
-{ "type": "subscribed", "pc_id": "...", "publisher_id": "..." }
-{ "type": "error", "pc_id": "...", "error": "..." }
+{ "type": "participant_updated", "participant_id": "...", "audio_enabled": true, "video_enabled": true }
+{ "type": "subscribed", "pc_id": "...", "publisher_id": "...", "track_mid": "..." }
+{ "type": "unsubscribed", "pc_id": "...", "publisher_id": "...", "track_mid": "..." }
+{ "type": "error", "pc_id": "...", "code": "...", "error": "..." }
 ```
 
 默认信令地址为 `ws://192.168.31.112:5174`，加入页可修改。

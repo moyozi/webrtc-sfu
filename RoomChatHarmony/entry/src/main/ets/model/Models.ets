@@ -8,6 +8,20 @@ export enum LogLevel { INFO, SUCCESS, WARN, ERROR }
 /** 远端订阅状态 */
 export enum SubStatus { IDLE, CONNECTING, SUBSCRIBED, ERROR }
 
+/** 发布者的一条媒体轨道 (mid + kind), 与信令协议 `TrackInfo` 对应。 */
+export interface TrackInfo {
+  mid: string;
+  kind: string;
+}
+
+/** 房间成员信息 (成员快照 / 广播共用), 与信令协议 `ParticipantInfo` 对应。 */
+export interface ParticipantInfo {
+  participant_id: string;
+  audio_enabled: boolean;
+  video_enabled: boolean;
+  tracks: TrackInfo[];
+}
+
 /** 一条事件日志 */
 export class LogEntry {
   time: string;

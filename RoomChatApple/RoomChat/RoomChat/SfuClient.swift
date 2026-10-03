@@ -17,6 +17,25 @@ enum SfuError: Error {
     case generic(String)
 }
 
+/// 本地视频帧探针 (仅诊断): 挂到 localVideoTrack 上确认采集是否真的产帧,
+/// 用于区分“采集无帧”与“RTCMTLVideoView 渲染问题”。
+private final class LocalFrameProbe: NSObject, RTCVideoRenderer {
+    private let onFirstFrame: () -> Void
+    private var fired = false
+
+    init(onFirstFrame: @escaping () -> Void) {
+        self.onFirstFrame = onFirstFrame
+    }
+
+    func setSize(_ size: CGSize) {}
+
+    func renderFrame(_ frame: RTCVideoFrame?) {
+        guard frame != nil, !fired else { return }
+        fired = true
+        onFirstFrame()
+    }
+}
+
 /// SFU 客户端 — 单条 WebSocket + 多个 RTCPeerConnection
 ///
 /// 架构与 Web 端 RoomChatWeb/src/lib/sfu.ts 完全对应:
@@ -46,6 +65,7 @@ final class SfuClient: NSObject {
     private(set) var localAudioTrack: RTCAudioTrack?
     private(set) var localVideoTrack: RTCVideoTrack?
     private var capturer: RTCVideoCapturer?
+    private var localFrameProbe: LocalFrameProbe?
     private var isFrontCamera = true
 
     private var signaling: SignalingClient?
@@ -80,6 +100,7 @@ final class SfuClient: NSObject {
         self.roomId = roomId
         self.participantId = participantId
 
+        try await requestMediaPermissions()
         createLocalMedia()
 
         guard let url = URL(string: serverUrl) else {
@@ -108,6 +129,32 @@ final class SfuClient: NSObject {
         try await createPublisher()
     }
 
+    /// 先显式申请摄像头 / 麦克风权限, 再启动采集。
+    ///
+    /// iOS 上 RTCCameraVideoCapturer 不会自动弹出权限申请, 若未授权就 startCapture,
+    /// AVCaptureSession 不会产出任何帧, 表现为“本地无画面”。与 Android / Web 端一致,
+    /// 加入前必须拿到权限 (拒绝则直接抛错, 由 UI 提示)。
+    private func requestMediaPermissions() async throws {
+        let cameraGranted = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                cont.resume(returning: granted)
+            }
+        }
+        guard cameraGranted else {
+            throw SfuError.generic("需要摄像头权限进行视频通话")
+        }
+
+        let micGranted = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            AVAudioApplication.requestRecordPermission { granted in
+                cont.resume(returning: granted)
+            }
+        }
+        guard micGranted else {
+            throw SfuError.generic("需要麦克风权限进行语音通话")
+        }
+        log("摄像头/麦克风权限已就绪", .success)
+    }
+
     private func createLocalMedia() {
         let audioConstraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
         let audioSource = SfuClient.factory.audioSource(with: audioConstraints)
@@ -122,13 +169,29 @@ final class SfuClient: NSObject {
         self.capturer = RTCCameraVideoCapturer(delegate: videoSource)
 #endif
         self.localVideoTrack = SfuClient.factory.videoTrack(with: videoSource, trackId: "video0")
+        attachLocalFrameProbe()
 
         startCapture()
         log("本地媒体流已就绪", .success)
     }
 
+    /// 诊断用: 挂一个只数帧的 renderer, 确认采集真的产帧 (与渲染问题区分)。
+    private func attachLocalFrameProbe() {
+        guard let track = localVideoTrack else { return }
+        let probe = LocalFrameProbe { [weak self] in
+            DispatchQueue.main.async {
+                self?.log("收到本地视频帧 (采集正常)", .success)
+            }
+        }
+        track.add(probe)
+        localFrameProbe = probe
+    }
+
     private func startCapture() {
-        guard let capturer = capturer as? RTCCameraVideoCapturer else { return }
+        guard let capturer = capturer as? RTCCameraVideoCapturer else {
+            log("模拟器无摄像头: 本地预览不可用 (请在真机运行)", .warn)
+            return
+        }
         let devices = RTCCameraVideoCapturer.captureDevices()
         guard let device = devices.first(where: { $0.position == .front }) ?? devices.first else {
             log("未找到可用摄像头", .error)
@@ -142,10 +205,33 @@ final class SfuClient: NSObject {
             return abs(Int(l.width) - 640) + abs(Int(l.height) - 480)
                 < abs(Int(r.width) - 640) + abs(Int(r.height) - 480)
         } ?? formats.first
-        guard let format = format else { return }
+        guard let format = format else {
+            log("未找到可用采集格式", .error)
+            return
+        }
         let fps = format.videoSupportedFrameRateRanges
             .max { $0.maxFrameRate < $1.maxFrameRate }?.maxFrameRate ?? 30
-        capturer.startCapture(with: device, format: format, fps: Int(fps))
+        let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+        log("启动摄像头: \(device.localizedName) \(dims.width)x\(dims.height) @\(Int(fps))fps", .info)
+
+        capturer.startCapture(
+            with: device,
+            format: format,
+            fps: Int(fps)
+        ) { [weak self] error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    self?.log("摄像头启动失败: \(error.localizedDescription)", .error)
+                } else {
+                    self?.log("摄像头采集已启动", .success)
+                }
+            }
+        }
+
+        // 延迟确认采集会话是否真的在运行 (诊断黑屏用)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.log("captureSession.isRunning = \(capturer.captureSession.isRunning)", .info)
+        }
     }
 
     private func createPublisher() async throws {
@@ -172,6 +258,37 @@ final class SfuClient: NSObject {
         sendJoin(pcId: pcId, pc: pc, participantId: participantId, role: "publisher")
         configureAudio()
         log("正在加入房间 \(roomId) ...", .info)
+
+        // 5 秒后检查 outbound-rtp, 确认本地视频是否真的在发出 (诊断远端看不到 iOS 视频用)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            self?.pollOutboundStats()
+        }
+    }
+
+    /// 拉取发布连接的 outbound 统计: 若 framesSent/bytesSent 为 0, 说明视频根本没发出去
+    /// (编码/协商问题); 若 > 0, 说明 iOS 已发流, 问题在 SFU 转发或订阅端。
+    private func pollOutboundStats() {
+        guard let entry = pcs[SfuClient.pubPcId] else { return }
+        entry.pc.statistics { [weak self] report in
+            var bytesSent = 0
+            var framesSent = 0
+            var found = false
+            for (_, stat) in report.statistics {
+                guard stat.type == "outbound-rtp" else { continue }
+                let kind = stat.values["kind"] as? String ?? ""
+                if kind == "video" {
+                    found = true
+                    bytesSent = (stat.values["bytesSent"] as? NSNumber)?.intValue ?? 0
+                    framesSent = (stat.values["framesSent"] as? NSNumber)?.intValue ?? 0
+                }
+            }
+            DispatchQueue.main.async {
+                self?.log(
+                    "[stats pub] video bytesSent=\(bytesSent) framesSent=\(framesSent)\(found ? "" : " (no outbound video rtp)")",
+                    .info
+                )
+            }
+        }
     }
 
     // ── 订阅 ──────────────────────────────────────────────────
@@ -555,17 +672,24 @@ final class SfuClient: NSObject {
 
     private func configureAudio() {
 #if os(iOS) || os(visionOS)
-        let session = RTCAudioSession.sharedInstance()
-        session.lockForConfiguration()
-        do {
-            try session.setCategory(.playAndRecord)
-            try session.setMode(.voiceChat)
-            try session.overrideOutputAudioPort(.speaker)
-            try session.setActive(true)
-        } catch {
-            log("音频会话配置失败: \(error)", .warn)
+        // RTCAudioSession.setActive 会同步激活 AVAudioSession, 在主线程调用会导致
+        // UI 卡顿 (WebRTC 内部会打印 "This method can lead to UI unresponsiveness")。
+        // 因此整个音频会话配置挪到后台线程执行。
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let session = RTCAudioSession.sharedInstance()
+            session.lockForConfiguration()
+            do {
+                try session.setCategory(.playAndRecord)
+                try session.setMode(.voiceChat)
+                try session.overrideOutputAudioPort(.speaker)
+                try session.setActive(true)
+            } catch {
+                DispatchQueue.main.async {
+                    self?.log("音频会话配置失败: \(error)", .warn)
+                }
+            }
+            session.unlockForConfiguration()
         }
-        session.unlockForConfiguration()
 #endif
     }
 

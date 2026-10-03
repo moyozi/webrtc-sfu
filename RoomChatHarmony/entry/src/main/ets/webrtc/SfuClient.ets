@@ -1,6 +1,6 @@
 import webrtc from '@ohos/webrtc';
 import { SignalingClient, ServerMessage } from './SignalingClient';
-import { LogLevel, SubStatus } from '../model/Models';
+import { LogLevel, SubStatus, TrackInfo } from '../model/Models';
 
 /**
  * SFU 客户端 — 单条 WebSocket + 多个 RTCPeerConnection
@@ -10,7 +10,8 @@ import { LogLevel, SubStatus } from '../model/Models';
  *   - pc_id = "sub-<远端id>" 订阅连接 (recvonly), 不加入房间
  *
  * 所有 PC 复用同一条 WebSocket, 服务端按 pc_id 路由。
- * 音频轨道必须最先添加 (mid=0), 视频第二 (mid=1), 以匹配服务端的订阅 mid。
+ * 协议 v2: 通过 joined/participant_joined/participant_tracks 发现发布者轨道,
+ * subscribe 时携带发布者实际 track_mid 与本地 subscriber_mid。
  */
 interface PcEntry {
   pc: webrtc.RTCPeerConnection;
@@ -22,6 +23,12 @@ interface PcEntry {
 interface IceTarget {
   mid: string;
   idx: number;
+}
+
+/** 待发送的 subscribe 目标 (发布者 track_mid -> 订阅者本地 subscriber_mid) */
+interface TrackSub {
+  trackMid: string;
+  subscriberMid: string;
 }
 
 /** getStats 中的 inbound-rtp 统计 (用于诊断订阅媒体是否真正到达) */
@@ -41,6 +48,8 @@ interface OutboundRtpStats extends webrtc.RTCStats {
 }
 
 const PUB_PC_ID: string = 'pub';
+/// 与 SFU 服务端 PROTOCOL_VERSION 对应。
+const PROTOCOL_VERSION: number = 2;
 const VIDEO_WIDTH: number = 640;
 const VIDEO_HEIGHT: number = 480;
 const VIDEO_FPS: number = 30;
@@ -67,6 +76,10 @@ export class SfuClient {
   private remoteVideoTracks: Map<string, webrtc.MediaStreamTrack> = new Map();
   private readyPcs: Set<string> = new Set();
   private pendingIce: Map<string, webrtc.RTCIceCandidate[]> = new Map();
+  /** 各发布者已知的轨道 (mid + kind)。 */
+  private publisherTracks: Map<string, TrackInfo[]> = new Map();
+  /** 已发送 subscribe 的发布者 track_mid 集合 (去重 + 取消订阅用)。 */
+  private sentSubscribeMids: Map<string, Set<string>> = new Map();
   private disposed: boolean = false;
 
   getLocalVideoTrack(): webrtc.MediaStreamTrack | null {
@@ -101,6 +114,12 @@ export class SfuClient {
     };
     await s.connect(serverUrl);
     this.sig = s;
+    // 协议握手: 声明协议版本, 服务端回 welcome。
+    s.send(JSON.stringify({
+      type: 'hello',
+      protocol_version: PROTOCOL_VERSION,
+      client: 'roomchat-harmony'
+    }));
 
     await this.createPublisher();
   }
@@ -231,7 +250,8 @@ export class SfuClient {
     this.subPcByPublisher.set(publisherId, pcId);
     this.setupPcCallbacks(pcId, pc, entry);
 
-    // 音频在前 (mid=0), 视频在后 (mid=1), 与服务端发布轨道顺序一致
+    // 订阅端本地约定: 音频在前 (subscriber_mid=0), 视频在后 (subscriber_mid=1);
+    // 发布者实际 track_mid 由信令轨道发现给出, 与此无关。
     pc.addTransceiver('audio', { direction: 'recvonly' });
     pc.addTransceiver('video', { direction: 'recvonly' });
 
@@ -261,13 +281,17 @@ export class SfuClient {
     const entry = this.pcs.get(pcId);
     this.pcs.delete(pcId);
 
-    if (entry != null) {
-      for (const tr of entry.pc.getTransceivers()) {
-        if (tr.mid != null) {
-          this.sig?.send(this.unsubscribeMessage(pcId, publisherId, tr.mid));
-        }
+    // 按发布者实际 mid 取消订阅 (与 subscribe 时发送的 track_mid 对应)。
+    const sent = this.sentSubscribeMids.get(publisherId);
+    if (sent != null) {
+      for (const trackMid of sent) {
+        this.sig?.send(this.unsubscribeMessage(pcId, publisherId, trackMid));
       }
-      this.sig?.send(this.leaveMessage(pcId));
+      this.sentSubscribeMids.delete(publisherId);
+    }
+    this.sig?.send(this.leaveMessage(pcId));
+
+    if (entry != null) {
       try {
         entry.pc.close();
       } catch (e) {
@@ -300,6 +324,8 @@ export class SfuClient {
     this.remoteVideoTracks.clear();
     this.readyPcs.clear();
     this.pendingIce.clear();
+    this.publisherTracks.clear();
+    this.sentSubscribeMids.clear();
 
     this.stopLocalMedia();
 
@@ -470,6 +496,20 @@ export class SfuClient {
         }
         break;
       }
+      case 'joined': {
+        const arr = msg.participants;
+        if (arr != null) {
+          for (const p of arr) {
+            const pid = p.participant_id;
+            if (pid === this.participantId || pid.startsWith(`${this.participantId}-recv-`)) {
+              continue;
+            }
+            this.publisherTracks.set(pid, p.tracks);
+            this.onParticipantJoined(pid);
+          }
+        }
+        break;
+      }
       case 'subscribed': {
         const pcId = msg.pc_id ?? '';
         const entry = this.pcs.get(pcId);
@@ -478,22 +518,69 @@ export class SfuClient {
         this.onLog(`订阅确认: ${pid}`, LogLevel.SUCCESS);
         break;
       }
+      case 'unsubscribed': {
+        this.onLog(`已取消订阅: ${msg.publisher_id ?? ''}`, LogLevel.INFO);
+        break;
+      }
       case 'participant_joined': {
         const pid = msg.participant_id ?? '';
         if (pid === this.participantId || pid.startsWith(`${this.participantId}-recv-`)) {
           return;
         }
+        this.publisherTracks.set(pid, msg.tracks ?? []);
         this.onLog(`参与者加入: ${pid}`, LogLevel.INFO);
         this.onParticipantJoined(pid);
+        break;
+      }
+      case 'participant_tracks': {
+        const pid = msg.participant_id ?? '';
+        if (pid === this.participantId || pid.startsWith(`${this.participantId}-recv-`)) {
+          return;
+        }
+        this.publisherTracks.set(pid, msg.tracks ?? []);
+        const pcId = this.subPcByPublisher.get(pid);
+        if (pcId != null) {
+          this.sendSubscribes(pcId, pid);
+        } else {
+          // 之前因无轨道未订阅, 现在有轨道了 → 发起订阅
+          this.onParticipantJoined(pid);
+        }
+        break;
+      }
+      case 'participant_updated': {
+        this.onLog(
+          `参与者状态更新: ${msg.participant_id ?? ''} ` +
+            `(audio=${msg.audio_enabled ?? true}, video=${msg.video_enabled ?? true})`,
+          LogLevel.INFO
+        );
         break;
       }
       case 'participant_left': {
         const pid = msg.participant_id ?? '';
         this.onLog(`参与者离开: ${pid}`, LogLevel.WARN);
+        this.publisherTracks.delete(pid);
         this.unsubscribe(pid);
         this.onParticipantLeft(pid);
         break;
       }
+      case 'welcome': {
+        this.onLog(
+          `信令握手: ${msg.server ?? ''} (v${msg.protocol_version ?? 0})`,
+          LogLevel.INFO
+        );
+        break;
+      }
+      case 'left': {
+        this.onLog(`连接已关闭: ${msg.pc_id ?? ''}`, LogLevel.INFO);
+        break;
+      }
+      case 'room_state': {
+        const arr = msg.participants;
+        this.onLog(`房间快照: ${arr != null ? arr.length : 0} 位成员`, LogLevel.INFO);
+        break;
+      }
+      case 'pong':
+        break;
       case 'error': {
         const err = msg.error ?? '';
         const pcId = msg.pc_id;
@@ -546,34 +633,50 @@ export class SfuClient {
     this.scanReceivers(entry);
 
     if (entry.role === 'subscriber' && entry.publisherId != null) {
-      for (const tr of entry.pc.getTransceivers()) {
-        const subMid = tr.mid;
-        if (subMid == null) {
-          continue;
-        }
-        // 发布端约定: 音频 mid=0, 视频 mid=1;
-        // 订阅端自身 mid 可能不同, 通过 subscriber_mid 单独告知服务端。
-        let kind = '';
-        const recv = tr.receiver;
-        if (recv != null && recv.track != null) {
-          kind = recv.track.kind;
-        }
-        let publisherMid = subMid;
-        if (kind === 'audio') {
-          publisherMid = '0';
-        } else if (kind === 'video') {
-          publisherMid = '1';
-        }
-        this.onLog(`sub_mid=${subMid} kind=${kind} -> pub_mid=${publisherMid}`, LogLevel.INFO);
-        this.sig?.send(this.subscribeMessage(pcId, entry.publisherId, publisherMid, subMid));
-      }
-      this.onLog(`订阅 ${entry.publisherId} SDP 完成, 已发送 subscribe`, LogLevel.SUCCESS);
+      // 依据发布者已知轨道发送 subscribe (track_mid = 发布者实际 mid)。
+      this.sendSubscribes(pcId, entry.publisherId);
       setTimeout(() => {
         this.pollInboundStats(pcId, entry.publisherId ?? '');
       }, 4000);
     } else {
       this.onLog('SDP 协商完成, 已添加服务器候选', LogLevel.SUCCESS);
     }
+  }
+
+  /**
+   * 依据发布者已知轨道发送 subscribe: track_mid = 发布者 mid,
+   * subscriber_mid = 本地 recvonly mid (音频=0, 视频=1)。
+   * 可重复调用, 只补发尚未发送的 mid。
+   */
+  private sendSubscribes(pcId: string, publisherId: string): void {
+    const tracks = this.publisherTracks.get(publisherId);
+    if (tracks == null) {
+      return;
+    }
+    let sent = this.sentSubscribeMids.get(publisherId);
+    if (sent == null) {
+      sent = new Set<string>();
+      this.sentSubscribeMids.set(publisherId, sent);
+    }
+    const want: TrackSub[] = [];
+    const audio = tracks.find((t: TrackInfo) => t.kind === 'audio');
+    if (audio != null && audio.mid.length > 0 && !sent.has(audio.mid)) {
+      want.push({ trackMid: audio.mid, subscriberMid: '0' });
+    }
+    const video = tracks.find((t: TrackInfo) => t.kind === 'video');
+    if (video != null && video.mid.length > 0 && !sent.has(video.mid)) {
+      want.push({ trackMid: video.mid, subscriberMid: '1' });
+    }
+    if (want.length === 0) {
+      return;
+    }
+    for (const w of want) {
+      this.sig?.send(this.subscribeMessage(pcId, publisherId, w.trackMid, w.subscriberMid));
+    }
+    for (const w of want) {
+      sent.add(w.trackMid);
+    }
+    this.onLog(`订阅 ${publisherId} SDP 完成, 已发送 ${want.length} 条 subscribe`, LogLevel.SUCCESS);
   }
 
   /** 拉取发布连接的 outbound 统计, 判断本地媒体是否真的发出 (黑屏诊断用) */
@@ -695,8 +798,7 @@ export class SfuClient {
       type: 'ice_candidate',
       pc_id: pcId,
       candidate: c.candidate,
-      sdp_mid: c.sdpMid ?? null,
-      sdp_mline_index: c.sdpMLineIndex ?? null
+      sdp_mid: c.sdpMid ?? null
     });
   }
 

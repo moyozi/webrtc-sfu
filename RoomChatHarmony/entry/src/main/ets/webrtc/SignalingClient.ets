@@ -1,5 +1,6 @@
 import webSocket from '@ohos.net.webSocket';
 import util from '@ohos.util';
+import { TrackInfo, ParticipantInfo } from '../model/Models';
 
 /**
  * 信令客户端 — WebSocket 封装 (对应 Android 端 webrtc/SignalingClient.kt)
@@ -16,10 +17,19 @@ export interface ServerMessage {
   ice_candidates?: string[];
   candidate?: string;
   sdp_mid?: string | null;
-  sdp_mline_index?: number | null;
   participant_id?: string;
   publisher_id?: string;
+  track_mid?: string;
+  room_id?: string;
+  role?: string;
   error?: string;
+  code?: string;
+  protocol_version?: number;
+  server?: string;
+  audio_enabled?: boolean;
+  video_enabled?: boolean;
+  participants?: ParticipantInfo[];
+  tracks?: TrackInfo[];
 }
 
 export type SignalHandler = (msg: ServerMessage) => void;

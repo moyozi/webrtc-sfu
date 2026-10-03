@@ -143,6 +143,11 @@ export class SfuClient {
 
     // 2. 获取本地媒体
     this.cb.onLog("正在获取摄像头和麦克风...");
+    if (typeof navigator.mediaDevices?.getUserMedia !== "function") {
+      throw new Error(
+        "无法访问摄像头/麦克风: getUserMedia 仅在安全上下文可用, 请用 https:// 或 http://localhost/127.0.0.1 访问本页面"
+      );
+    }
     this.localStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
       video: { width: 640, height: 480 },
