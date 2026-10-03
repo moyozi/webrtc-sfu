@@ -26,6 +26,7 @@ RoomChatHarmony/
 │       ├── components/VideoTile.ets      # XComponent 视频画面
 │       └── pages/Index.ets               # 加入页 + 通话页 + 参与者面板
 ├── ohos_webrtc/              # @ohos/webrtc 原生 HAR 库 (vendored)
+├── fetch_webrtc.sh           # 拉取 WebRTC 预编译依赖 (不入库)
 ├── build-profile.json5
 ├── hvigorfile.ts
 └── oh-package.json5
@@ -74,24 +75,21 @@ node /Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw.js \
 
 ## 依赖说明（重要）
 
-`ohos_webrtc` 原生库需要链接一个体积很大的静态库：
+`ohos_webrtc` 原生库需要链接一个体积很大的静态库，以及配套的 WebRTC 头文件：
 
-- `ohos_webrtc/src/main/cpp/deps/webrtc/libs/arm64-v8a/libwebrtc.a`（约 388 MB）
+- `ohos_webrtc/src/main/cpp/deps/webrtc/libs/arm64-v8a/libwebrtc.a`（约 388 MB，预编译二进制）
+- `ohos_webrtc/src/main/cpp/deps/webrtc/include/`（约 169 MB，编译期头文件）
 
-该文件在上游仓库中由 Git LFS 托管。本目录已放入完整二进制；如果你通过 Git
-重新分发 / 克隆，请确保：
-
-```bash
-git lfs install
-git lfs pull
-```
-
-或直接从上游下载：
+这两个目录**不入库**（已加入 `ohos_webrtc/.gitignore`）。首次构建前运行一次：
 
 ```bash
-curl -L -o ohos_webrtc/src/main/cpp/deps/webrtc/libs/arm64-v8a/libwebrtc.a \
-  "https://media.githubusercontent.com/media/hezhubo/OhosWebrtc/main/ohos_webrtc/src/main/cpp/deps/webrtc/libs/arm64-v8a/libwebrtc.a"
+./RoomChatHarmony/fetch_webrtc.sh
 ```
+
+脚本会从上游 [hezhubo/OhosWebrtc](https://github.com/hezhubo/OhosWebrtc)（固定提交
+`7621685`，即 `add mediasoup 3.4.3`）拉取头文件，并直接下载 `libwebrtc.a`（上游以
+Git LFS 托管，本脚本走 `media.githubusercontent.com` 直链，无需安装 `git-lfs`），
+最后校验 SHA-256。
 
 > 另外，`libmediasoupclient` 依赖的 `deps/libsdptransform`（上游为 git 子模块，
 > 未随 tarball 分发）已一并放入

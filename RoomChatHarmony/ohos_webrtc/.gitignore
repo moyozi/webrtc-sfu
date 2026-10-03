@@ -4,3 +4,7 @@
 /build
 /.cxx
 /.test
+
+# 预编译 WebRTC 依赖（libwebrtc.a + include 头文件），不入库
+# 首次构建前运行 RoomChatHarmony/fetch_webrtc.sh 获取
+/src/main/cpp/deps/webrtc/
