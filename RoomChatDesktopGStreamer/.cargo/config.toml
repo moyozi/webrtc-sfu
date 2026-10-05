@@ -1,0 +1,18 @@
+# GStreamer WebRTC 开发文件 (gstreamer-webrtc crate 构建依赖) 的查找路径。
+#
+# gstreamer-webrtc 通过 pkg-config 寻找 `gstreamer-webrtc-1.0.pc` 与
+# `gst/webrtc/*.h`。在已安装 `gstreamer1-plugins-bad-free-devel` 的机器上
+# 无需此文件。
+#
+# 这里额外优先搜索一个用户级本地目录 (`scripts/setup-gstreamer-webrtc-dev.sh`
+# 会把 Fedora `gstreamer1-plugins-bad-free-devel` 包免 root 解压到这里), 便于
+# 在没有 sudo 权限的机器上构建。pkg-config 始终还会搜索系统默认目录, 因此该
+# 目录不存在时会自动回退到系统安装的开发包。
+#
+# 若 shell 中已设置 PKG_CONFIG_PATH, 该值不会被覆盖 (除非 force = true)。
+
+[env]
+PKG_CONFIG_PATH = "/home/hongshengjie/.local/share/gst-webrtc-dev/usr/lib64/pkgconfig"
+# libnice 的 GStreamer 插件 (nicesrc/nicesink, webrtcbin 必需) 在用户级目录里。
+# 程序本身也会在启动时尝试加入该目录 (见 src/sfu.rs), 这里让 `cargo run` 直接生效。
+GST_PLUGIN_PATH = "/home/hongshengjie/.local/share/gst-webrtc-dev/usr/lib64/gstreamer-1.0"
