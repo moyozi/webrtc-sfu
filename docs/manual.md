@@ -231,6 +231,51 @@ claims 约定：`sub`（必填，用户 ID，发布者 `participant_id` 必须�
 `room` / `role`（可选，限定房间 / 角色：`role=subscriber` 只能订阅，
 `publisher` 或省略则既可发布也可订阅）。鉴权失败返回 401；密钥不会写入日志。
 
+#### 与 Go auth 服务联调（非对称 RS256/ES256）
+
+Rust SFU 只持有**公钥**验签，私钥仅留在 Go auth 服务侧（`go/src/auth`）。
+该仓库内置 `cmd/jwtgen`，可生成密钥并签发带 `room`/`role` 的 SFU token：
+
+```bash
+# 1. 在 Go auth 仓库生成 RS256 密钥对（写入 ./secrets/）
+cd ~/go/src/auth
+go run ./cmd/jwtgen -keygen -keydir ./secrets -alg RS256 -kid auth-1
+
+# 2. 用私钥签发一个 SFU token
+go run ./cmd/jwtgen -private-key ./secrets/jwt-private.pem -alg RS256 \
+  -sub alice -room room-1 -role publisher -aud authenticated -ttl 3600
+
+# 3. 启动 SFU：只需提供公钥；algorithm / aud 需与签发方一致
+SFU_JWT_PUBLIC_KEY_FILE=~/go/src/auth/secrets/jwt-public.pem \
+SFU_JWT_ALGORITHM=RS256 \
+SFU_JWT_AUDIENCE=authenticated \
+  ./target/release/sfu-server
+```
+
+Go auth 服务本身切换到非对称（`configs/app.toml`）：
+
+```toml
+[jwt]
+algorithm = "RS256"
+private_key_file = "./secrets/jwt-private.pem"
+public_key_file = "./secrets/jwt-public.pem"
+# 纯非对称部署可留空 secret；保留则兼容验签旧的 HS256 令牌
+```
+
+切换后服务签发的访问令牌（`sub` = 用户 ID，`aud` = `authenticated`）可直接被
+SFU 公钥验签，并通过 `http://<auth-host>/.well-known/jwks.json` 暴露公钥。
+
+一条命令跑通端到端联调（Go 签发 → Rust 验签）：
+
+```bash
+./scripts/interop-jwt.sh              # 默认 RS256
+KEY_TYPE=ec ./scripts/interop-jwt.sh  # ES256
+```
+
+`GO_AUTH_DIR` 可指定 Go auth 仓库路径（默认 `$HOME/go/src/auth`）。
+固定 fixture 测试见 `tests/fixtures/jwt/` 与
+`cargo test --bin sfu-server signaling::auth`。
+
 ---
 
 ## 6. 快速启动（单机）

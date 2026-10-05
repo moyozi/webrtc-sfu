@@ -523,4 +523,68 @@ mod tests {
         let claims = auth.verify(token).unwrap();
         assert_eq!(claims.sub, "bob");
     }
+
+    /// 跨项目联调: 校验由 Go auth 服务 (`golang-jwt/jwt/v4`, RS256 非对称私钥)
+    /// 签发的 token。fixture 由 `go/src/auth/cmd/jwtgen` 生成 (见 scripts/interop-jwt.sh)。
+    #[test]
+    fn verifies_go_auth_rs256_token() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/jwt");
+        let public_key = std::fs::read_to_string(dir.join("go_auth_rs256_pub.pem"))
+            .expect("缺少 Go auth 公钥 fixture");
+        let token = std::fs::read_to_string(dir.join("go_auth_rs256_token.txt"))
+            .expect("缺少 Go auth token fixture");
+
+        let settings = JwtSettings {
+            public_key: Some(public_key),
+            algorithm: Some("RS256".into()),
+            audience: Some("authenticated".into()),
+            required: true,
+            ..Default::default()
+        };
+        let auth = Authenticator::from_settings(&settings).unwrap();
+        assert!(auth.is_enabled());
+
+        let claims = auth
+            .verify(token.trim())
+            .expect("Go 签发的 RS256 token 应通过校验");
+        assert_eq!(claims.sub, "alice");
+        assert_eq!(claims.room.as_deref(), Some("room-1"));
+        assert_eq!(claims.role.as_deref(), Some("publisher"));
+
+        assert!(auth
+            .authorize_join(&claims, "room-1", "alice", "publisher")
+            .is_ok());
+        // room 声明限定: 其它房间应被拒绝
+        assert!(auth
+            .authorize_join(&claims, "room-2", "alice", "publisher")
+            .is_err());
+    }
+
+    /// 由 `scripts/interop-jwt.sh` 注入环境变量, 对"当场生成"的 Go token 做联调校验。
+    /// 未设置环境变量时跳过, 因此可安全地常驻测试套件。
+    #[test]
+    fn verifies_go_auth_token_from_env() {
+        let (Ok(pub_path), Ok(token)) = (
+            std::env::var("JWT_INTEROP_PUBLIC_KEY_FILE"),
+            std::env::var("JWT_INTEROP_TOKEN"),
+        ) else {
+            return; // 未设置则跳过 (常规 `cargo test` 路径)
+        };
+        let public_key = std::fs::read_to_string(&pub_path)
+            .unwrap_or_else(|e| panic!("读取 {pub_path} 失败: {e}"));
+        let algorithm = std::env::var("JWT_INTEROP_ALGORITHM").unwrap_or_else(|_| "RS256".into());
+        let audience = std::env::var("JWT_INTEROP_AUDIENCE").unwrap_or_else(|_| "authenticated".into());
+
+        let settings = JwtSettings {
+            public_key: Some(public_key),
+            algorithm: Some(algorithm),
+            audience: Some(audience),
+            required: true,
+            ..Default::default()
+        };
+        let auth = Authenticator::from_settings(&settings).unwrap();
+        let claims = auth.verify(token.trim()).expect("live Go token 应通过校验");
+        assert_eq!(claims.sub, "alice");
+        assert_eq!(claims.room.as_deref(), Some("room-1"));
+    }
 }

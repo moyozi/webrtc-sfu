@@ -870,6 +870,24 @@ SFU_JWT_SECRET=dev-secret ./scripts/gen-jwt.sh alice room-1 publisher 3600
 # 输出 eyJhbGciOi... 即为 JWT
 ```
 
+**非对称联调（Go auth → Rust SFU）**：SFU 只保存公钥，私钥仅留在 Go auth
+(`go/src/auth`) 侧。用其 `cmd/jwtgen` 生成密钥并签发 token：
+
+```bash
+cd ~/go/src/auth
+go run ./cmd/jwtgen -keygen -keydir ./secrets -alg RS256 -kid auth-1
+go run ./cmd/jwtgen -private-key ./secrets/jwt-private.pem -alg RS256 \
+  -sub alice -room room-1 -role publisher -aud authenticated -ttl 3600
+
+SFU_JWT_PUBLIC_KEY_FILE=~/go/src/auth/secrets/jwt-public.pem \
+SFU_JWT_ALGORITHM=RS256 SFU_JWT_AUDIENCE=authenticated \
+  ./target/release/sfu-server
+```
+
+端到端联调脚本（Go 签发 → Rust 验签）：`./scripts/interop-jwt.sh`
+（`KEY_TYPE=ec` 可切 ES256，`GO_AUTH_DIR` 指定 Go auth 仓库路径）。固定
+fixture 测试见 `tests/fixtures/jwt/`。
+
 ### 8.5 信令 → 媒体：控制面 gRPC
 
 信令进程与 worker 进程可分离（worker-only 进程设 `SFU_SIGNALING=off`）。
