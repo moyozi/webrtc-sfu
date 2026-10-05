@@ -1,0 +1,14 @@
+# 本地 FFmpeg 开发文件 (ffmpeg-next 构建依赖) 的查找路径。
+#
+# ffmpeg-next 通过 pkg-config 寻找 libavcodec/libavformat/... 的开发文件。
+# 在已安装 FFmpeg 开发包的机器上无需此文件。
+#
+# 这里额外优先搜索一个用户级本地目录 (`scripts/setup-ffmpeg-dev.sh` 会把
+# Fedora `*-free-devel` 包免 root 解压到这里), 便于在没有 sudo 权限的机器上
+# 构建。pkg-config 始终还会搜索系统默认目录, 因此该目录不存在时会自动回退到
+# 系统安装的 FFmpeg 开发包。
+#
+# 若 shell 中已设置 PKG_CONFIG_PATH, 该值不会被覆盖 (除非 force = true)。
+
+[env]
+PKG_CONFIG_PATH = "/home/hongshengjie/.local/share/ffmpeg-dev/usr/lib64/pkgconfig"
