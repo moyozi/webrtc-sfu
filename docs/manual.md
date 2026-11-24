@@ -765,7 +765,7 @@ top -H -p $(pgrep -x sfu-server) | grep sfu-worker
 
 ## 附：相关文档
 
-- 架构与实现细节：`README.md`
+- 架构与实现细节：`docs/design.md`
 - 多 worker / 跨主机中继设计：`docs/multi-worker-relay.md`
 - 内核调优脚本：`scripts/sysctl-sfu.sh`
 - 部署样例：`deploy/`
